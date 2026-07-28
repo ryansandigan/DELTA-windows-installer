@@ -1,0 +1,1 @@
+import{j as s}from"./jsx-runtime-BYsfuH3T.js";import{L as u}from"./chunk-JZWAC4HX-B9gBqAB-.js";import{u as a}from"./url-ClF4YC6g.js";function f({to:r,lang:t,visible:o=!0,...n}){const i=a(t,r);return o?s.jsx(u,{to:i,...n}):null}export{f as L};

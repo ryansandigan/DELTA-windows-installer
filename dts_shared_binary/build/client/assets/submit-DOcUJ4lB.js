@@ -1,0 +1,1 @@
+import{j as u}from"./jsx-runtime-BYsfuH3T.js";function m({label:t,id:n=void 0,disabled:o=!1,className:e="mg-button mg-button-primary",style:r={}}){return u.jsx("button",{id:n,disabled:o,className:e,style:{...r,flex:"none"},type:"submit",children:t})}export{m as S};
