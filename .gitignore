@@ -70,3 +70,9 @@ yarn-error.log*
 
 .cache/
 dist/
+
+# -----------------------------------------------------------------------------
+# DELTA installer cache (setup.ps1) - large binaries, never committed
+# -----------------------------------------------------------------------------
+
+installers/
