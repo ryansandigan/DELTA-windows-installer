@@ -1,1 +1,0 @@
-import{p as e,o as a,u as r,z as t,b as s,d as o}from"./countryAccountsTable-DMoWdZNa.js";const d=e("categories",{id:s(),name:t("name"),parentId:r("parent_id").references(()=>d.id),level:a("level").notNull().default(1),...o});export{d as c};

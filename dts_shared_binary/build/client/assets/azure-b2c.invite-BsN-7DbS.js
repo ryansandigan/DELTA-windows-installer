@@ -1,1 +1,0 @@
-import{w as s,u as o}from"./chunk-JZWAC4HX-B9gBqAB-.js";import{j as r}from"./jsx-runtime-BYsfuH3T.js";const a=s(function(){const e=o();return e?.errors?r.jsx(r.Fragment,{children:r.jsxs("div",{children:[r.jsx("h1",{children:"Error: received server error response"}),r.jsx("p",{children:e.errors})]})}):r.jsx("div",{children:r.jsx("p",{})})});export{a as default};
