@@ -1,0 +1,101 @@
+name: Release
+
+# Fires only when a version tag (v1.0.0, v2.3.1, ...) is pushed. Ordinary
+# branch pushes and pull requests never trigger a release.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Least-privilege default: this workflow only needs to publish a release
+# and attach assets to it.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        # Checkout resolves the pushed tag automatically (it's the
+        # triggering ref) - no extra ref/fetch-depth configuration needed.
+
+      - name: Derive release version from tag
+        id: version
+        shell: pwsh
+        run: |
+          # github.ref_name is the bare tag (e.g. "v1.0.0") on a tag push.
+          # tools/build-release.ps1 expects the version without the "v"
+          # prefix (e.g. "1.0.0") - strip it once, here, and reuse the
+          # result in every later step.
+          $tag = "${{ github.ref_name }}"
+          $version = $tag -replace '^v', ''
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Verify installer version matches Git tag
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          # Dot-source the version file exactly as setup.ps1 does, rather
+          # than regex-matching its text - this reuses PowerShell's own
+          # parser to evaluate the assignment, so it can't be fooled by
+          # incidental formatting differences (quote style, spacing, a
+          # trailing comment) the way a hand-rolled text pattern could.
+          . .\lib\DeltaInstaller.Version.ps1
+          $installerVersion = $Script:DeltaInstallerVersion
+
+          $gitTag        = "${{ github.ref_name }}"
+          $taggedVersion = "${{ steps.version.outputs.version }}"
+
+          if ($installerVersion -ne $taggedVersion) {
+            Write-Host "Version mismatch detected."
+            Write-Host ""
+            Write-Host "Git tag:"
+            Write-Host "$gitTag"
+            Write-Host ""
+            Write-Host "Installer version:"
+            Write-Host "$installerVersion"
+            Write-Host ""
+            Write-Host "Release aborted."
+            exit 1
+          }
+
+          Write-Host "Installer version matches Git tag."
+          Write-Host ""
+          Write-Host "Proceeding with release build..."
+
+      - name: Build release package
+        shell: pwsh
+        run: .\tools\build-release.ps1 -Version "${{ steps.version.outputs.version }}"
+        # All packaging logic (whitelist copy, ZIP, SHA256) lives in this
+        # script. This workflow only supplies the version and invokes it -
+        # it fails the job automatically if the script exits non-zero.
+
+      - name: Verify release artifacts exist
+        shell: pwsh
+        run: |
+          $version  = "${{ steps.version.outputs.version }}"
+          $zip      = "release/DELTA-windows-installer-$version.zip"
+          $checksum = "$zip.sha256"
+
+          if (-not (Test-Path -LiteralPath $zip -PathType Leaf)) {
+            throw "Expected release artifact not found: $zip"
+          }
+          if (-not (Test-Path -LiteralPath $checksum -PathType Leaf)) {
+            throw "Expected release artifact not found: $checksum"
+          }
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            release/DELTA-windows-installer-${{ steps.version.outputs.version }}.zip
+            release/DELTA-windows-installer-${{ steps.version.outputs.version }}.zip.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -122,6 +122,12 @@ $Script:DeltaRuntimeSourceDirectory = Join-Path -Path $Script:ProjectRoot -Child
 # must be set before this line rather than computed inside it.
 . (Join-Path -Path $Script:ProjectRoot -ChildPath 'lib\DeltaInstaller.Common.ps1')
 
+# Single source of truth for this installer's own version - see that
+# file's header. Dot-sourced separately from DeltaInstaller.Common.ps1
+# so the version stays a plain, standalone piece of data rather than
+# living inside the shared helper library.
+. (Join-Path -Path $Script:ProjectRoot -ChildPath 'lib\DeltaInstaller.Version.ps1')
+
 # Automatic dts_shared_binary acquisition/update (GitHub Releases API) -
 # deliberately independent of the rest of this script; see that file's own
 # header for why it takes its inputs as parameters rather than reading
@@ -2472,7 +2478,7 @@ function Confirm-DeltaRuntimeNotRunning {
 }
 
 function Initialize-Setup {
-    Write-SetupBanner -Title 'DELTA Setup' -Subtitle 'Windows Deployment Installer'
+    Write-SetupBanner -Title 'DELTA Windows Installer' -Subtitle "Version $Script:DeltaInstallerVersion"
 
     # Install logs live under %TEMP% (ephemeral, per-run detail); cached
     # installer binaries live under .\installers (persistent, see
