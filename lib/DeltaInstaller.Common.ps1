@@ -453,6 +453,70 @@ function Split-UninstallCommand {
 }
 
 # ---------------------------------------------------------------------------
+# DELTA installation discovery
+# ---------------------------------------------------------------------------
+
+function Get-DeltaInstallPath {
+    <#
+      The single, shared way any Windows installer utility - today just
+      setup.ps1 registering itself (Register-DeltaInstallation), tomorrow
+      setup-nginx.ps1/setup-iis.ps1/upgrade.ps1/uninstall.ps1 consuming it -
+      discovers where DELTA is actually installed, instead of each script
+      separately hardcoding a path or re-implementing its own registry/
+      filesystem detection. Deliberately placed here rather than inside any
+      one of those scripts, so all of them share exactly one resolution
+      order rather than each maintaining its own copy.
+
+      Returns the resolved installation directory as a plain string, or
+      $null if no valid installation could be found - never throws, since
+      "DELTA isn't installed here" is a normal, expected outcome the caller
+      needs to decide how to handle (contrast Get-PostgresBinDirectory
+      above, where Stop-Setup IS appropriate - that function's callers
+      already know they need a PostgreSQL installation to proceed; a
+      caller of this one is often specifically trying to tell "missing"
+      apart from "found" before deciding what to do next).
+
+      Resolution order:
+
+        1. HKLM:\SOFTWARE\PreventionWeb\DELTA's InstallPath value (written
+           by setup.ps1's Register-DeltaInstallation as the last step of a
+           successful install) - but only trusted if that directory still
+           actually exists on disk right now. The registry is never
+           trusted blindly: an installation could have been moved or
+           deleted by hand after the key was written, and a stale registry
+           value pointing at nothing is worse than no value at all, so
+           this falls through to the legacy check below rather than
+           returning a path that isn't really there.
+
+        2. The legacy default install path, C:\DELTA - for installations
+           created before Register-DeltaInstallation existed and therefore
+           never registered themselves at all. Verified by the presence of
+           C:\DELTA\.env specifically, not just the directory existing -
+           .env is a real deployment artifact (New-DeltaEnvironmentFile in
+           setup.ps1 only ever writes it once an installation has actually
+           happened), whereas an empty C:\DELTA directory proves nothing
+           and could exist for unrelated reasons.
+
+        3. $null if neither of the above found anything real.
+    #>
+
+    $registryKeyPath = 'HKLM:\SOFTWARE\PreventionWeb\DELTA'
+    $registryEntry = Get-ItemProperty -LiteralPath $registryKeyPath -Name 'InstallPath' -ErrorAction SilentlyContinue
+    $registryInstallPath = Get-RegistryPropertyValue -InputObject $registryEntry -Name 'InstallPath'
+    if ($registryInstallPath -and (Test-Path -LiteralPath $registryInstallPath)) {
+        return $registryInstallPath
+    }
+
+    $legacyInstallPath = 'C:\DELTA'
+    $legacyEnvPath = Join-Path -Path $legacyInstallPath -ChildPath '.env'
+    if (Test-Path -LiteralPath $legacyEnvPath) {
+        return $legacyInstallPath
+    }
+
+    return $null
+}
+
+# ---------------------------------------------------------------------------
 # Session PATH refresh
 # ---------------------------------------------------------------------------
 

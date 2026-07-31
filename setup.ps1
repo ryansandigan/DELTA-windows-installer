@@ -2758,6 +2758,80 @@ function Resolve-ExistingDeltaDeployment {
 }
 
 # ---------------------------------------------------------------------------
+# Registry registration
+# ---------------------------------------------------------------------------
+
+# The single, authoritative location future DELTA utilities (setup-nginx.ps1,
+# a future setup-iis.ps1, upgrade.ps1, uninstall.ps1) are meant to read to
+# discover this installation, instead of each one separately assuming a fixed
+# path the way this installer's own scripts historically have (see
+# $Script:DefaultDeltaRuntimeRoot in lib\DeltaInstaller.Common.ps1 - that
+# remains only a prompt default, never an assumption an installed copy
+# actually lives there). Deliberately just these two values for now - see
+# this section's own Register-DeltaInstallation for why nothing else is
+# written yet.
+$Script:DeltaRegistryKeyPath = 'HKLM:\SOFTWARE\PreventionWeb\DELTA'
+
+function Register-DeltaInstallation {
+    <#
+      The last real phase of this installer - writes/updates
+      $Script:DeltaRegistryKeyPath with where DELTA was installed
+      (InstallPath, from $Script:DeltaRuntimeRoot - the actual resolved
+      directory, per Resolve-DeltaAppRoot, never a hardcoded C:\DELTA) and
+      which version of this installer put it there (Version, from
+      $Script:DeltaInstallerVersion - lib\DeltaInstaller.Version.ps1 -
+      never hand-duplicated here). Only InstallPath/Version exist at this
+      stage; no other registry metadata is introduced.
+
+      Called last in the orchestration block below, only once every real
+      installation phase before it has already succeeded - a failed or
+      canceled installation must never register itself as complete. Only
+      the purely cosmetic final summary runs after this, so "this function
+      ran" and "the installation succeeded" are the same fact.
+
+      Idempotent by construction, not by an explicit "does the key already
+      exist" branch: Set-ItemProperty creates InstallPath/Version if
+      they're missing and simply overwrites them if they're not, so the
+      exact same two calls are correct whether this machine has never seen
+      a DELTA installation before or is being upgraded/reinstalled over an
+      existing one - confirmed directly that Set-ItemProperty does not
+      throw the way New-ItemProperty (without -Force) does against a
+      property that already exists.
+
+      Requires Administrator privileges to write under HKLM - checked
+      explicitly here (the same per-action pattern Install-NodeMsi/
+      Install-PostgresServer already use above) rather than assumed,
+      since a re-run against an already-fully-installed, unchanged
+      environment can otherwise complete every phase above without ever
+      needing to elevate.
+    #>
+
+    Write-PhaseBanner 'Registry Registration'
+    Write-Step 'Registering the DELTA installation in the Windows Registry...'
+    Write-Detail "Key: $($Script:DeltaRegistryKeyPath)"
+
+    if (-not (Test-IsAdministrator)) {
+        Stop-Setup "Administrator privileges are required to write to $($Script:DeltaRegistryKeyPath). Re-run this script from an elevated PowerShell session."
+    }
+
+    try {
+        if (-not (Test-Path -LiteralPath $Script:DeltaRegistryKeyPath)) {
+            New-Item -Path $Script:DeltaRegistryKeyPath -Force -ErrorAction Stop | Out-Null
+        }
+
+        Set-ItemProperty -LiteralPath $Script:DeltaRegistryKeyPath -Name 'InstallPath' -Value $Script:DeltaRuntimeRoot -Type String -ErrorAction Stop
+        Set-ItemProperty -LiteralPath $Script:DeltaRegistryKeyPath -Name 'Version' -Value $Script:DeltaInstallerVersion -Type String -ErrorAction Stop
+    }
+    catch {
+        Stop-Setup "Failed to register the DELTA installation in the Windows Registry ($($Script:DeltaRegistryKeyPath)): $($_.Exception.Message). This usually means Administrator privileges are required - re-run this script from an elevated PowerShell session."
+    }
+
+    Write-Success '    Registry key written.'
+    Write-Detail "InstallPath: $($Script:DeltaRuntimeRoot)"
+    Write-Detail "Version: $($Script:DeltaInstallerVersion)"
+}
+
+# ---------------------------------------------------------------------------
 # Orchestration
 #
 # Each phase is a single top-level function call, in dependency order.
@@ -2778,6 +2852,7 @@ try {
     Complete-DatabaseSetup
     Install-DeltaDependencies
     Confirm-DeltaRuntimeNotRunning
+    Register-DeltaInstallation
 
     # Future phases (not yet implemented):
     # Install-WindowsService (Phase 5)
