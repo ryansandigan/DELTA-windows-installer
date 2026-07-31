@@ -1,0 +1,127 @@
+# DELTA Windows Installer
+
+## Overview
+
+This repository contains the Windows installer for [DELTA](https://github.com/PreventionWeb/delta), a server-rendered web application for tracking disaster and hazardous-event data. **It is not the DELTA application itself** — it is a bootstrap installer that automates the installation, configuration, and deployment of DELTA on Windows.
+
+The installer is intentionally lightweight. Large runtime components — the Node.js runtime, PostgreSQL, PostGIS, and the DELTA application artifact itself — are downloaded during installation rather than bundled into the repository or its release packages.
+
+Windows Server is the primary production deployment target. Windows 11 is also supported, for development, testing, and proof-of-concept deployments.
+
+## Features
+
+- Automated, scripted installation via a single entry point (`setup.ps1`)
+- Automatic acquisition and update-checking of the DELTA runtime artifact (`dts_shared_binary`) against the DELTA GitHub Releases API
+- Node.js installation
+- PostgreSQL installation, including detection and optional reuse of an existing instance
+- PostGIS installation for the target PostgreSQL instance
+- DELTA runtime deployment to a configurable application directory
+- Environment configuration (`.env` generation from `.env.example`)
+- Database initialization
+- Database upgrade utility for existing DELTA installations
+- Uninstall utility for the prerequisites installed by `setup.ps1`
+- Idempotent installation steps — safe to run `setup.ps1` more than once against the same machine
+
+## Supported Platforms
+
+| Operating System | Status | Intended Use |
+|---|---|---|
+| Windows Server 2025 | Supported | Production |
+| Windows Server 2022 | Supported | Production |
+| Windows 11 | Supported | Development, testing, proof-of-concept |
+
+Only the platforms listed above have been validated. Other Windows versions and editions are not currently supported.
+
+## Repository Structure
+
+| Path | Purpose |
+|---|---|
+| `setup.ps1` | Main installation orchestrator. Coordinates Node.js, PostgreSQL, and PostGIS installation, DELTA runtime deployment, environment configuration, and database initialization. |
+| `init_db.ps1` | Creates the DELTA database and restores its schema against an existing PostgreSQL/PostGIS installation. Can be run standalone or invoked by `setup.ps1`. |
+| `upgrade_database.ps1` | Applies the DELTA SQL upgrade chain to an existing DELTA database. Can be run standalone or invoked by `setup.ps1`. |
+| `uninstall.ps1` | Removes the prerequisites installed by `setup.ps1` (Node.js, PostgreSQL, PostGIS). Does not remove the deployed DELTA runtime or its database unless explicitly instructed. |
+| `lib/` | Shared PowerShell helper functions used by `setup.ps1`, `init_db.ps1`, `upgrade_database.ps1`, and `uninstall.ps1`. |
+| `docs/` | Technical documentation covering runtime architecture, installation procedures, database management, and deployment considerations. |
+| `.env.example` | Template for the DELTA application's environment configuration, used to generate `.env` during installation. |
+
+Two directories are populated automatically by `setup.ps1` at install time and are not part of the repository's tracked content:
+
+| Path | Purpose |
+|---|---|
+| `installers/` | Downloaded installer binaries for Node.js, PostgreSQL, and PostGIS. |
+| `dts_shared_binary/` | The DELTA runtime artifact, downloaded from the DELTA GitHub Releases API and later deployed to the target application directory. |
+
+Both directories are excluded from GitHub release packages and from version control.
+
+## Prerequisites
+
+- Administrator privileges on the target machine
+- Internet connectivity, to download runtime components during installation
+- PowerShell 5.1 or later
+- A supported Windows version (see [Supported Platforms](#supported-platforms))
+
+## Quick Start
+
+```powershell
+Set-ExecutionPolicy RemoteSigned
+
+cd DELTA-windows-installer
+
+.\setup.ps1
+```
+
+- `Set-ExecutionPolicy RemoteSigned` allows locally present PowerShell scripts to run.
+- `cd DELTA-windows-installer` moves into the installer repository.
+- `.\setup.ps1` runs the installer, which prompts for the required inputs (such as the DELTA application directory) and proceeds through the phases described below.
+
+## Installation Workflow
+
+```
+Run setup.ps1
+      │
+      ▼
+Validate environment
+      │
+      ▼
+Download runtime components
+      │
+      ▼
+Install Node.js
+      │
+      ▼
+Install PostgreSQL
+      │
+      ▼
+Install PostGIS
+      │
+      ▼
+Deploy DELTA
+      │
+      ▼
+Generate configuration
+      │
+      ▼
+Finalize installation
+```
+
+`setup.ps1` is designed to be safe to run more than once: steps that are already satisfied (a component already installed, a database already present) are detected and skipped or handled interactively rather than repeated blindly.
+
+## Additional Utilities
+
+| Script | Purpose |
+|---|---|
+| `init_db.ps1` | Initializes the DELTA database — creates the database and loads its schema against an existing PostgreSQL/PostGIS installation. |
+| `upgrade_database.ps1` | Upgrades an existing DELTA database by applying the application's SQL upgrade chain. |
+| `uninstall.ps1` | Removes the components `setup.ps1` installs (Node.js, PostgreSQL, PostGIS) from the machine. |
+
+## Release Philosophy
+
+GitHub Releases for this repository contain only the installer itself — the PowerShell scripts and supporting library code. Large runtime payloads (the Node.js, PostgreSQL, and PostGIS installers, and the DELTA runtime artifact) are intentionally excluded and are instead downloaded during installation. This keeps releases small while ensuring the components installed are current at install time.
+
+## Documentation
+
+Additional technical documentation, including runtime architecture, platform-specific installation procedures, and database management, is available under [`docs/`](docs/).
+
+## License
+
+Licensing information for this repository has not yet been finalized. This section will be updated once a license is selected.
