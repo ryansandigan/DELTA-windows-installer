@@ -36,7 +36,7 @@
     would be a production incident, not a convenience.
 
     Only once that check has passed (no existing installation found) does
-    it proceed, in three phases:
+    it proceed, in five phases:
 
       1. Install-Nginx - installs the one pinned version, $Script:NginxVersion
          (see the Configuration section below), from a local
@@ -47,7 +47,18 @@
          conf\conf.d\ exists, since the official ZIP distribution does not
          ship that directory itself.
 
-      2. New-DeltaNginxConfiguration - writes C:\nginx\conf\nginx.conf and
+      2. Install-DeltaSslCertificate - the SSL Certificate Wizard (see
+         docs\todo\TODO-setup-nginx-enhancements.md, Phase 2). Asks the
+         administrator whether an SSL certificate already exists and, if
+         so, walks them through selecting it (and its private key) via
+         standard Windows file selection dialogs, validates both, and
+         copies them into C:\nginx\certs\ as delta.crt/delta.key. Answering
+         "No" is a complete no-op. Deliberately narrow in scope for now -
+         see that function's own header for what later phases (HTTP/HTTPS
+         template selection, automatic PORT detection, existing-certificate
+         overwrite handling) still own instead.
+
+      3. New-DeltaNginxConfiguration - writes C:\nginx\conf\nginx.conf and
          C:\nginx\conf\conf.d\delta.conf from the canonical templates in
          templates\nginx\ (this repository), rather than generating either
          file line-by-line from PowerShell. This deliberately replaces the
@@ -55,13 +66,15 @@
          in conf\nginx.conf with a minimal, DELTA-specific file. No backup
          step here - by the time this runs, the existing-installation check
          above has already guaranteed there is nothing pre-existing worth
-         protecting.
+         protecting. Still always the plain HTTP template regardless of
+         whether phase 2 just installed a certificate - wiring SSL into the
+         generated configuration is a later phase, not this one.
 
-      3. Test-DeltaNginxConfiguration - runs `nginx -t` against the
+      4. Test-DeltaNginxConfiguration - runs `nginx -t` against the
          configuration just written. A validation failure stops the script
          immediately, before NGINX is ever started.
 
-      4. Start-DeltaNginx - starts NGINX. On this path it is always a fresh
+      5. Start-DeltaNginx - starts NGINX. On this path it is always a fresh
          start, never a reload - the existing-installation check above
          guarantees nothing at $Script:NginxHome was already running.
 
@@ -92,6 +105,23 @@ $Script:NginxConfDirectory   = Join-Path -Path $Script:NginxHome -ChildPath 'con
 $Script:NginxMainConfigPath  = Join-Path -Path $Script:NginxConfDirectory -ChildPath 'nginx.conf'
 $Script:NginxConfDDirectory  = Join-Path -Path $Script:NginxConfDirectory -ChildPath 'conf.d'
 $Script:DeltaVHostConfigPath = Join-Path -Path $Script:NginxConfDDirectory -ChildPath 'delta.conf'
+
+# SSL Certificate Wizard (docs\todo\TODO-setup-nginx-enhancements.md, Phase
+# 2) - NGINX's own dedicated certs directory, never the original file
+# locations the administrator selected them from (Install-DeltaSslCertificate
+# below copies into these two fixed destinations).
+$Script:NginxCertsDirectory     = Join-Path -Path $Script:NginxHome -ChildPath 'certs'
+$Script:NginxCertificatePath    = Join-Path -Path $Script:NginxCertsDirectory -ChildPath 'delta.crt'
+$Script:NginxCertificateKeyPath = Join-Path -Path $Script:NginxCertsDirectory -ChildPath 'delta.key'
+
+$Script:SupportedCertificateExtensions = @('.crt', '.cer', '.pem')
+$Script:SupportedPrivateKeyExtensions  = @('.key', '.pem')
+
+# Set by Install-DeltaSslCertificate only when it actually copies a
+# certificate into place - stays $false on the "No" (no-op) answer, or if
+# that phase is never reached at all. Read by Show-DeltaNginxSummary to
+# decide whether to display the SSL Certificate section at all.
+$Script:SslCertificateConfigured = $false
 
 # The one NGINX version this installer ever installs - pinned, not "latest",
 # so a run today and a run next year install byte-for-byte the same NGINX.
@@ -356,6 +386,183 @@ function Install-Nginx {
 }
 
 # ---------------------------------------------------------------------------
+# SSL Certificate Wizard
+# ---------------------------------------------------------------------------
+
+function Read-SslCertificateChoice {
+    <#
+      Asks whether the administrator already has an SSL certificate ready
+      to install - the same numbered-choice, bare-Enter-picks-a-default
+      shape as Read-ExistingPostgresChoice/Read-DeltaDeploymentLifecycleChoice
+      in setup.ps1. Defaults to "No" on a bare Enter: an administrator who
+      presses Enter without reading closely should land on the option that
+      does nothing (no file dialogs pop up unexpectedly), not the one that
+      launches two of them.
+    #>
+
+    Write-Host ''
+    Write-Host 'Do you already have an SSL certificate?'
+    Write-Host ''
+    Write-Host '1) Yes'
+    Write-Host '2) No'
+    Write-Host ''
+
+    while ($true) {
+        $choice = Read-Host -Prompt 'Choose an option [2]'
+        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '2' }
+
+        switch ($choice.Trim()) {
+            '1' { return 'Yes' }
+            '2' { return 'No' }
+        }
+        Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
+    }
+}
+
+function Select-DeltaSslFile {
+    <#
+      Opens a standard Windows file selection dialog
+      (System.Windows.Forms.OpenFileDialog) and returns the selected file's
+      full path, or $null if the administrator closed/canceled the dialog
+      without choosing one - never a manually-typed path, per this
+      feature's own requirement (locating a certificate or key file
+      wherever it happens to live on disk is exactly what a file picker is
+      for). Requires an STA thread, which is WinForms' own hard
+      requirement, not something this function works around - powershell.exe
+      (the Windows PowerShell 5.1 host this script targets; see
+      #Requires -Version 5.1 above) defaults to STA, so this is not expected
+      to be an issue in practice.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Filter
+    )
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    }
+    catch {
+        Stop-Setup "Unable to open a file selection dialog - System.Windows.Forms could not be loaded: $($_.Exception.Message)"
+    }
+
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Title = $Title
+    $dialog.Filter = $Filter
+    $dialog.CheckFileExists = $true
+    $dialog.Multiselect = $false
+
+    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
+        return $null
+    }
+
+    return $dialog.FileName
+}
+
+function Test-DeltaSslFileExtension {
+    <#
+      Reports whether $Path's extension is one of $AllowedExtensions
+      (case-insensitive - Windows filesystems already are, so a literal
+      ".CRT" selected via the file dialog must be accepted the same as
+      ".crt"). A small, standalone helper rather than inlined at each call
+      site, since Install-DeltaSslCertificate below needs the identical
+      check twice (certificate, then private key) against two different
+      allowed-extension lists.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string[]]$AllowedExtensions
+    )
+
+    $extension = [System.IO.Path]::GetExtension($Path)
+    return $AllowedExtensions -contains $extension.ToLowerInvariant()
+}
+
+function Install-DeltaSslCertificate {
+    <#
+      Phase 2 of the enhancements roadmap - docs\todo\
+      TODO-setup-nginx-enhancements.md, "SSL Certificate Wizard". Asks the
+      administrator whether an SSL certificate already exists
+      (Read-SslCertificateChoice) and, if so, walks them through selecting
+      it and its private key via standard Windows file selection dialogs
+      (Select-DeltaSslFile), validates both thoroughly, and copies them
+      into $Script:NginxCertsDirectory as delta.crt/delta.key -
+      $Script:NginxCertificatePath/$Script:NginxCertificateKeyPath, NGINX's
+      own dedicated certs directory, never the original file locations the
+      administrator selected them from.
+
+      Answering "No" is a complete no-op: nothing is prompted for, created,
+      or copied, and every script-scoped path variable above stays defined
+      but unused.
+
+      Deliberately narrow in scope - explicitly NOT this phase's job (see
+      the TODO file's later, not-yet-implemented phases):
+        - Choosing between an HTTP or HTTPS NGINX configuration template.
+          New-DeltaNginxConfiguration always writes the plain HTTP
+          template regardless of whether this function just installed a
+          certificate.
+        - Reading the DELTA backend port from .env.
+        - Prompting before overwriting an already-existing delta.crt/
+          delta.key - this always copies over whatever, if anything, is
+          already there.
+
+      Validation failures (missing selection, missing file, unsupported
+      extension) all stop the installer outright (Stop-Setup) with a clear
+      message, per this feature's own requirement - never a silent skip.
+    #>
+
+    Write-PhaseBanner 'SSL Certificate'
+
+    $choice = Read-SslCertificateChoice
+    if ($choice -eq 'No') {
+        Write-Host ''
+        Write-Detail 'No SSL certificate will be configured at this time.'
+        return
+    }
+
+    Write-Step 'Selecting the SSL certificate file...'
+    $certificatePath = Select-DeltaSslFile -Title 'Select the SSL certificate file' `
+        -Filter 'Certificate Files (*.crt;*.cer;*.pem)|*.crt;*.cer;*.pem|All Files (*.*)|*.*'
+
+    Write-Step 'Selecting the SSL private key file...'
+    $privateKeyPath = Select-DeltaSslFile -Title 'Select the SSL private key file' `
+        -Filter 'Private Key Files (*.key;*.pem)|*.key;*.pem|All Files (*.*)|*.*'
+
+    if (-not $certificatePath -or -not $privateKeyPath) {
+        Stop-Setup 'SSL certificate setup was canceled - both the certificate and private key files must be selected.'
+    }
+    if (-not (Test-Path -LiteralPath $certificatePath)) {
+        Stop-Setup "The selected SSL certificate file does not exist: $certificatePath"
+    }
+    if (-not (Test-Path -LiteralPath $privateKeyPath)) {
+        Stop-Setup "The selected SSL private key file does not exist: $privateKeyPath"
+    }
+    if (-not (Test-DeltaSslFileExtension -Path $certificatePath -AllowedExtensions $Script:SupportedCertificateExtensions)) {
+        Stop-Setup "Unsupported SSL certificate file extension ($([System.IO.Path]::GetExtension($certificatePath))). Supported extensions: $($Script:SupportedCertificateExtensions -join ', ')."
+    }
+    if (-not (Test-DeltaSslFileExtension -Path $privateKeyPath -AllowedExtensions $Script:SupportedPrivateKeyExtensions)) {
+        Stop-Setup "Unsupported SSL private key file extension ($([System.IO.Path]::GetExtension($privateKeyPath))). Supported extensions: $($Script:SupportedPrivateKeyExtensions -join ', ')."
+    }
+
+    Write-Step 'Installing the SSL certificate...'
+    if (-not (Test-Path -LiteralPath $Script:NginxCertsDirectory)) {
+        New-Item -Path $Script:NginxCertsDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    Copy-Item -LiteralPath $certificatePath -Destination $Script:NginxCertificatePath -Force
+    Copy-Item -LiteralPath $privateKeyPath -Destination $Script:NginxCertificateKeyPath -Force
+
+    $Script:SslCertificateConfigured = $true
+
+    Write-Success '    SSL certificate installed.'
+    Write-Host ''
+    Write-Host 'Certificate:'
+    Write-Detail $Script:NginxCertificatePath
+    Write-Host ''
+    Write-Host 'Private key:'
+    Write-Detail $Script:NginxCertificateKeyPath
+}
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -576,6 +783,19 @@ function Show-DeltaNginxSummary {
     Write-Host 'DELTA Virtual Host:'
     Write-Detail $Script:DeltaVHostConfigPath
 
+    if ($Script:SslCertificateConfigured) {
+        Write-PhaseBanner 'SSL Certificate'
+        Write-Host 'Certificate:'
+        Write-Detail $Script:NginxCertificatePath
+        Write-Host ''
+        Write-Host 'Private Key:'
+        Write-Detail $Script:NginxCertificateKeyPath
+        Write-Host ''
+        Write-Host 'Note: HTTPS is not yet wired into the generated NGINX'
+        Write-Host 'configuration - this certificate has only been installed'
+        Write-Host 'for a later step to use.'
+    }
+
     Write-PhaseBanner 'Backend'
     Write-Host 'DELTA:'
     Write-Detail $Script:DeltaBackendUrl
@@ -689,6 +909,7 @@ try {
     }
 
     Install-Nginx
+    Install-DeltaSslCertificate
     New-DeltaNginxConfiguration
     Test-DeltaNginxConfiguration
     Start-DeltaNginx
