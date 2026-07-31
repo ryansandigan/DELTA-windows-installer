@@ -108,6 +108,450 @@ function Test-IsAdministrator {
 }
 
 # ---------------------------------------------------------------------------
+# Long-running process activity indicator
+# ---------------------------------------------------------------------------
+
+function Start-ProcessWithActivityIndicator {
+    <#
+      Generic wrapper around Start-Process for long-running, silent child
+      processes (installers, in particular) that otherwise give the
+      operator no sign the installer is still alive for several minutes
+      at a time. Purely a console UX layer: every caller still gets back
+      the same System.Diagnostics.Process a plain Start-Process -PassThru
+      -Wait would have returned (including its .ExitCode once the
+      process has exited), so every existing exit-code check, log path,
+      and Stop-Setup error message at each call site is completely
+      unaffected - callers only replace their own Start-Process call
+      with this one.
+
+      Two ways to use it:
+        - Pass -FilePath (and optionally -ArgumentList/-WorkingDirectory/
+          -RedirectStandardInput) and this function starts the process
+          itself.
+        - Pass an already-started -Process (from Start-Process -PassThru,
+          deliberately NOT -Wait) for a caller that needs Start-Process
+          options this function doesn't expose directly.
+
+      While the child process runs, a single console line is updated in
+      place (carriage return, not repeated Write-Host calls) with a
+      cycling dot trail and an elapsed mm:ss timer (e.g. "Installing
+      PostgreSQL..... (02:14)"), polled via Process.WaitForExit(500) - no
+      Start-Sleep racing the exit, and never more than one visible line
+      per activity. The timer is measured from $Process.StartTime (the
+      child process's own actual start time, not when this function
+      happened to be called) and simply stops being displayed the
+      instant the process exits, along with the rest of the line. If the
+      console output is redirected (e.g. piped to a
+      log file, where \r has no visible effect), the same 500ms poll
+      instead emits a fresh line, but throttled to once every 2 seconds
+      so a multi-minute install can't flood the log. Either way, the
+      moment the process exits - success or failure alike - the line is
+      cleared immediately, so whatever the caller prints next (its own
+      success message, or Stop-Setup's error message on a non-zero exit
+      code) appears cleanly on its own line, exactly as it does today.
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'Command')]
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'Command')]
+        [string]$FilePath,
+
+        [Parameter(ParameterSetName = 'Command')]
+        [string]$ArgumentList,
+
+        [Parameter(ParameterSetName = 'Command')]
+        [string]$WorkingDirectory,
+
+        [Parameter(ParameterSetName = 'Command')]
+        [string]$RedirectStandardInput,
+
+        [Parameter(Mandatory, ParameterSetName = 'Process')]
+        [System.Diagnostics.Process]$Process,
+
+        [Parameter(Mandatory)]
+        [string]$ActivityName
+    )
+
+    if ($PSCmdlet.ParameterSetName -eq 'Command') {
+        # Built on System.Diagnostics.Process directly rather than the
+        # Start-Process cmdlet: confirmed directly that Start-Process
+        # -PassThru, when used WITHOUT -Wait (a requirement here, since
+        # this function needs to poll the process itself to animate),
+        # can return a Process object whose .ExitCode never becomes
+        # readable (silently $null) even after WaitForExit() confirms
+        # HasExited - a cmdlet-specific quirk, not present when driving
+        # System.Diagnostics.Process directly. Every exit-code check at
+        # every call site depends on ExitCode being trustworthy, so this
+        # sidesteps the cmdlet entirely instead of working around it.
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $FilePath
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        if ($ArgumentList)     { $startInfo.Arguments = $ArgumentList }
+        if ($WorkingDirectory) { $startInfo.WorkingDirectory = $WorkingDirectory }
+        if ($RedirectStandardInput) { $startInfo.RedirectStandardInput = $true }
+
+        $Process = New-Object System.Diagnostics.Process
+        $Process.StartInfo = $startInfo
+        [void]$Process.Start()
+
+        if ($RedirectStandardInput) {
+            # Mirrors Start-Process -RedirectStandardInput <path>: feed the
+            # file's bytes to the child's stdin, then close it so the
+            # child sees EOF rather than blocking on further input.
+            $stdinBytes = [System.IO.File]::ReadAllBytes($RedirectStandardInput)
+            if ($stdinBytes.Length -gt 0) {
+                $Process.StandardInput.BaseStream.Write($stdinBytes, 0, $stdinBytes.Length)
+            }
+            $Process.StandardInput.Close()
+        }
+    }
+
+    $inPlace           = -not [Console]::IsOutputRedirected
+    $dots              = 0
+    $maxDots           = 6
+    $lastLineLength    = 0
+    $lastFallbackPrint = Get-Date
+
+    # $Process.StartTime (not Get-Date here) so the timer reflects when the
+    # child process itself actually started - matters for the -Process
+    # parameter set, where the process may already have been running for a
+    # moment before this function was ever called.
+    $startTime = $Process.StartTime
+
+    while (-not $Process.WaitForExit(500)) {
+        $dots = if ($dots -ge $maxDots) { 1 } else { $dots + 1 }
+        $elapsed = [TimeSpan]::FromSeconds([Math]::Floor(((Get-Date) - $startTime).TotalSeconds))
+        $line = "    $ActivityName" + ('.' * $dots) + " ($($elapsed.ToString('mm\:ss')))"
+
+        if ($inPlace) {
+            Write-Host "`r$($line.PadRight($lastLineLength))" -NoNewline
+            $lastLineLength = $line.Length
+        }
+        elseif (((Get-Date) - $lastFallbackPrint).TotalSeconds -ge 2) {
+            Write-Host $line
+            $lastFallbackPrint = Get-Date
+        }
+    }
+
+    # WaitForExit(int) can return true a moment before the process's exit
+    # code is actually available (a documented .NET race - see
+    # Process.WaitForExit's own remarks on synchronizing after the
+    # timeout overload). The parameterless overload blocks until that
+    # synchronization is guaranteed to have completed - effectively
+    # instant here, since the process has already exited - so callers can
+    # trust $Process.ExitCode immediately on return.
+    $Process.WaitForExit()
+
+    if ($inPlace -and $lastLineLength -gt 0) {
+        Write-Host "`r$(' ' * $lastLineLength)`r" -NoNewline
+    }
+
+    return $Process
+}
+
+function Wait-Until {
+    <#
+      Polls $Condition (a scriptblock returning truthy/falsy) every
+      $IntervalMilliseconds until it returns true or $TimeoutSeconds
+      elapses, then returns whatever the condition's own last evaluation
+      was - never throws itself, so the caller decides what a timeout
+      actually means. The same "poll for a state change instead of
+      trusting the instant a process handle exits" shape as
+      Wait-ForPostgresServiceRunning below, generalized: that function
+      waits on a Windows service reaching Running; this one waits on any
+      caller-supplied condition, which is what uninstall.ps1 needs to
+      confirm a just-uninstalled program's registry entry is actually
+      gone.
+
+      Exists specifically because of a confirmed race: several
+      installers (NSIS-based ones, in particular - PostGIS's own bundle
+      uninstaller, verified directly on a real machine) copy themselves
+      to a temporary location and re-launch that copy to perform the
+      actual cleanup - including deleting the Add/Remove Programs
+      registry entry - and the ORIGINAL process (the one Start-Process
+      was ever able to wait on) exits and reports success before that
+      detached copy has necessarily finished. A validation check run in
+      the same instant the wait returns can therefore observe the
+      registry entry still present for a program that has, in every way
+      that matters, already been fully uninstalled - not a failed
+      uninstall, and not a validation pattern-matching bug, just a
+      normal completion lag this needs to tolerate rather than treat as
+      instantaneous.
+    #>
+    param(
+        [Parameter(Mandatory)][scriptblock]$Condition,
+        [int]$TimeoutSeconds = 10,
+        [int]$IntervalMilliseconds = 500
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        if (& $Condition) {
+            return $true
+        }
+        Start-Sleep -Milliseconds $IntervalMilliseconds
+    } while ((Get-Date) -lt $deadline)
+
+    return [bool](& $Condition)
+}
+
+# ---------------------------------------------------------------------------
+# Windows Programs and Features (uninstall) helpers
+# ---------------------------------------------------------------------------
+
+function Get-RegistryPropertyValue {
+    <#
+      Safely reads a possibly-absent property from a Get-ItemProperty
+      result, returning $null instead of throwing when it isn't there.
+
+      Registry "objects" have no fixed schema the way a real class does:
+      Get-ItemProperty only ever attaches the properties that actually
+      exist as values under that specific key, so sibling keys under the
+      same parent routinely expose different property sets from each
+      other - confirmed directly against this machine's own Uninstall
+      registry hive, where 5 of 13 subkeys had no DisplayName value at
+      all. Under this project's Set-StrictMode -Version Latest,
+      $obj.SomeMissingProperty throws ("The property '...' cannot be
+      found on this object") rather than quietly returning $null - the
+      confirmed root cause of a real Get-InstalledProgramInfo failure:
+      dot-notation property access on entries that were missing the
+      property being read. Going through $obj.PSObject.Properties[$Name]
+      explicitly, rather than dot-notation, is the idiomatic way to read
+      a possibly-absent property under strict mode - the members
+      collection's indexer returns $null for a genuinely absent property
+      instead of throwing, which is what every caller here actually
+      wants. Generic and reusable beyond this one caller - anywhere a
+      dynamically-shaped object (registry results, parsed config, JSON)
+      needs a property read that may legitimately not be there.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()]$InputObject,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if (-not $property) {
+        return $null
+    }
+    return $property.Value
+}
+
+function Get-InstalledProgramInfo {
+    <#
+      Looks up a program's "Programs and Features" registration (the same
+      data Control Panel / Settings > Apps reads) by DisplayName, via the
+      registry directly - never the Win32_Product WMI class, which is a
+      well-documented Windows footgun: merely querying it silently
+      triggers a consistency-check MSI reconfigure of every installed MSI
+      package on the machine. Scans both registry views a 64-bit Windows
+      Server exposes - HKLM:\...\Uninstall (native 64-bit apps) and
+      HKLM:\...\WOW6432Node\...\Uninstall (32-bit apps under WOW64) -
+      since a given installer isn't guaranteed to register in only one.
+
+      Every property read from a raw registry result goes through
+      Get-RegistryPropertyValue rather than dot-notation - see that
+      function's own comment for why: a meaningful fraction of real
+      Uninstall subkeys (hotfixes, updates, and other non-"program"
+      entries Windows registers in the same hive) lack DisplayName
+      entirely, and some that do have it still lack one or more of the
+      other fields read here (QuietUninstallString and InstallLocation,
+      in particular, are commonly absent even on legitimate program
+      entries). None of that is an error condition - it's the normal,
+      expected shape of this registry hive - so nothing here should ever
+      throw just because a given subkey doesn't happen to have every
+      field.
+
+      $DisplayNamePattern is a -like wildcard pattern (e.g. '*PostgreSQL*'),
+      matched case-insensitively (the default for -like) against each
+      entry's DisplayName. ALWAYS returns a real array - never $null, and
+      never a bare (non-array) PSCustomObject - regardless of whether
+      zero, exactly one, or several entries matched, so every caller can
+      unconditionally use .Count / index into it / pipe it without first
+      checking what kind of thing came back. This guarantee needs the
+      explicit unary-comma on the return statement below (`return
+      ,@($matches)`, not `return @($matches)`): confirmed directly that
+      PowerShell's own pipeline-output unwrapping otherwise collapses a
+      zero-element array return into $null, and a one-element array
+      return into that single element as a bare scalar - only a
+      two-or-more-element array survives a plain `return @($matches)`
+      as an actual array. That inconsistency was a second, independent
+      bug alongside the DisplayName strict-mode failure - one that
+      hadn't yet caused visible failures only because every current
+      caller happens to pipe the result through `Select-Object -First 1`
+      (safe against all three shapes), not because the function itself
+      was actually returning what its own contract promised.
+    #>
+    param([Parameter(Mandatory)][string]$DisplayNamePattern)
+
+    $uninstallKeyPaths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+
+    $rawEntries = @(Get-ItemProperty -Path $uninstallKeyPaths -ErrorAction SilentlyContinue)
+
+    $matches = @(foreach ($entry in $rawEntries) {
+        $displayName = Get-RegistryPropertyValue -InputObject $entry -Name 'DisplayName'
+        if (-not $displayName) {
+            continue
+        }
+        if ($displayName -notlike $DisplayNamePattern) {
+            continue
+        }
+
+        [PSCustomObject]@{
+            DisplayName          = $displayName
+            DisplayVersion       = Get-RegistryPropertyValue -InputObject $entry -Name 'DisplayVersion'
+            UninstallString      = Get-RegistryPropertyValue -InputObject $entry -Name 'UninstallString'
+            QuietUninstallString = Get-RegistryPropertyValue -InputObject $entry -Name 'QuietUninstallString'
+            InstallLocation      = Get-RegistryPropertyValue -InputObject $entry -Name 'InstallLocation'
+        }
+    })
+
+    return ,$matches
+}
+
+function Split-UninstallCommand {
+    <#
+      Splits a registered UninstallString (as read from
+      Get-InstalledProgramInfo) into the executable path Start-Process
+      needs and whatever arguments, if any, were already registered
+      alongside it - e.g. '"C:\Program Files\PostgreSQL\16\uninstall-
+      postgresql.exe"' or, quoted differently, an unquoted
+      'C:\bin\uninst.exe /SOMEFLAG'. Handles the quoted-path case
+      explicitly (the common one whenever the path itself contains a
+      space, e.g. anything under "Program Files") rather than naively
+      splitting on the first space, which would otherwise cut a quoted
+      path in half.
+    #>
+    param([Parameter(Mandatory)][string]$UninstallString)
+
+    $trimmed = $UninstallString.Trim()
+
+    if ($trimmed.StartsWith('"')) {
+        $closingQuoteIndex = $trimmed.IndexOf('"', 1)
+        if ($closingQuoteIndex -gt 0) {
+            return [PSCustomObject]@{
+                FilePath  = $trimmed.Substring(1, $closingQuoteIndex - 1)
+                Arguments = $trimmed.Substring($closingQuoteIndex + 1).Trim()
+            }
+        }
+    }
+
+    $firstSpaceIndex = $trimmed.IndexOf(' ')
+    if ($firstSpaceIndex -lt 0) {
+        return [PSCustomObject]@{ FilePath = $trimmed; Arguments = '' }
+    }
+    return [PSCustomObject]@{
+        FilePath  = $trimmed.Substring(0, $firstSpaceIndex)
+        Arguments = $trimmed.Substring($firstSpaceIndex + 1).Trim()
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Session PATH refresh
+# ---------------------------------------------------------------------------
+
+function Update-SessionEnvironmentPath {
+    <#
+      An MSI install or uninstall updates the Machine/User PATH in the
+      registry, but an already-running PowerShell process does not pick
+      that up automatically. Rebuilding $env:Path from both scopes lets
+      node/npm resolve (setup.ps1, right after installing) or stop
+      resolving (uninstall.ps1, right after removing) later in this same
+      session, without requiring a new shell.
+    #>
+    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $userPath    = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = @($machinePath, $userPath) -join ';'
+}
+
+# ---------------------------------------------------------------------------
+# Node.js discovery
+# ---------------------------------------------------------------------------
+
+function Find-NodeExecutable {
+    <#
+      Locates node.exe without relying solely on PATH, in order of preference:
+        1. PATH (covers the common case cheaply)
+        2. The Node.js installer's own registry key
+        3. Well-known Program Files install locations
+      Returns the full path to node.exe, or $null if not found by any method.
+      Shared by setup.ps1 (Phase 1 idempotency check) and uninstall.ps1
+      (both its detection phase and its post-uninstall verification) -
+      "is Node.js actually usable right now" needs to mean exactly the
+      same thing in both directions.
+    #>
+
+    $fromPath = Get-Command -Name 'node.exe' -ErrorAction SilentlyContinue
+    if ($fromPath) {
+        return $fromPath.Source
+    }
+
+    $registryKeys = @(
+        'HKLM:\SOFTWARE\Node.js',
+        'HKLM:\SOFTWARE\WOW6432Node\Node.js'
+    )
+    foreach ($key in $registryKeys) {
+        if (Test-Path -Path $key) {
+            # Get-RegistryPropertyValue, not dot-notation - see its own
+            # comment: this key existing doesn't guarantee it has an
+            # InstallPath value, and dot-notation on a genuinely absent
+            # property throws under this project's Set-StrictMode
+            # -Version Latest rather than returning $null.
+            $registryItem = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+            $installPath = Get-RegistryPropertyValue -InputObject $registryItem -Name 'InstallPath'
+            if ($installPath) {
+                $candidate = Join-Path -Path $installPath -ChildPath 'node.exe'
+                if (Test-Path -Path $candidate) {
+                    return $candidate
+                }
+            }
+        }
+    }
+
+    $wellKnownPaths = @(
+        (Join-Path -Path $env:ProgramFiles -ChildPath 'nodejs\node.exe')
+    )
+    if (${env:ProgramFiles(x86)}) {
+        $wellKnownPaths += Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath 'nodejs\node.exe'
+    }
+    foreach ($candidate in $wellKnownPaths) {
+        if (Test-Path -Path $candidate) {
+            return $candidate
+        }
+    }
+
+    return $null
+}
+
+function Get-InstalledNodeVersion {
+    <#
+      Runs node.exe -v directly rather than trusting registry metadata,
+      since that's the one source guaranteed to reflect what actually runs.
+      Returns the version without a leading "v", or $null on failure.
+    #>
+    param([Parameter(Mandatory)][string]$NodeExecutablePath)
+
+    try {
+        $rawVersion = & $NodeExecutablePath '-v' 2>$null
+    }
+    catch {
+        return $null
+    }
+
+    if (-not $rawVersion) {
+        return $null
+    }
+
+    return ($rawVersion | Select-Object -First 1).ToString().Trim().TrimStart('v')
+}
+
+# ---------------------------------------------------------------------------
 # Credential handling
 # ---------------------------------------------------------------------------
 

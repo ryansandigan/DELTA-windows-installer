@@ -215,6 +215,17 @@ $Script:PostGISChecksumUrl     = "$($Script:PostGISDownloadUrl).md5"
 $Script:DefaultDeltaDatabaseName = 'dts_db'
 $Script:EnvTemplatePath          = Join-Path -Path $Script:ProjectRoot -ChildPath '.env.example'
 
+# Set by Resolve-ExistingDeltaDeployment - 'Upgrade' (default), 'Recreate',
+# or 'Fresh'. Stays 'Upgrade' unmodified whenever no existing DELTA
+# deployment is found at all, which is exactly what makes that case behave
+# identically to every phase's own pre-existing idempotent behavior with
+# zero special-casing required elsewhere. Read by New-DeltaEnvironmentFile
+# (via its -ForceRegenerateFromTemplate switch) once DATABASE_URL is
+# finally known, later in the run - see Resolve-ExistingDeltaDeployment's
+# own header for why the 'Recreate' choice can only be recorded here, not
+# acted on immediately.
+$Script:DeltaDeploymentLifecycle = 'Upgrade'
+
 # ---------------------------------------------------------------------------
 # Generic helpers
 #
@@ -225,88 +236,20 @@ $Script:EnvTemplatePath          = Join-Path -Path $Script:ProjectRoot -ChildPat
 # specific to this script's own installation phases stays here.
 # ---------------------------------------------------------------------------
 
-function Update-SessionEnvironmentPath {
-    <#
-      An MSI install updates the Machine/User PATH in the registry, but an
-      already-running PowerShell process does not pick that up automatically.
-      Rebuilding $env:Path from both scopes lets node/npm resolve later in
-      this same session without requiring a new shell.
-    #>
-    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    $userPath    = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $env:Path = @($machinePath, $userPath) -join ';'
-}
-
 # ---------------------------------------------------------------------------
-# Node.js detection
+# Update-SessionEnvironmentPath now lives in lib\DeltaInstaller.Common.ps1 -
+# uninstall.ps1 needs the identical Machine+User PATH refresh (e.g. right
+# after an MSI uninstall) that this script does after an install.
 # ---------------------------------------------------------------------------
 
-function Find-NodeExecutable {
-    <#
-      Locates node.exe without relying solely on PATH, in order of preference:
-        1. PATH (covers the common case cheaply)
-        2. The Node.js installer's own registry key
-        3. Well-known Program Files install locations
-      Returns the full path to node.exe, or $null if not found by any method.
-    #>
-
-    $fromPath = Get-Command -Name 'node.exe' -ErrorAction SilentlyContinue
-    if ($fromPath) {
-        return $fromPath.Source
-    }
-
-    $registryKeys = @(
-        'HKLM:\SOFTWARE\Node.js',
-        'HKLM:\SOFTWARE\WOW6432Node\Node.js'
-    )
-    foreach ($key in $registryKeys) {
-        if (Test-Path -Path $key) {
-            $installPath = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).InstallPath
-            if ($installPath) {
-                $candidate = Join-Path -Path $installPath -ChildPath 'node.exe'
-                if (Test-Path -Path $candidate) {
-                    return $candidate
-                }
-            }
-        }
-    }
-
-    $wellKnownPaths = @(
-        (Join-Path -Path $env:ProgramFiles -ChildPath 'nodejs\node.exe')
-    )
-    if (${env:ProgramFiles(x86)}) {
-        $wellKnownPaths += Join-Path -Path ${env:ProgramFiles(x86)} -ChildPath 'nodejs\node.exe'
-    }
-    foreach ($candidate in $wellKnownPaths) {
-        if (Test-Path -Path $candidate) {
-            return $candidate
-        }
-    }
-
-    return $null
-}
-
-function Get-InstalledNodeVersion {
-    <#
-      Runs node.exe -v directly rather than trusting registry metadata,
-      since that's the one source guaranteed to reflect what actually runs.
-      Returns the version without a leading "v", or $null on failure.
-    #>
-    param([Parameter(Mandatory)][string]$NodeExecutablePath)
-
-    try {
-        $rawVersion = & $NodeExecutablePath '-v' 2>$null
-    }
-    catch {
-        return $null
-    }
-
-    if (-not $rawVersion) {
-        return $null
-    }
-
-    return ($rawVersion | Select-Object -First 1).ToString().Trim().TrimStart('v')
-}
+# ---------------------------------------------------------------------------
+# Node.js detection now lives in lib\DeltaInstaller.Common.ps1
+# (Find-NodeExecutable, Get-InstalledNodeVersion) - uninstall.ps1 needs the
+# exact same "is Node.js actually usable right now" detection this script
+# uses, so it was promoted to the shared file the same way PostgreSQL
+# detection already was, rather than let a second copy of either function
+# exist.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Download
@@ -374,9 +317,10 @@ function Install-NodeMsi {
 
     Write-Step 'Installing Node.js (silent MSI install)...'
     Write-Detail "Log: $logPath"
+    Write-Detail 'This may take several minutes.'
 
     $argumentString = "/i `"$InstallerPath`" /qn /norestart /log `"$logPath`""
-    $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList $argumentString -Wait -PassThru -NoNewWindow
+    $process = Start-ProcessWithActivityIndicator -FilePath 'msiexec.exe' -ArgumentList $argumentString -ActivityName 'Installing Node.js'
 
     switch ($process.ExitCode) {
         0 {
@@ -794,6 +738,7 @@ function Install-PostgresServer {
     Write-Detail "Data directory: $($Script:PostgresDataDirectory)"
     Write-Detail "Port: $($Script:PostgresPort)"
     Write-Detail "Service name: $($Script:PostgresServiceName)"
+    Write-Detail 'This may take several minutes.'
 
     $plainPassword   = ConvertTo-PlainText -SecureString $SuperuserPassword
     $servicePassword = New-ServiceAccountPassword
@@ -815,7 +760,7 @@ function Install-PostgresServer {
             "--errortrace `"$errorTracePath`""
         ) -join ' '
 
-        $process = Start-Process -FilePath $InstallerPath -ArgumentList $argumentString -Wait -PassThru -NoNewWindow
+        $process = Start-ProcessWithActivityIndicator -FilePath $InstallerPath -ArgumentList $argumentString -ActivityName 'Installing PostgreSQL'
     }
     finally {
         # Best-effort clearing of the in-memory plaintext passwords. .NET
@@ -1103,6 +1048,55 @@ function Install-PostgreSql {
 # PostGIS detection and validation
 # ---------------------------------------------------------------------------
 
+function Get-PostGISFailureReason {
+    <#
+      Classifies why Test-PostGISAvailable's psql invocation didn't
+      confirm PostGIS as available, into one of a small set of short,
+      stable category labels - diagnostic-only, purely for the log.
+      Never called by anything that changes behavior based on the
+      result; it only makes the existing pass/fail outcome easier to
+      read in the installer's own output. Mirrors the classification
+      approach Get-PostgresConnectionFailureReason
+      (lib\DeltaInstaller.Common.ps1) already uses for the credential-
+      validation path - full-sentence explanations there, short category
+      labels here - and adds an "Extension missing" category specific to
+      this function's own CREATE EXTENSION postgis call.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$ExitCode,
+        [AllowEmptyString()][string]$OutputText
+    )
+
+    if ($ExitCode -eq 0) {
+        # psql itself reported success (exit 0) but the expected POSTGIS=
+        # marker wasn't found in its output - not one of the normal,
+        # anticipated failure shapes below.
+        return 'Unexpected PostgreSQL error'
+    }
+    if ([string]::IsNullOrWhiteSpace($OutputText)) {
+        return 'Unknown'
+    }
+    if ($OutputText -match '(?i)connection refused') {
+        return 'Connection refused'
+    }
+    if ($OutputText -match '(?i)(timed out|timeout expired)') {
+        return 'Connection timeout'
+    }
+    if ($OutputText -match '(?i)authentication failed') {
+        return 'Authentication failure'
+    }
+    if ($OutputText -match 'database "[^"]*" does not exist') {
+        return 'Database not found'
+    }
+    if ($OutputText -match '(?i)(extension "postgis" is not available|could not open extension control file)') {
+        return 'Extension missing'
+    }
+    if ($OutputText -match '(?i)error:') {
+        return 'Unexpected PostgreSQL error'
+    }
+    return 'Unknown'
+}
+
 function Test-PostGISAvailable {
     <#
       The functional definition of "PostGIS is installed" for this phase:
@@ -1114,11 +1108,38 @@ function Test-PostGISAvailable {
       after) - for PostGIS, "installed" only means something if it's
       actually usable, so there's no weaker file-existence signal worth
       trusting on its own. See docs/08-development-roadmap.md Phase 2B.
+
+      Diagnostic logging (connection parameters, the exact psql command,
+      exit code, stdout, stderr, and - on failure - a classified reason
+      via Get-PostGISFailureReason) is unconditional, on every call,
+      success or failure alike - added specifically so a future
+      integration failure at either call site (the pre-install
+      idempotency check or the post-install validation, Install-PostGIS
+      above) leaves a complete, unambiguous record in the installer's
+      own log instead of needing to be reconstructed after the fact.
+      This is observability only: nothing below changes what this
+      function returns or how any caller behaves - $output/$exitCode are
+      captured exactly as before, and $stdoutLines/$stderrLines are
+      derived from that same already-captured data purely for logging
+      (PowerShell tags 2>&1-merged native stderr lines as ErrorRecord
+      objects, which is what makes them separable from stdout after the
+      fact without capturing the two streams differently).
     #>
     param(
         [Parameter(Mandatory)][string]$PsqlPath,
         [Parameter(Mandatory)][SecureString]$SuperuserPassword
     )
+
+    Write-Detail 'Connection:'
+    Write-Detail "  Host: $Script:PostgresHost"
+    Write-Detail "  Port: $Script:PostgresPort"
+    Write-Detail '  Database: postgres'
+    Write-Detail "  Username: $Script:PostgresSuperuser"
+    Write-Host ''
+
+    $commandDisplay = "$PsqlPath -U $Script:PostgresSuperuser -h $Script:PostgresHost -p $Script:PostgresPort -d postgres --set ON_ERROR_STOP=on --tuples-only --no-align -c `"CREATE EXTENSION IF NOT EXISTS postgis;`" -c `"SELECT PostGIS_Full_Version();`""
+    Write-Detail "Command: $commandDisplay"
+    Write-Detail 'Password: supplied via PGPASSWORD environment variable (not shown, not part of the command line)'
 
     $plainPassword = ConvertTo-PlainText -SecureString $SuperuserPassword
     $previousPgPassword = $env:PGPASSWORD
@@ -1150,17 +1171,32 @@ function Test-PostGISAvailable {
         $plainPassword = $null
     }
 
+    # Derived purely for logging - see this function's own header. Native
+    # stderr lines merged via 2>&1 arrive as ErrorRecord objects; plain
+    # stdout lines arrive as strings. $output/$exitCode themselves (used
+    # by every check below) are untouched by this.
+    $stdoutLines = @($output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+    $stderrLines = @($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { $_.ToString() })
+
+    Write-Detail "Exit code: $exitCode"
+    Write-Detail "Stdout: $(if ($stdoutLines.Count -gt 0) { ($stdoutLines -join ' | ') } else { '(empty)' })"
+    Write-Detail "Stderr: $(if ($stderrLines.Count -gt 0) { ($stderrLines -join ' | ') } else { '(empty)' })"
+
     $outputText = ($output | Out-String).Trim()
     if ($exitCode -ne 0) {
-        return [PSCustomObject]@{ Available = $false; VersionString = $null; ErrorMessage = $outputText }
+        $failureReason = Get-PostGISFailureReason -ExitCode $exitCode -OutputText $outputText
+        Write-Detail "Failure reason: $failureReason"
+        return [PSCustomObject]@{ Available = $false; VersionString = $null; ErrorMessage = $outputText; FailureReason = $failureReason }
     }
 
     $versionLine = $output | Where-Object { $_ -match 'POSTGIS=' } | Select-Object -First 1
     if (-not $versionLine) {
-        return [PSCustomObject]@{ Available = $false; VersionString = $null; ErrorMessage = $outputText }
+        $failureReason = Get-PostGISFailureReason -ExitCode $exitCode -OutputText $outputText
+        Write-Detail "Failure reason: $failureReason"
+        return [PSCustomObject]@{ Available = $false; VersionString = $null; ErrorMessage = $outputText; FailureReason = $failureReason }
     }
 
-    return [PSCustomObject]@{ Available = $true; VersionString = $versionLine.Trim(); ErrorMessage = $null }
+    return [PSCustomObject]@{ Available = $true; VersionString = $versionLine.Trim(); ErrorMessage = $null; FailureReason = $null }
 }
 
 # ---------------------------------------------------------------------------
@@ -1274,8 +1310,9 @@ function Install-PostGISBundle {
     }
 
     Write-Step 'Installing PostGIS (silent install)...'
+    Write-Detail 'This may take several minutes.'
 
-    $process = Start-Process -FilePath $InstallerPath -ArgumentList '/S' -Wait -PassThru -NoNewWindow
+    $process = Start-ProcessWithActivityIndicator -FilePath $InstallerPath -ArgumentList '/S' -ActivityName 'Installing PostGIS'
 
     if ($process.ExitCode -ne 0) {
         Stop-Setup "The PostGIS installer returned exit code $($process.ExitCode)."
@@ -1339,7 +1376,7 @@ function Install-PostGIS {
     $confirmed = Test-PostGISAvailable -PsqlPath $existing.PsqlPath -SuperuserPassword $superuserPassword
 
     if (-not $confirmed.Available) {
-        Stop-Setup "PostGIS installation appeared to succeed, but CREATE EXTENSION / PostGIS_Full_Version() still failed: $($confirmed.ErrorMessage)"
+        Stop-Setup "PostGIS installation appeared to succeed, but CREATE EXTENSION / PostGIS_Full_Version() still failed ($($confirmed.FailureReason)): $($confirmed.ErrorMessage)"
     }
 
     Write-Host ''
@@ -1385,11 +1422,27 @@ function Install-DeltaRuntime {
       package.json, the .bat scripts) is still needed and is copied as-is.
 
       Idempotent by construction: dts_shared_binary never contains an
-      "uploads" or "logs" directory or a .env file, so re-running this
-      (e.g. on a repeat setup.ps1 invocation) only ever overwrites files
-      that also exist in the source artifact - it never touches
-      runtime-generated state that may already exist in the target
-      directory.
+      "uploads" or "logs" directory, so re-running this (e.g. on a
+      repeat setup.ps1 invocation) only ever overwrites files that also
+      exist in the source artifact - it never touches runtime-generated
+      state that may already exist in the target directory.
+
+      dts_shared_binary IS confirmed to ship its own .env (a development
+      example, committed upstream for local dev use - not this
+      installer's deployment config) - a false assumption in an earlier
+      version of this comment. That file is deliberately stripped from
+      $Script:DeltaRuntimeRoot immediately after the copy below, the
+      same way *.sh files already are: the runtime artifact is
+      application code only and must never determine or override
+      deployment configuration. <installer root>\.env.example
+      ($Script:EnvTemplatePath) is the only template New-
+      DeltaEnvironmentFile is ever meant to read - without this
+      stripping step, that artifact-shipped .env would already exist at
+      the target by the time New-DeltaEnvironmentFile runs (this
+      function always runs first), so its own "does .env already exist"
+      check would find it and preserve it instead of ever generating
+      from the real template - confirmed as the actual root cause of a
+      real reported bug.
     #>
 
     Write-PhaseBanner 'DELTA Runtime Deployment'
@@ -1407,11 +1460,43 @@ function Install-DeltaRuntime {
 
     Write-Step "Deploying DELTA runtime to $($Script:DeltaRuntimeRoot)..."
 
+    # dts_shared_binary ships its own .env (application code's local-dev
+    # example, not this installer's deployment config) - Copy-Item -Force
+    # below would otherwise silently overwrite an operator's real,
+    # already-generated .env with it (Force means "overwrite whatever's
+    # already at the destination"), on every single re-run, not just a
+    # fresh install. Moved aside first, and restored exactly afterward,
+    # so the copy has nothing of the operator's to clobber at that path
+    # in the first place - the runtime artifact must never determine or
+    # override deployment configuration, fresh install or upgrade alike.
+    $envTargetPath = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath '.env'
+    $preservedEnvPath = $null
+    if (Test-Path -LiteralPath $envTargetPath) {
+        $preservedEnvPath = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath '.env.installer-preserved-tmp'
+        Move-Item -LiteralPath $envTargetPath -Destination $preservedEnvPath -Force
+    }
+
     Copy-Item -Path (Join-Path -Path $Script:DeltaRuntimeSourceDirectory -ChildPath '*') `
         -Destination $Script:DeltaRuntimeRoot -Recurse -Force
 
     Get-ChildItem -Path $Script:DeltaRuntimeRoot -Filter '*.sh' -Recurse -File |
         Remove-Item -Force
+
+    # Whatever the copy just placed at these names is runtime-artifact
+    # content (dts_shared_binary's own .env, and .env.example in case a
+    # future release ships one) - never a legitimate deployment config,
+    # so it's removed unconditionally. The operator's real .env, if any,
+    # was already moved safely out of the way above and is restored next.
+    foreach ($strayEnvFile in @('.env', '.env.example')) {
+        $strayEnvPath = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath $strayEnvFile
+        if (Test-Path -LiteralPath $strayEnvPath) {
+            Remove-Item -LiteralPath $strayEnvPath -Force
+        }
+    }
+
+    if ($preservedEnvPath) {
+        Move-Item -LiteralPath $preservedEnvPath -Destination $envTargetPath -Force
+    }
 
     $schemaFile = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath 'dts_database\dts_db_schema.sql'
     if (-not (Test-Path -LiteralPath $schemaFile)) {
@@ -1559,15 +1644,97 @@ function Read-DeltaDatabaseName {
     return $entered.Trim()
 }
 
+function Resolve-DeltaEnvironmentTemplatePath {
+    <#
+      The priority order for which template New-DeltaEnvironmentFile
+      reads when it needs to generate .env from scratch:
+
+        1. <installer root>\.env.example ($Script:EnvTemplatePath) -
+           the authoritative deployment template, always preferred when
+           present.
+        2. <dts_shared_binary source>\.env
+           ($Script:DeltaRuntimeSourceDirectory\.env) - fallback only,
+           for dts_shared_binary being used entirely outside this
+           Windows installer (no .env.example shipped alongside it at
+           all). This is the installer repository's own copy of the
+           artifact, not the deployed copy under $Script:DeltaRuntimeRoot
+           - Install-DeltaRuntime deliberately strips the runtime
+           artifact's .env from the deployed copy on every run (see its
+           own header) precisely so the runtime artifact can never
+           silently determine deployment configuration there; this
+           fallback is a distinct, explicit, last-resort case, not a
+           reversal of that.
+
+      Returns a PSCustomObject with Path and IsFallback, or stops the
+      installer outright (Stop-Setup) with both checked paths named if
+      neither template exists - never a silent, ambiguous default.
+    #>
+    if (Test-Path -LiteralPath $Script:EnvTemplatePath) {
+        return [PSCustomObject]@{ Path = $Script:EnvTemplatePath; IsFallback = $false }
+    }
+
+    $fallbackTemplatePath = Join-Path -Path $Script:DeltaRuntimeSourceDirectory -ChildPath '.env'
+    if (Test-Path -LiteralPath $fallbackTemplatePath) {
+        return [PSCustomObject]@{ Path = $fallbackTemplatePath; IsFallback = $true }
+    }
+
+    Stop-Setup "No configuration template could be found. Checked the installer template ($($Script:EnvTemplatePath)) and the runtime artifact fallback ($fallbackTemplatePath). Cannot generate the environment file."
+}
+
 function New-DeltaEnvironmentFile {
     <#
       Generates <AppRoot>\.env (the deployed runtime directory - see
-      Install-DeltaRuntime) from the installer repository's .env.example
-      template, or updates DATABASE_URL in an existing .env in place -
-      every other line (SMTP, SSO, SUPPORT_URL, comments, blank lines,
-      everything) is preserved untouched either way, per the database/
-      environment workflow assessment's decision rules. An existing .env
-      is always backed up (timestamped copy) before any write.
+      Install-DeltaRuntime) from a template - resolved by Resolve-
+      DeltaEnvironmentTemplatePath, .env.example preferred, the runtime
+      artifact's own .env as a last-resort fallback, see that function's
+      own header - or updates it in place if a .env already exists
+      there, or, when -ForceRegenerateFromTemplate is set (Resolve-
+      ExistingDeltaDeployment's "Recreate" lifecycle choice), always
+      regenerates from that resolved template even though a .env
+      already exists. An existing .env is always backed up (timestamped
+      copy) before any write, in every one of those cases.
+
+      Architecture: .env.example is the single source of truth for the
+      application's default configuration - EMAIL_TRANSPORT, SMTP_*,
+      SSO_*, AUTHENTICATION_SUPPORTED, SUPPORT_URL, SESSION_SECRET,
+      every current and future default the application ships with. This
+      installer's own job is narrower than "generate .env": it only ever
+      overwrites the specific, named variables IT is actually
+      responsible for supplying - $Script:DeltaManagedEnvironmentValues,
+      built below from values this run collected or determined (right
+      now: just DATABASE_URL, from the PostgreSQL connection info this
+      script resolved). Every other line - regardless of what it is, or
+      whether a future .env.example adds entirely new variables this
+      installer has never heard of - passes through completely
+      unmodified. That's what keeps .env.example authoritative for
+      defaults: a new default added there shows up correctly in the
+      next fresh install without this function needing to change at
+      all, and this installer can never silently overwrite an
+      application setting (feature flags, auth config, logging
+      behavior, security settings, anything) it was never asked to
+      manage.
+
+      Adding a future installer-managed value (the parameter doc
+      mentions PORT as a likely future example) means adding one more
+      key to $managedValues below - never a new bespoke match/replace
+      branch - since Update-ManagedEnvironmentLines already applies to
+      every entry in that table generically.
+
+      The "read the existing .env, else fall back to the template" dual
+      source is orthogonal to that architecture, not an exception to
+      it: once a real .env exists at the target, it - not .env.example
+      - is this specific deployment's source of truth by default (it
+      may already carry operator customizations: real SMTP credentials,
+      a non-default SESSION_SECRET, SSO configuration), so re-running
+      this installer against it must never silently reset those back to
+      template defaults UNLESS the operator explicitly asked for that
+      via the "Recreate" lifecycle choice (-ForceRegenerateFromTemplate)
+      - an explicit, visible decision at that prompt, never an implicit
+      side effect of merely re-running setup.ps1. Whichever path runs,
+      the exact same managed-values table and the exact same generic
+      replace mechanism apply - installer-managed variables get
+      updated, everything else is left exactly as it already was in
+      whichever file this run reads it from.
 
       The target path is computed here, from $Script:DeltaRuntimeRoot,
       rather than read from a precomputed module-level constant - by
@@ -1580,7 +1747,10 @@ function New-DeltaEnvironmentFile {
       New-DatabaseUrl, which only ever returns it as a value to be
       written to a file, never printed.
     #>
-    param([Parameter(Mandatory)][string]$DatabaseUrl)
+    param(
+        [Parameter(Mandatory)][string]$DatabaseUrl,
+        [switch]$ForceRegenerateFromTemplate
+    )
 
     Write-Step 'Configuring application environment...'
 
@@ -1591,39 +1761,110 @@ function New-DeltaEnvironmentFile {
         Stop-Setup "DELTA runtime directory not found: $targetDirectory. Run Install-DeltaRuntime first."
     }
 
-    $sourceLines = $null
-    if (Test-Path -LiteralPath $envTargetPath) {
+    # A pre-existing .env is always backed up before this function writes
+    # anything, regardless of which branch below actually reads it back
+    # in - including when -ForceRegenerateFromTemplate means its content
+    # won't be reused at all, since "backed up" and "reused as the
+    # source" are two different guarantees and the Recreate lifecycle
+    # choice explicitly asks for exactly that combination (Option 2:
+    # "Backup existing .env" + "Generate a new .env from .env.example").
+    $targetExists = Test-Path -LiteralPath $envTargetPath
+    if ($targetExists) {
         $backupPath = "$envTargetPath.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
         Copy-Item -LiteralPath $envTargetPath -Destination $backupPath -Force
         Write-Detail "Existing .env backed up to: $backupPath"
-        $sourceLines = Get-Content -LiteralPath $envTargetPath
-    }
-    elseif (Test-Path -LiteralPath $Script:EnvTemplatePath) {
-        Write-Detail "Generating new .env from template: $($Script:EnvTemplatePath)"
-        $sourceLines = Get-Content -LiteralPath $Script:EnvTemplatePath
-    }
-    else {
-        Stop-Setup "No existing .env to update and no template found at $($Script:EnvTemplatePath). Cannot generate the environment file."
     }
 
-    $replaced = $false
-    $updatedLines = foreach ($line in $sourceLines) {
-        if ($line -match '^\s*DATABASE_URL\s*=') {
-            $replaced = $true
-            "DATABASE_URL=`"$DatabaseUrl`""
-        }
-        else {
-            $line
-        }
+    $sourceLines = $null
+    if ($ForceRegenerateFromTemplate -or -not $targetExists) {
+        $template = Resolve-DeltaEnvironmentTemplatePath
+
+        Write-Host ''
+        Write-Host $(if ($template.IsFallback) { 'Using fallback configuration template:' } else { 'Using configuration template:' })
+        Write-Host $template.Path
+        Write-Host ''
+
+        $sourceLines = Get-Content -LiteralPath $template.Path
     }
-    if (-not $replaced) {
-        $updatedLines = @($updatedLines) + "DATABASE_URL=`"$DatabaseUrl`""
+    else {
+        $sourceLines = Get-Content -LiteralPath $envTargetPath
     }
+
+    # The complete, explicit set of variables this installer is allowed to
+    # write - never anything else. Ordered so a freshly-appended variable
+    # (one absent from the source file entirely) lands in a stable,
+    # predictable sequence rather than whatever order a hashtable would
+    # otherwise enumerate in.
+    $managedValues = [ordered]@{
+        DATABASE_URL = $DatabaseUrl
+    }
+
+    $updatedLines = Update-ManagedEnvironmentLines -SourceLines $sourceLines -ManagedValues $managedValues
 
     Set-Content -LiteralPath $envTargetPath -Value $updatedLines -Encoding utf8
 
     Write-Success '    Environment file ready.'
     Write-Detail "Location: $envTargetPath"
+}
+
+function Update-ManagedEnvironmentLines {
+    <#
+      The generic mechanism New-DeltaEnvironmentFile's architecture
+      depends on: given the lines of a .env/.env.example file and an
+      ordered table of installer-managed KEY = value pairs, returns the
+      same lines with only those specific keys' lines replaced (or
+      appended, for a key not already present in the source at all) -
+      every other line passed through byte-for-byte unmodified,
+      including its original quoting style, comments, and blank lines.
+      Deliberately the only place in this installer that ever decides
+      "which .env lines am I allowed to change" - New-DeltaEnvironmentFile
+      never matches or replaces a variable itself, so there is exactly
+      one mechanism to audit for that guarantee, not one per variable.
+    #>
+    param(
+        [AllowEmptyCollection()][string[]]$SourceLines,
+        [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$ManagedValues
+    )
+
+    # Which managed keys were actually found (and replaced) in the source
+    # file - tracked with a plain hashtable rather than removing from a
+    # copy of $ManagedValues.Keys, since OrderedDictionary's Keys
+    # collection is only a non-generic ICollection and isn't something
+    # PowerShell can hand straight to a typed generic collection.
+    $foundKeys = @{}
+
+    $updatedLines = foreach ($line in $SourceLines) {
+        $matchedKey = $null
+        foreach ($key in $ManagedValues.Keys) {
+            if ($line -match "^\s*$([regex]::Escape($key))\s*=") {
+                $matchedKey = $key
+                break
+            }
+        }
+
+        if ($matchedKey) {
+            $foundKeys[$matchedKey] = $true
+            "$matchedKey=`"$($ManagedValues[$matchedKey])`""
+        }
+        else {
+            $line
+        }
+    }
+
+    # Any managed key never found in the source file at all (a brand new
+    # installer-managed variable that .env.example doesn't define yet, or
+    # an existing .env predating it) is appended rather than silently
+    # dropped - matches the original single-variable behavior this
+    # generalizes, just for however many managed keys there are now.
+    # $ManagedValues.Keys (not $foundKeys) drives this loop so append
+    # order always matches the table's own declared, stable order.
+    foreach ($key in $ManagedValues.Keys) {
+        if (-not $foundKeys.ContainsKey($key)) {
+            $updatedLines = @($updatedLines) + "$key=`"$($ManagedValues[$key])`""
+        }
+    }
+
+    return $updatedLines
 }
 
 function Invoke-DeltaDatabaseInit {
@@ -1876,7 +2117,7 @@ function Complete-DatabaseSetupForExistingPostgres {
 
     $databaseUrl = New-DatabaseUrl -PostgresHost $Script:PostgresHost -Port $Script:PostgresPort `
         -Username $Script:PostgresSuperuser -Password $SuperuserPassword -DatabaseName $DatabaseName
-    New-DeltaEnvironmentFile -DatabaseUrl $databaseUrl
+    New-DeltaEnvironmentFile -DatabaseUrl $databaseUrl -ForceRegenerateFromTemplate:($Script:DeltaDeploymentLifecycle -eq 'Recreate')
 }
 
 function Complete-DatabaseSetup {
@@ -1907,7 +2148,7 @@ function Complete-DatabaseSetup {
 
     $databaseUrl = New-DatabaseUrl -PostgresHost $Script:PostgresHost -Port $Script:PostgresPort `
         -Username $Script:PostgresSuperuser -Password $superuserPassword -DatabaseName $deltaDatabaseName
-    New-DeltaEnvironmentFile -DatabaseUrl $databaseUrl
+    New-DeltaEnvironmentFile -DatabaseUrl $databaseUrl -ForceRegenerateFromTemplate:($Script:DeltaDeploymentLifecycle -eq 'Recreate')
 
     Invoke-DeltaDatabaseInit -DatabaseName $deltaDatabaseName -SuperuserPassword $superuserPassword
 }
@@ -2267,6 +2508,250 @@ function Resolve-DeltaAppRoot {
 }
 
 # ---------------------------------------------------------------------------
+# Existing DELTA deployment lifecycle
+# ---------------------------------------------------------------------------
+
+function Get-ExistingDeltaDeploymentItems {
+    <#
+      Reports which of the operator-meaningful deployment artifacts -
+      .env, uploads\, logs\ - actually exist under $Script:DeltaRuntimeRoot
+      right now. Purely a detection helper: Resolve-ExistingDeltaDeployment
+      uses it both to decide whether an existing-deployment prompt is
+      warranted at all, and to render the "what was found" checklist when
+      it is. Deliberately checks for these specific artifacts rather than
+      just "does the directory exist" - an empty directory an operator
+      pre-created has nothing worth protecting, and should be treated
+      exactly like "no existing deployment" rather than triggering a
+      prompt about data that was never actually there.
+    #>
+    return [ordered]@{
+        '.env'    = Test-Path -LiteralPath (Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath '.env')
+        'uploads' = Test-Path -LiteralPath (Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath 'uploads')
+        'logs'    = Test-Path -LiteralPath (Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath 'logs')
+    }
+}
+
+function Read-DeltaDeploymentLifecycleChoice {
+    <#
+      Displays the existing-deployment summary and the three lifecycle
+      options, returning 'Upgrade' | 'Recreate' | 'Fresh'. Bare Enter
+      defaults to Upgrade (option 1, recommended) - the same "blank
+      means the safe/recommended choice" convention Read-
+      ExistingPostgresChoice already uses for the analogous PostgreSQL
+      reuse decision.
+
+      Deliberately plain ASCII markers ("[x]", "-"), not Unicode
+      checkmark/bullet characters, matching every other console message
+      in this installer - confirmed directly that a Unicode character
+      here renders as mojibake (or drops entirely) once setup.ps1's
+      output is piped/redirected rather than written straight to an
+      interactive console host, which is a realistic way this script
+      can be invoked, not just a theoretical edge case.
+    #>
+    param([Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$FoundItems)
+
+    Write-Host ''
+    Write-Host ('=' * $Script:BannerWidth)
+    Write-Host 'Existing DELTA deployment detected'
+    Write-Host ('=' * $Script:BannerWidth)
+    Write-Host ''
+    Write-Host 'Application directory:'
+    Write-Host $Script:DeltaRuntimeRoot
+    Write-Host ''
+    Write-Host 'The following deployment data was found:'
+    Write-Host ''
+    foreach ($name in $FoundItems.Keys) {
+        if ($FoundItems[$name]) {
+            Write-Host "    [x] $name"
+        }
+    }
+    Write-Host ''
+    Write-Host 'Choose how you would like to continue:'
+    Write-Host ''
+    Write-Host '1) Upgrade existing deployment (Recommended)'
+    Write-Host ''
+    Write-Host '   - Preserve existing .env'
+    Write-Host '   - Preserve uploads'
+    Write-Host '   - Preserve logs'
+    Write-Host '   - Replace DELTA application files'
+    Write-Host '   - Update installer-managed environment variables only'
+    Write-Host ''
+    Write-Host '2) Recreate DELTA application'
+    Write-Host ''
+    Write-Host '   - Backup existing .env'
+    Write-Host '   - Generate a new .env from .env.example'
+    Write-Host '   - Replace DELTA application files'
+    Write-Host '   - Preserve uploads'
+    Write-Host '   - Preserve logs'
+    Write-Host ''
+    Write-Host '3) Completely fresh installation'
+    Write-Host ''
+    Write-Host '   WARNING' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host '   This will recreate the DELTA application directory.'
+    Write-Host ''
+    Write-Host '   Existing application configuration will be backed up before removal.'
+    Write-Host ''
+    Write-Host '   The following will be removed:'
+    Write-Host ''
+    Write-Host '       - .env'
+    Write-Host '       - uploads'
+    Write-Host '       - logs'
+    Write-Host '       - runtime files'
+    Write-Host ''
+
+    while ($true) {
+        $choice = Read-Host -Prompt 'Choose an option [1]'
+        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '1' }
+
+        switch ($choice.Trim()) {
+            '1' { return 'Upgrade' }
+            '2' { return 'Recreate' }
+            '3' { return 'Fresh' }
+        }
+        Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
+    }
+}
+
+function Confirm-DeltaFreshInstallation {
+    <#
+      The explicit confirmation gate for lifecycle option 3 (Completely
+      fresh installation) - requires the operator to type the exact,
+      case-sensitive word YES, deliberately a harder bar than the plain
+      Y/N this installer uses everywhere else (Reset-
+      PostgresSuperuserPassword's confirmation, Confirm-UninstallIntent
+      in uninstall.ps1): every other yes/no prompt in this project
+      protects a single value or a database; this is the only one that
+      removes an entire application directory tree, even though - see
+      Backup-ExistingDeltaDeployment - "removes" always really means
+      "moves to a timestamped backup," never an actual delete.
+    #>
+    Write-Host ''
+    Write-Host 'WARNING' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host 'You are about to perform a completely fresh DELTA installation.'
+    Write-Host ''
+    Write-Host 'This will remove the existing application directory.'
+    Write-Host ''
+    Write-Host 'Type YES to continue:'
+    Write-Host ''
+    $confirmation = Read-Host -Prompt '>'
+
+    return ($confirmation -ceq 'YES')
+}
+
+function Backup-ExistingDeltaDeployment {
+    <#
+      Lifecycle option 3's actual "removal" mechanism - and it never
+      actually deletes anything. Moves (not copies - a same-volume
+      rename, not a slow tree copy) $Script:DeltaRuntimeRoot to a
+      timestamped sibling path (e.g. C:\DELTA-backup-2026-07-31-104530),
+      leaving every byte of the prior deployment (.env, uploads, logs,
+      runtime files) fully recoverable at that path indefinitely - never
+      permanently deleted automatically, per this feature's own
+      requirement.
+
+      Once this succeeds, $Script:DeltaRuntimeRoot genuinely does not
+      exist on disk anymore, which is deliberately sufficient on its own
+      to make every later phase (Install-DeltaRuntime's directory
+      creation, Initialize-DeltaRuntimeDirectories, New-
+      DeltaEnvironmentFile's template-fallback branch) behave exactly
+      like a first-ever install, without any of them needing to know
+      lifecycle option 3 was ever chosen.
+    #>
+    $backupPath = "$($Script:DeltaRuntimeRoot)-backup-$(Get-Date -Format 'yyyy-MM-dd-HHmmss')"
+    if (Test-Path -LiteralPath $backupPath) {
+        Stop-Setup "Cannot back up the existing DELTA deployment: a directory already exists at the backup destination ($backupPath). Remove or rename it and re-run setup.ps1."
+    }
+
+    Write-Step "Backing up existing DELTA deployment to $backupPath..."
+    try {
+        Move-Item -LiteralPath $Script:DeltaRuntimeRoot -Destination $backupPath -ErrorAction Stop
+    }
+    catch {
+        Stop-Setup "Failed to back up the existing DELTA deployment to $backupPath - nothing was removed. $($_.Exception.Message)"
+    }
+
+    Write-Success "    Backup complete: $backupPath"
+}
+
+function Resolve-ExistingDeltaDeployment {
+    <#
+      Makes the lifecycle of an existing DELTA deployment explicit
+      instead of silently assuming an upgrade. Runs once, immediately
+      after Resolve-DeltaAppRoot has resolved $Script:DeltaRuntimeRoot
+      and before anything (Install-DeltaRuntime first) ever touches it -
+      deliberately before the Node.js/PostgreSQL/PostGIS phases too, so
+      an operator who meant to decline lifecycle option 3 finds out
+      immediately rather than after several minutes of unrelated
+      installation work.
+
+      If $Script:DeltaRuntimeRoot doesn't exist yet, or exists but has
+      none of the operator-meaningful deployment artifacts Get-
+      ExistingDeltaDeploymentItems checks for (e.g. an empty directory
+      an operator pre-created), this does nothing at all and leaves
+      $Script:DeltaDeploymentLifecycle at its default ('Upgrade') -
+      every later phase already behaves correctly for a first-ever
+      install, and this feature's own requirement is that that path
+      stays completely unchanged.
+
+      Otherwise, prompts for one of the three lifecycle choices
+      (Read-DeltaDeploymentLifecycleChoice) and records the answer in
+      $Script:DeltaDeploymentLifecycle:
+        - Upgrade (default/recommended): no filesystem action here at
+          all - every later phase's own existing idempotent behavior
+          (Install-DeltaRuntime only overwrites its own files;
+          Initialize-DeltaRuntimeDirectories and New-
+          DeltaEnvironmentFile both already leave an existing
+          uploads/logs/.env untouched) already does exactly this,
+          unchanged, which is why this choice needed no new code
+          anywhere else in the script.
+        - Recreate: no filesystem action here either - only records the
+          choice. New-DeltaEnvironmentFile reads
+          $Script:DeltaDeploymentLifecycle later, at the point it
+          actually runs (well after PostgreSQL is installed and
+          DATABASE_URL is finally known - it cannot run any earlier
+          than that), and backs up + regenerates .env from .env.example
+          when it sees 'Recreate', via its own
+          -ForceRegenerateFromTemplate parameter. uploads/logs are left
+          alone the same idempotent way the Upgrade choice leaves them
+          alone.
+        - Fresh: the one choice that takes an immediate action right
+          here - Confirm-DeltaFreshInstallation gates it behind an
+          exact typed "YES", and Backup-ExistingDeltaDeployment moves
+          the entire existing deployment out of the way before this
+          returns. A declined confirmation re-shows the same
+          three-option menu rather than aborting the installer outright.
+    #>
+    $foundItems = Get-ExistingDeltaDeploymentItems
+    $anyFound = @($foundItems.Values | Where-Object { $_ }).Count -gt 0
+
+    if (-not (Test-Path -LiteralPath $Script:DeltaRuntimeRoot) -or -not $anyFound) {
+        return
+    }
+
+    while ($true) {
+        $choice = Read-DeltaDeploymentLifecycleChoice -FoundItems $foundItems
+
+        if ($choice -eq 'Fresh') {
+            if (-not (Confirm-DeltaFreshInstallation)) {
+                Write-Host ''
+                Write-Detail 'Fresh installation canceled.'
+                continue
+            }
+            Backup-ExistingDeltaDeployment
+        }
+
+        $Script:DeltaDeploymentLifecycle = $choice
+        break
+    }
+
+    Write-Host ''
+    Write-Host 'Deployment lifecycle:'
+    Write-Host $Script:DeltaDeploymentLifecycle
+}
+
+# ---------------------------------------------------------------------------
 # Orchestration
 #
 # Each phase is a single top-level function call, in dependency order.
@@ -2278,6 +2763,7 @@ try {
     Initialize-Setup
     Update-DeltaRuntimeArtifact -RuntimeDirectory $Script:DeltaRuntimeSourceDirectory -ProjectRoot $Script:ProjectRoot
     Resolve-DeltaAppRoot
+    Resolve-ExistingDeltaDeployment
     Install-NodeJs
     Install-PostgreSql
     Install-PostGIS
