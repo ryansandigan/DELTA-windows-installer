@@ -8,6 +8,28 @@ The installer is intentionally lightweight. Large runtime components — the Nod
 
 Windows Server is the primary production deployment target. Windows 11 is also supported, for development, testing, and proof-of-concept deployments.
 
+## Before You Begin
+
+> **Windows may block the installer scripts immediately after you download and extract the release ZIP.** This is expected Windows security behavior, not a bug in the installer — unblock the ZIP before extracting it, as described below.
+
+Download the latest official release from the [Releases page](https://github.com/ryansandigan/DELTA-windows-installer/releases). Always download the **release ZIP** (e.g. `DELTA-windows-installer-<version>.zip`) from that page — not the repository's "Source code (zip)" download — since only the release ZIP contains the packaged, production-ready installer.
+
+Windows marks files downloaded from the Internet — including ZIP files downloaded from GitHub or other Internet sources — with a hidden **Mark of the Web** (a `Zone.Identifier` marker). As a result, PowerShell may refuse to run the installer scripts under the default `RemoteSigned` execution policy once the ZIP has been extracted.
+
+Unblock the ZIP **before** extracting it:
+
+1. Download the latest release ZIP from the [Releases page](https://github.com/ryansandigan/DELTA-windows-installer/releases).
+2. Right-click the downloaded ZIP.
+3. Select **Properties**.
+4. Check **Unblock**.
+5. Click **Apply**.
+6. Extract the ZIP.
+7. Run `setup.ps1`.
+
+> Windows adds a "Mark of the Web" (`Zone.Identifier`) to files downloaded from the Internet. If the ZIP is extracted before being unblocked, PowerShell may prevent unsigned scripts from running under the default `RemoteSigned` execution policy. Unblocking the ZIP before extraction removes this mark from the extracted files — without changing PowerShell's execution policy or disabling any Windows security feature.
+
+> **Note:** Unblocking only needs to be done once for each downloaded release ZIP. Files extracted from an already-unblocked ZIP do not need to be unblocked individually.
+
 ## Features
 
 - Automated, scripted installation via a single entry point (`setup.ps1`)
