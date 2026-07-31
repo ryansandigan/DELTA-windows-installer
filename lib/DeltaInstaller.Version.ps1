@@ -26,4 +26,4 @@
     changes required to keep it there.
 #>
 
-$Script:DeltaInstallerVersion = '1.0.0'
+$Script:DeltaInstallerVersion = '1.0.2'
