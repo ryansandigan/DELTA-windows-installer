@@ -2800,15 +2800,85 @@ try {
 
     $Script:PostgresSuperuserPassword = $null
 
+    # Final installation summary - purely a console-output concern. Every
+    # piece of state it prints (DeltaRuntimeRoot, the .env/start.bat paths
+    # derived from it) was already established by the phases above; this
+    # section performs no installation actions of its own, and reuses the
+    # existing Write-SetupBanner/Write-PhaseBanner/Write-Detail vocabulary
+    # rather than introducing new formatting primitives.
+    $deltaHome    = $Script:DeltaRuntimeRoot
+    $envPath      = Join-Path -Path $deltaHome -ChildPath '.env'
+    $startBatPath = Join-Path -Path $deltaHome -ChildPath 'start.bat'
+
+    Write-SetupBanner -Title 'DELTA Installation Summary' -Subtitle 'Installation completed successfully.'
+
+    Write-Success '    [OK] Node.js'
+    Write-Success '    [OK] PostgreSQL'
+    Write-Success '    [OK] PostGIS'
+    Write-Success '    [OK] DELTA Runtime'
+
+    Write-PhaseBanner 'Application Location'
+    Write-Host 'DELTA Home:'
+    Write-Detail $deltaHome
+    Write-Host ''
+    Write-Host 'Configuration:'
+    Write-Detail $envPath
+
+    Write-PhaseBanner 'First Run'
+    Write-Host 'Start DELTA:'
+    Write-Detail $startBatPath
+    Write-Host ''
+    Write-Host 'Once DELTA has started, browse to:'
+    Write-Detail 'http://localhost:3000'
+    Write-Host ''
+    Write-Host 'Stop DELTA:'
+    Write-Detail 'Close the console window start.bat is running in (or press Ctrl+C inside it).'
+
+    Write-PhaseBanner 'Configuration'
+    Write-Host 'A default .env file has already been created. It is suitable for'
+    Write-Host 'initial installation and local testing.'
+    Write-Host ''
+    Write-Host 'Before production deployment, review and update:'
+    Write-Detail '- PUBLIC_URL'
+    Write-Detail '- Database settings'
+    Write-Detail '- SMTP configuration'
+    Write-Detail '- Authentication settings'
+
+    Write-PhaseBanner 'Optional: Reverse Proxy'
+    Write-Host 'DELTA listens on port 3000 by default. Production deployments'
+    Write-Host 'typically place it behind a reverse proxy.'
+    Write-Host ''
+    Write-Host 'Example (NGINX):'
+    Write-Host ''
+    Write-Host '    server {'
+    Write-Host '        listen 80;'
+    Write-Host '        server_name delta.example.org;'
+    Write-Host ''
+    Write-Host '        location / {'
+    Write-Host '            proxy_pass http://127.0.0.1:3000;'
+    Write-Host ''
+    Write-Host '            proxy_set_header Host $host;'
+    Write-Host '            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;'
+    Write-Host '            proxy_set_header X-Forwarded-Proto $scheme;'
+    Write-Host '            proxy_set_header X-Real-IP $remote_addr;'
+    Write-Host '        }'
+    Write-Host '    }'
+    Write-Host ''
+    Write-Host 'IIS and other reverse proxies are also supported - see the'
+    Write-Host 'deployment documentation for detailed guidance.'
+
+    Write-PhaseBanner 'Troubleshooting'
+    Write-Host 'If DELTA fails to start because port 3000 is already in use, add'
+    Write-Host 'or change the following line in .env:'
+    Write-Host ''
+    Write-Detail 'PORT=3001'
+    Write-Host ''
+    Write-Host 'Then restart DELTA - close the console window start.bat is'
+    Write-Host 'running in, and run it again:'
+    Write-Detail $startBatPath
+
     Write-Host ''
     Write-Host ('=' * $Script:BannerWidth)
-    Write-Host 'Setup complete: Node.js, PostgreSQL, PostGIS, and the DELTA runtime are ready.'
-    Write-Host ('=' * $Script:BannerWidth)
-    Write-Host ''
-    Write-Host 'The DELTA application has not been started.'
-    Write-Host 'To start it for validation, run:'
-    Write-Host ''
-    Write-Host "    $(Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath 'start.bat')"
     Write-Host ''
 
     exit 0
