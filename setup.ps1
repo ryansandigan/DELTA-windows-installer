@@ -484,17 +484,17 @@ function Show-MainMenu {
 
 function Invoke-DeltaOptionalReverseProxySetup {
     <#
-      The optional, final step of a Fresh Installation only - offered
-      once DELTA has already been started and verified this run (called
-      from inside Show-InstallationSummary's own $Activated branch, right
-      after it prints the "Browse to" URL, before the rest of that
-      summary continues). Never shown for Update or Recreate - see
+      The final guided step of a Fresh Installation only - offered once
+      DELTA has already been started and verified this run (called from
+      inside Show-FreshInstallationSummary, right after it prints the
+      "Browse to" URL, with nothing else printed after it returns).
+      Never shown for Update or Recreate - see
       $Script:DeltaIsFreshInstallation's own declaration for why a real
       existing deployment may already have a reverse proxy configured,
       making this offer meaningless there - and never reached at all for
       a failed or aborted installation, since Show-InstallationSummary
-      itself is only ever called once every phase before it has already
-      succeeded.
+      (and everything it dispatches to) is only ever called once every
+      phase before it has already succeeded.
 
       Owns none of the actual reverse-proxy logic itself.
       setup-nginx.ps1/setup-iis.ps1 remain the single implementation of
@@ -511,22 +511,24 @@ function Invoke-DeltaOptionalReverseProxySetup {
 
       Deliberately does not branch on the child script's exit code -
       reverse proxy configuration is optional, so whether it succeeded,
-      failed, or was cancelled, this always returns control back to
-      Show-InstallationSummary the same way, letting the normal
-      installation summary continue exactly as it does today. A failure
-      inside either script shows its own error naturally (both already
-      print their own red failure banner before exiting 1) - never
-      wrapped, duplicated, or re-interpreted here.
+      failed, or was cancelled, this always returns control back to its
+      caller the same way, ending the installer's guided flow exactly as
+      cleanly either way. A failure inside either script shows its own
+      error naturally (both already print their own red failure banner
+      before exiting 1) - never wrapped, duplicated, or re-interpreted
+      here. Option 3 (Exit) needs no explicit `exit` call of its own -
+      returning here simply lets setup.ps1's own orchestration block
+      reach its normal `exit 0` moments later.
     #>
     Show-Section -Title 'Optional Reverse Proxy Setup'
 
-    Write-Host 'DELTA is now running successfully.'
+    Write-Host 'DELTA is running successfully.'
     Write-Host ''
-    Write-Host 'You may configure a reverse proxy now, or do it later.'
+    Write-Host 'Choose a reverse proxy to configure now:'
     Write-Host ''
     Write-Host '1. Configure NGINX'
     Write-Host '2. Configure IIS'
-    Write-Host '3. Skip for now'
+    Write-Host '3. Exit'
     Write-Host ''
 
     while ($true) {
@@ -554,19 +556,54 @@ function Invoke-DeltaOptionalReverseProxySetup {
 
 function Show-InstallationSummary {
     <#
-      The final "installation complete" screen. Every piece of state it
-      prints (DeltaHome, EnvPath, StartBatPath, Port, Activated) is
-      supplied by the orchestration block below, already established by
-      the phases that ran before it - this performs no installation
-      actions and reads no $Script: state of its own, purely reformatting
-      the same information the previous inline Write-Host block printed -
-      with one deliberate exception: once it has just reported DELTA as
-      genuinely up (the $Activated branch below), it reads
-      $Script:DeltaIsFreshInstallation directly to decide whether to offer
-      the optional reverse-proxy setup at that exact point, via
-      Invoke-DeltaOptionalReverseProxySetup - see that function's own
-      header for why it belongs there and not anywhere in the
-      orchestration block itself.
+      The completion-screen dispatcher - the only completion function the
+      orchestration block below calls directly. Fresh Installation,
+      Update, and Recreate DELTA Application are deliberately unrelated
+      operator experiences (see each target function's own header), so
+      this holds no display logic of its own beyond choosing among them.
+
+      Dispatches purely on the same authoritative deployment-state
+      variables Resolve-ExistingDeltaDeployment already established
+      earlier in this run ($Script:DeltaIsFreshInstallation /
+      $Script:DeltaDeploymentLifecycle) - never by re-inferring the
+      workflow from filesystem state at this late stage, which could
+      disagree with the choice the operator actually made or the action
+      this run actually took.
+
+      The three branches are exhaustive and mutually exclusive:
+      $Script:DeltaDeploymentLifecycle only ever holds 'Upgrade',
+      'Recreate', or 'Fresh', and $Script:DeltaIsFreshInstallation is
+      true for exactly the cases that mean a genuinely fresh deployment
+      (see that flag's own declaration) - so "not fresh, not Recreate"
+      and "an explicit, real Update" are the same thing.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$DeltaHome,
+        [Parameter(Mandatory)][string]$EnvPath,
+        [Parameter(Mandatory)][string]$StartBatPath,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][bool]$Activated
+    )
+
+    if ($Script:DeltaIsFreshInstallation) {
+        Show-FreshInstallationSummary -DeltaHome $DeltaHome -EnvPath $EnvPath -StartBatPath $StartBatPath -Port $Port -Activated $Activated
+    }
+    elseif ($Script:DeltaDeploymentLifecycle -eq 'Recreate') {
+        Show-RecreateCompletionSummary -DeltaHome $DeltaHome -EnvPath $EnvPath -StartBatPath $StartBatPath -Port $Port -Activated $Activated
+    }
+    else {
+        Show-UpdateCompletionSummary -DeltaHome $DeltaHome -EnvPath $EnvPath -Port $Port -Activated $Activated
+    }
+}
+
+function Show-FreshInstallationSummary {
+    <#
+      The detailed completion screen for a genuine Fresh Installation
+      only (Show-InstallationSummary's $Script:DeltaIsFreshInstallation
+      branch) - every piece of state it prints (DeltaHome, EnvPath,
+      StartBatPath, Port, Activated) is supplied by its caller, already
+      established by the phases that ran before it; this performs no
+      installation actions of its own.
 
       $Activated distinguishes two different successful outcomes that
       must never be reported identically - "the deployment completed"
@@ -575,19 +612,25 @@ function Show-InstallationSummary {
       running process is actually serving the code/config just deployed,
       confirmed by Confirm-DeltaRuntimeStarted's real HTTP check):
 
-        - $true - the normal path: DELTA was (re)started and verified
-          this run. $Port is that already-running instance's actual
-          port, and the "First Run" section below reports DELTA as
-          already up with a URL to browse to.
+        - $true - the normal path: DELTA was started and verified this
+          run. $Port is that already-running instance's actual port, and
+          the "First Run" section below reports DELTA as already up with
+          a URL to browse to, immediately followed by
+          Invoke-DeltaOptionalReverseProxySetup - the last thing this
+          screen prints in that case. No manual-start instructions follow
+          it: DELTA is demonstrably already running, so "start it later"
+          guidance would be actively misleading as a final step here.
         - $false - Resolve-DeltaApplicationPort found the configured
           port occupied by DELTA's own previous instance and the
           operator chose not to restart it (Resolve-
           DeltaManagedInstanceRestartDecision). Confirm-DeltaRuntimeStarted
-          never ran its HTTP check, so this must never claim it did -
-          the "First Run" section below reports the deployment as
+          never ran its HTTP check, so this must never claim it did, and
+          the reverse-proxy offer never makes sense against an instance
+          that was never confirmed serving the just-installed code - the
+          "First Run" section below instead reports the deployment as
           completed but not yet active, and points at the manual restart
-          needed to activate it, with no browse-to URL implying
-          otherwise.
+          genuinely needed to activate it, with no browse-to URL or
+          reverse-proxy offer implying otherwise.
     #>
     param(
         [Parameter(Mandatory)][string]$DeltaHome,
@@ -621,38 +664,6 @@ function Show-InstallationSummary {
     })
 
     Write-Host ''
-    Write-Host 'First Run'
-    Write-Host ''
-    if ($Activated) {
-        Show-Success 'DELTA has been started and verified successfully.'
-        Write-Host ''
-        Write-Host 'Browse to:'
-        Write-Detail "http://localhost:$Port"
-        Write-Host ''
-
-        if ($Script:DeltaIsFreshInstallation) {
-            Invoke-DeltaOptionalReverseProxySetup
-        }
-
-        Write-Host 'This startup is an installation validation step, not a supervised service -'
-        Write-Host 'see the Windows Service documentation for production deployment. To stop'
-        Write-Host 'DELTA now, end its node.exe process (Task Manager, or taskkill); re-running'
-        Write-Host 'this installer also stops it automatically before starting a fresh instance.'
-        Write-Host ''
-        Write-Host 'To start DELTA manually later (e.g. after a reboot):'
-        Write-Detail $StartBatPath
-    }
-    else {
-        Write-Host "The existing DELTA instance was left running, per the operator's choice above." -ForegroundColor Yellow
-        Write-Host ''
-        Write-Host 'Startup validation was skipped - HTTP validation did not run this time.'
-        Write-Host ''
-        Write-Host 'The currently running instance may still be serving the previous deployment,'
-        Write-Host 'not the one just installed. Restart DELTA manually to activate it:'
-        Write-Detail $StartBatPath
-    }
-
-    Write-Host ''
     Write-Host 'Configuration Notes'
     Write-Host ''
     Write-Host 'A default .env file has already been created. It is suitable for'
@@ -665,37 +676,159 @@ function Show-InstallationSummary {
     Write-Detail '- Authentication settings'
 
     Write-Host ''
-    Write-Host 'Optional: Reverse Proxy'
+    Write-Host 'First Run'
     Write-Host ''
-    Write-Host "DELTA listens on port $Port for this installation. Production"
-    Write-Host 'deployments typically place it behind a reverse proxy.'
-    Write-Host ''
-    Write-Host 'Example (NGINX):'
-    Write-Host ''
-    Write-Host '    server {'
-    Write-Host '        listen 80;'
-    Write-Host '        server_name delta.example.org;'
-    Write-Host ''
-    Write-Host '        location / {'
-    Write-Host "            proxy_pass http://127.0.0.1:$Port;"
-    Write-Host ''
-    Write-Host '            proxy_set_header Host $host;'
-    Write-Host '            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;'
-    Write-Host '            proxy_set_header X-Forwarded-Proto $scheme;'
-    Write-Host '            proxy_set_header X-Real-IP $remote_addr;'
-    Write-Host '        }'
-    Write-Host '    }'
-    Write-Host ''
-    Write-Host 'IIS and other reverse proxies are also supported - see the'
-    Write-Host 'deployment documentation for detailed guidance.'
+    if ($Activated) {
+        Show-Success 'DELTA has been started and verified successfully.'
+        Write-Host ''
+        Write-Host 'Browse to:'
+        Write-Detail "http://localhost:$Port"
+        Write-Host ''
+
+        Invoke-DeltaOptionalReverseProxySetup
+    }
+    else {
+        Write-Host "The existing DELTA instance was left running, per the operator's choice above." -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host 'Startup validation was skipped - HTTP validation did not run this time.'
+        Write-Host ''
+        Write-Host 'The currently running instance may still be serving the previous deployment,'
+        Write-Host 'not the one just installed. Restart DELTA manually to activate it:'
+        Write-Detail $StartBatPath
+    }
 
     Write-Host ''
-    Write-Host 'Troubleshooting'
+    Write-Host ('=' * $Script:BannerWidth)
     Write-Host ''
-    Write-Host "If a future manual start finds port $Port already in use, add or"
-    Write-Host 'change the PORT line in .env to another available port, then start'
-    Write-Host 'DELTA again:'
-    Write-Detail $StartBatPath
+}
+
+function Show-UpdateCompletionSummary {
+    <#
+      The concise completion screen for an Update only
+      (Show-InstallationSummary's "real Upgrade, not a Fresh
+      Installation" branch - see that function's own header). An operator
+      updating an existing, already-configured DELTA deployment has
+      already seen the installer's full component/configuration detail
+      on a prior run; repeating "Installed Components", "First Run",
+      default-.env guidance, production-configuration reminders, the
+      reverse-proxy offer, and manual-startup instructions here would
+      just be noise describing things that either haven't changed or
+      were never touched this run (.env is reused as-is - see
+      Get-DeltaUpgradeDatabaseUrlComponents). This intentionally has no
+      $StartBatPath parameter - an Update has nothing left to tell the
+      operator to do manually.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$DeltaHome,
+        [Parameter(Mandatory)][string]$EnvPath,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][bool]$Activated
+    )
+
+    Show-Section -Title 'Update Complete'
+
+    Write-Host 'DELTA has been updated successfully.'
+    Write-Host ''
+    Write-Host 'Runtime:'
+    if ($Activated) {
+        Write-Detail 'Running'
+    }
+    else {
+        Write-Detail 'Not restarted - existing instance left running, per the operator''s choice above.'
+    }
+    Write-Host ''
+    Write-Host 'Backend:'
+    Write-Detail "http://localhost:$Port"
+    Write-Host ''
+    Write-Host 'Application:'
+    Write-Detail $DeltaHome
+    Write-Host ''
+    Write-Host 'Configuration:'
+    Write-Detail $EnvPath
+    Write-Host ''
+    Write-Host 'Done.'
+
+    Write-Host ''
+    Write-Host ('=' * $Script:BannerWidth)
+    Write-Host ''
+}
+
+function Show-RecreateCompletionSummary {
+    <#
+      The completion screen for "Recreate DELTA application" only
+      (Show-InstallationSummary's $Script:DeltaDeploymentLifecycle -eq
+      'Recreate' branch) - deliberately distinct from both Fresh
+      Installation and Update, per this feature's own requirement.
+      Detailed like a Fresh Installation, because application files and
+      .env were genuinely recreated this run (see
+      Resolve-ExistingDeltaDeployment's own header for exactly what
+      'Recreate' does and preserves), but never offers the reverse-proxy
+      setup (Invoke-DeltaOptionalReverseProxySetup) - a real prior
+      deployment existed here, which may already have one configured -
+      and never uses "First Run" wording, since this is not this
+      deployment's first run, just its latest one.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$DeltaHome,
+        [Parameter(Mandatory)][string]$EnvPath,
+        [Parameter(Mandatory)][string]$StartBatPath,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][bool]$Activated
+    )
+
+    Show-Section -Title 'Recreation Complete' -Subtitle 'DELTA application was recreated successfully.'
+
+    Write-Host 'Installed Components'
+    Write-Host ''
+    Show-Success '[OK] DELTA Runtime'
+    Show-Success '[OK] Node.js'
+    Show-Success '[OK] PostgreSQL'
+    Show-Success '[OK] PostGIS'
+
+    Write-Host ''
+    Write-Host 'Application'
+    Write-Host ''
+    Write-Host 'Location :'
+    Write-Detail $DeltaHome
+    Write-Host ''
+    Write-Host 'Configuration :'
+    Write-Detail $EnvPath
+
+    Show-ComponentStatus -Name 'Deployment Status' -Fields ([ordered]@{
+        'Deployment' = 'Recreated'
+        'Activation' = if ($Activated) { 'Active' } else { 'Pending (manual restart required)' }
+    })
+
+    Write-Host ''
+    Write-Host 'Configuration Notes'
+    Write-Host ''
+    Write-Host 'A new .env file has been generated from the template. It is suitable for'
+    Write-Host 'initial installation and local testing.'
+    Write-Host ''
+    Write-Host 'Before production deployment, review and update:'
+    Write-Detail '- PUBLIC_URL'
+    Write-Detail '- Database settings'
+    Write-Detail '- SMTP configuration'
+    Write-Detail '- Authentication settings'
+
+    Write-Host ''
+    Write-Host 'Startup'
+    Write-Host ''
+    if ($Activated) {
+        Show-Success 'DELTA was recreated, started, and verified successfully.'
+        Write-Host ''
+        Write-Host 'Browse to:'
+        Write-Detail "http://localhost:$Port"
+    }
+    else {
+        Write-Host "The existing DELTA instance was left running, per the operator's choice above." -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host 'Startup validation was skipped - HTTP validation did not run this time.'
+        Write-Host ''
+        Write-Host 'The currently running instance may still be serving the previous deployment,'
+        Write-Host 'not the one just recreated. Restart DELTA manually to activate it:'
+        Write-Detail $StartBatPath
+    }
 
     Write-Host ''
     Write-Host ('=' * $Script:BannerWidth)
