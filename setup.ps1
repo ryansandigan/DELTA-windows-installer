@@ -50,15 +50,24 @@
     resolves them, relative to its own working directory - not a fixed
     C:\DELTA assumption), grants the current account Modify permission on
     them, and proves they're actually writable before continuing. The
-    database stage then asks for the DELTA database name (default dts_db)
-    and generates or updates <AppRoot>\.env from the repository's
-    .env.example template. On a fresh PostgreSQL install this always means
-    creating the database via init_db.ps1; when an existing PostgreSQL
-    instance was reused, Complete-DatabaseSetupForExistingPostgres instead
-    checks whether that database already exists and, if so, asks whether to
-    recreate it, upgrade it (upgrade_database.ps1), or leave it untouched -
-    <AppRoot>\.env is regenerated with the final connection information in
-    every case.
+    database stage then resolves the DELTA database name - prompting for
+    it (default delta_db) only for a genuine Fresh Installation with no
+    existing configuration to consult; an Update instead extracts it
+    automatically from the existing .env's own DATABASE_URL, never
+    prompting - and generates or updates <AppRoot>\.env from the
+    repository's .env.example template. The canonical database flow
+    always ends with a
+    migration check (upgrade_database.ps1) - never just initialization
+    alone, and never gated behind an operator prompt: on a fresh
+    PostgreSQL install, or when an existing PostgreSQL instance was
+    reused but has no DELTA database yet, this means init_db.ps1 followed
+    unconditionally by upgrade_database.ps1; when a reused instance
+    already has a DELTA database, Complete-DatabaseSetupForExistingPostgres
+    runs upgrade_database.ps1 against it unconditionally instead - never
+    initialization again, and never a choice to recreate it. Destructive
+    database recreation is out of scope for this normal install/update
+    path entirely; it is not offered here in any form. <AppRoot>\.env is
+    regenerated with the final connection information in every case.
 
     Phase 3 (Install-DeltaDependencies) installs the DELTA runtime's own
     Node dependencies - Yarn, `yarn install --production`, dotenv-cli - by
@@ -194,8 +203,8 @@ $Script:PostgresSuperuserPassword = $null
 # reuse an already-installed, already-running PostgreSQL instance rather
 # than installing a fresh one. Read by Complete-DatabaseSetup to decide
 # between the original "always create fresh" flow and the reuse-aware
-# recreate/upgrade/keep flow (Complete-DatabaseSetupForExistingPostgres) -
-# a fresh install never needs that decision, since the DELTA database
+# existence-check-then-migrate flow (Complete-DatabaseSetupForExistingPostgres)
+# - a fresh install never needs that decision, since the DELTA database
 # provably doesn't exist yet on an instance this run just created.
 $Script:PostgresReuseMode = $false
 
@@ -231,7 +240,7 @@ $Script:PostGISChecksumUrl     = "$($Script:PostGISDownloadUrl).md5"
 # Resolve-DeltaAppRoot prompts for it, which happens after this
 # Configuration section runs - New-DeltaEnvironmentFile computes its
 # target path itself, at the point it's actually needed, instead.
-$Script:DefaultDeltaDatabaseName = 'dts_db'
+$Script:DefaultDeltaDatabaseName = 'delta_db'
 $Script:EnvTemplatePath          = Join-Path -Path $Script:ProjectRoot -ChildPath '.env.example'
 
 # Set by Resolve-ExistingDeltaDeployment - 'Upgrade' (default), 'Recreate',
@@ -2041,15 +2050,20 @@ function Read-DeltaDatabaseName {
     <#
       Prompts for the DELTA database name, defaulting to $DefaultName on
       a bare Enter - same prompt-with-suggested-default shape as
-      Resolve-PostgresPort. $DefaultName is $Script:DefaultDeltaDatabaseName
-      ("dts_db") unless the caller supplies a different one - Complete-
-      DatabaseSetup passes the name already recorded in the existing
-      .env's DATABASE_URL for an Upgrade run (Get-
-      DeltaUpgradeDatabaseUrlComponents), so a repeat run suggests
-      whatever's already there instead of DELTA's own generic default.
-      A Fresh Installation never has one of those to pass, so this
-      parameter's own default keeps that behavior byte-for-byte
-      unchanged.
+      Resolve-PostgresPort.
+
+      The DefaultName parameter is used only during the Fresh Installation
+      workflow, where no existing DELTA configuration exists yet and the
+      installer must ask which database should be created. The default
+      suggestion is "delta_db" ($Script:DefaultDeltaDatabaseName).
+
+      During an Update, the installer never prompts for the database name.
+      Instead, it uses the database extracted from the existing
+      DATABASE_URL, which is treated as the authoritative configuration -
+      Complete-DatabaseSetup skips this function entirely in that case
+      (Get-DeltaUpgradeDatabaseUrlComponents non-$null), so this function
+      itself has no Update-path behavior to document beyond "never
+      called."
     #>
     param([string]$DefaultName = $Script:DefaultDeltaDatabaseName)
 
@@ -2362,15 +2376,38 @@ function Invoke-DeltaDatabaseUpgrade {
       reference, independent top-level try/catch/exit in the child).
       Supplying -Password here selects upgrade_database.ps1's own Mode 1
       (non-interactive): it skips the "back up your database first" Y/N
-      prompt it would otherwise show, since choosing "Upgrade" from
-      Read-ExistingDeltaDatabaseChoice already was that confirmation.
+      prompt it would otherwise show. That confirmation belongs to
+      upgrade_database.ps1's own standalone (Mode 2) execution, not to
+      this installer's normal install/update flow, which never prompts
+      before running the migration check - see
+      Complete-DatabaseSetupForExistingPostgres.
+
+      Called unconditionally after every successful Invoke-DeltaDatabaseInit
+      (fresh install) and unconditionally for every existing database
+      (Update) - upgrade_database.ps1 itself, not this wrapper, owns
+      deciding whether that means "nothing to do" (already current), "ran
+      the migration chain", or a hard failure; see its own state
+      classification. This wrapper only ever supplies connection values
+      and surfaces a non-zero exit as a Stop-Setup, exactly like
+      Invoke-DeltaDatabaseInit.
+
+      -FollowingInitialization only changes the success message printed
+      here - a freshly initialized database already seeds the latest
+      schema version directly (dts_db_schema.sql), so upgrade_database.ps1
+      will itself report "already current" for that case. This switch
+      exists purely so the operator sees that positive confirmation
+      framed as part of initialization ("initialized, then confirmed
+      current") rather than as an unrelated, unexplained upgrade step -
+      it carries no version knowledge of its own, only sequencing context
+      only this caller has.
     #>
     param(
         [Parameter(Mandatory)][string]$DatabaseName,
-        [Parameter(Mandatory)][SecureString]$SuperuserPassword
+        [Parameter(Mandatory)][SecureString]$SuperuserPassword,
+        [switch]$FollowingInitialization
     )
 
-    Write-Step 'Upgrading the DELTA database...'
+    Write-Step 'Checking DELTA database migration status...'
 
     $upgradeScriptPath = Join-Path -Path $Script:ProjectRoot -ChildPath 'upgrade_database.ps1'
     if (-not (Test-Path -LiteralPath $upgradeScriptPath)) {
@@ -2386,10 +2423,15 @@ function Invoke-DeltaDatabaseUpgrade {
         -AppRoot $Script:DeltaRuntimeRoot
 
     if ($LASTEXITCODE -ne 0) {
-        Stop-Setup "Database upgrade failed (upgrade_database.ps1 exited with code $LASTEXITCODE). See its output above for details."
+        Stop-Setup "Database migration check failed (upgrade_database.ps1 exited with code $LASTEXITCODE). See its output above for details. Setup is stopping before runtime activation and registry registration."
     }
 
-    Write-Success '    DELTA database upgraded.'
+    if ($FollowingInitialization) {
+        Write-Success '    Database initialized, then confirmed current.'
+    }
+    else {
+        Write-Success '    DELTA database migration check complete.'
+    }
 }
 
 function Test-DeltaDatabaseExists {
@@ -2442,84 +2484,6 @@ function Test-DeltaDatabaseExists {
     return (($output | Out-String).Trim() -eq '1')
 }
 
-function Remove-DeltaDatabase {
-    <#
-      Drops $DatabaseName via dropdb.exe (--if-exists, so a race against
-      something else dropping it concurrently isn't a hard failure) -
-      only ever called from the "Recreate" branch of
-      Complete-DatabaseSetupForExistingPostgres, immediately before
-      Invoke-DeltaDatabaseInit recreates it from scratch.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$DatabaseName,
-        [Parameter(Mandatory)][SecureString]$SuperuserPassword
-    )
-
-    Write-Step "Dropping existing database '$DatabaseName'..."
-
-    $bin = Get-PostgresBinDirectory
-    $dropdbExe = Join-Path -Path $bin -ChildPath 'dropdb.exe'
-    if (-not (Test-Path -LiteralPath $dropdbExe)) {
-        Stop-Setup "Required PostgreSQL executable not found: $dropdbExe"
-    }
-
-    $plainPassword = ConvertTo-PlainText -SecureString $SuperuserPassword
-    $previousPgPassword = $env:PGPASSWORD
-    $previousEap = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $env:PGPASSWORD = $plainPassword
-        $output = & $dropdbExe -h $Script:PostgresHost -p $Script:PostgresPort -U $Script:PostgresSuperuser --if-exists $DatabaseName 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Stop-Setup "Failed to drop database '$DatabaseName': $(($output | Out-String).Trim())"
-        }
-    }
-    finally {
-        $ErrorActionPreference = $previousEap
-        if ($null -eq $previousPgPassword) {
-            Remove-Item -Path Env:\PGPASSWORD -ErrorAction SilentlyContinue
-        }
-        else {
-            $env:PGPASSWORD = $previousPgPassword
-        }
-        $plainPassword = $null
-    }
-
-    Write-Success "    Database '$DatabaseName' dropped."
-}
-
-function Read-ExistingDeltaDatabaseChoice {
-    <#
-      Presents the recreate/upgrade/keep menu once an existing DELTA
-      database has been confirmed on the reused PostgreSQL instance.
-      Bare Enter defaults to "Keep" - unlike the PostgreSQL reuse
-      prompt's recommended default, the safest default here is the
-      least destructive one: recreate drops real data, so it should
-      never be what a bare Enter does by accident.
-    #>
-    param([Parameter(Mandatory)][string]$DatabaseName)
-
-    Write-Host ''
-    Write-Host "An existing DELTA database named '$DatabaseName' was found."
-    Write-Host ''
-    Write-Host '1) Recreate the DELTA database (drops and re-initializes it)'
-    Write-Host '2) Upgrade the existing DELTA database'
-    Write-Host '3) Keep the existing DELTA database (no changes)'
-    Write-Host ''
-
-    while ($true) {
-        $choice = Read-Host -Prompt 'Choose an option [3]'
-        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '3' }
-
-        switch ($choice.Trim()) {
-            '1' { return 'Recreate' }
-            '2' { return 'Upgrade' }
-            '3' { return 'Keep' }
-        }
-        Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
-    }
-}
-
 function Complete-DatabaseSetupForExistingPostgres {
     <#
       The reuse-aware counterpart to Complete-DatabaseSetup's original
@@ -2528,6 +2492,24 @@ function Complete-DatabaseSetupForExistingPostgres {
       spec: C:\DELTA\.env is always regenerated with the final connection
       information no matter which branch runs below, so that line runs
       once, after the if/else, rather than being duplicated in each branch.
+
+      Canonical database flow (see also Complete-DatabaseSetup's fresh-
+      PostgreSQL branch): initialization and the migration check are two
+      separate responsibilities that always run together, never one
+      without the other, and neither one is ever gated behind an
+      operator prompt here.
+        - No DELTA database yet -> Init, then Upgrade (Upgrade will find
+          the freshly seeded schema already at the latest version and
+          confirm that, not silently no-op). This is a fresh install of
+          the database, with zero prompts.
+        - An existing DELTA database -> Upgrade unconditionally. There
+          is deliberately no recreate/drop option here at all -
+          destructive database maintenance is out of scope for the
+          normal install/update path entirely (not merely defaulted-off
+          or reworded as a confirmation); if it's ever needed again it
+          belongs in a separate, dedicated maintenance operation, never
+          inside this function. An unattended update therefore never
+          blocks on a console prompt it can't answer.
     #>
     param(
         [Parameter(Mandatory)][string]$DatabaseName,
@@ -2540,22 +2522,11 @@ function Complete-DatabaseSetupForExistingPostgres {
     if (-not $exists) {
         Write-Detail "Database '$DatabaseName' does not exist yet on this PostgreSQL instance."
         Invoke-DeltaDatabaseInit -DatabaseName $DatabaseName -SuperuserPassword $SuperuserPassword
+        Invoke-DeltaDatabaseUpgrade -DatabaseName $DatabaseName -SuperuserPassword $SuperuserPassword -FollowingInitialization
     }
     else {
-        $choice = Read-ExistingDeltaDatabaseChoice -DatabaseName $DatabaseName
-
-        switch ($choice) {
-            'Recreate' {
-                Remove-DeltaDatabase -DatabaseName $DatabaseName -SuperuserPassword $SuperuserPassword
-                Invoke-DeltaDatabaseInit -DatabaseName $DatabaseName -SuperuserPassword $SuperuserPassword
-            }
-            'Upgrade' {
-                Invoke-DeltaDatabaseUpgrade -DatabaseName $DatabaseName -SuperuserPassword $SuperuserPassword
-            }
-            'Keep' {
-                Write-Detail "Leaving database '$DatabaseName' untouched."
-            }
-        }
+        Write-Detail "Database '$DatabaseName' already exists - checking its migration status."
+        Invoke-DeltaDatabaseUpgrade -DatabaseName $DatabaseName -SuperuserPassword $SuperuserPassword
     }
 
     $databaseUrl = New-DatabaseUrl -PostgresHost $Script:PostgresHost -Port $Script:PostgresPort `
@@ -2566,40 +2537,54 @@ function Complete-DatabaseSetupForExistingPostgres {
 function Complete-DatabaseSetup {
     <#
       The "ask for DELTA database name -> generate .env -> invoke
-      init_db.ps1" stage of the target installation flow. Owns none of
-      the actual database logic itself - init_db.ps1/upgrade_database.ps1
-      do, invoked as sibling scripts rather than duplicated here. Reuses
-      the PostgreSQL host/port/username/password Phase 2A already
-      resolved; the DELTA database name is the only new value asked for.
+      init_db.ps1 -> invoke upgrade_database.ps1" stage of the target
+      installation flow. Owns none of the actual database logic itself -
+      init_db.ps1/upgrade_database.ps1 do, invoked as sibling scripts
+      rather than duplicated here. Reuses the PostgreSQL host/port/
+      username/password Phase 2A already resolved; the DELTA database
+      name is the only new value asked for.
 
       Branches on $Script:PostgresReuseMode (set by Install-PostgreSql):
-      a fresh install provably has no DELTA database yet, so the
-      original unconditional create-and-restore flow still applies
-      there unchanged; a reused instance might already have one, which
-      is what Complete-DatabaseSetupForExistingPostgres's
-      recreate/upgrade/keep decision exists to handle.
+      a fresh PostgreSQL install provably has no DELTA database yet, so
+      the flow below is Init then Upgrade unconditionally, exactly the
+      same "always run the migration check after initialization" shape
+      Complete-DatabaseSetupForExistingPostgres uses for its own
+      no-database-yet branch; a reused instance might already have a
+      DELTA database, which is what Complete-DatabaseSetupForExistingPostgres
+      exists to handle - by running the migration check unconditionally
+      against it, never by prompting whether to recreate it.
 
-      Upgrade reuse: the database name prompt's suggested default comes
-      from the existing .env's own DATABASE_URL (Get-
-      DeltaUpgradeDatabaseUrlComponents - Upgrade lifecycle only, never
-      Fresh Installation) instead of $Script:DefaultDeltaDatabaseName
-      ("dts_db") whenever that parses successfully - the operator still
-      has to confirm it (bare Enter), never a silent, unconfirmed
-      change, exactly like every other prompt-with-a-suggested-default
-      already in this script.
+      Upgrade reuse: once Get-DeltaUpgradeDatabaseUrlComponents (Upgrade
+      lifecycle only, never Fresh Installation - see that function's own
+      header) has successfully parsed a database name out of the
+      existing .env's DATABASE_URL, that name is treated as
+      authoritative, not merely a suggested default - the whole point of
+      Phase 2A already having parsed, authenticated, and accepted that
+      same DATABASE_URL is that there is no remaining decision left for
+      an operator to make here. The database name is used directly, with
+      only an informational Write-Detail (no Read-DeltaDatabaseName
+      call, no prompt, no confirmation) - unlike every other
+      prompt-with-a-suggested-default in this script, this one specific
+      value has already been established with certainty earlier in the
+      same run. A Fresh Installation never has an existing .env to parse
+      one out of, so Read-DeltaDatabaseName's interactive prompt remains
+      completely unchanged for that case.
     #>
     Show-Section -Title 'DELTA Database Setup'
 
     $existingUrlComponents = Get-DeltaUpgradeDatabaseUrlComponents
-    $suggestedDatabaseName = if ($existingUrlComponents) { $existingUrlComponents.DatabaseName } else { $Script:DefaultDeltaDatabaseName }
 
     if ($existingUrlComponents) {
         Write-Host 'Existing DELTA database:'
-        Write-Detail $suggestedDatabaseName
+        Write-Detail $existingUrlComponents.DatabaseName
         Write-Host ''
+        Write-Detail 'Using database from the existing DELTA configuration.'
+        $deltaDatabaseName = $existingUrlComponents.DatabaseName
+    }
+    else {
+        $deltaDatabaseName = Read-DeltaDatabaseName -DefaultName $Script:DefaultDeltaDatabaseName
     }
 
-    $deltaDatabaseName = Read-DeltaDatabaseName -DefaultName $suggestedDatabaseName
     $superuserPassword = Get-CachedPostgresSuperuserPassword
 
     if ($Script:PostgresReuseMode) {
@@ -2612,6 +2597,7 @@ function Complete-DatabaseSetup {
     New-DeltaEnvironmentFile -DatabaseUrl $databaseUrl -ForceRegenerateFromTemplate:($Script:DeltaDeploymentLifecycle -eq 'Recreate')
 
     Invoke-DeltaDatabaseInit -DatabaseName $deltaDatabaseName -SuperuserPassword $superuserPassword
+    Invoke-DeltaDatabaseUpgrade -DatabaseName $deltaDatabaseName -SuperuserPassword $superuserPassword -FollowingInitialization
 }
 
 # ---------------------------------------------------------------------------
@@ -2875,9 +2861,9 @@ function Invoke-DeltaTaskkill {
       $ErrorActionPreference is relaxed to 'Continue' for only the
       duration of this one call (restored immediately after, even on a
       throw, via try/finally) so the redirected stderr can be captured
-      instead of raised - Test-DeltaDatabaseExists/Remove-DeltaDatabase
-      already use this exact pattern for the same class of problem, not
-      a new technique introduced here.
+      instead of raised - Test-DeltaDatabaseExists already uses this
+      exact pattern for the same class of problem, not a new technique
+      introduced here.
 
       The captured text is never shown on the console - only handed to
       Write-Verbose, so an operator who wants to see exactly what

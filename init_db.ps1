@@ -57,7 +57,7 @@
     supplied - never pass this as a plaintext command-line string.
 
 .PARAMETER DatabaseName
-    Name of the DELTA database to create. Prompted for (default dts_db
+    Name of the DELTA database to create. Prompted for (default delta_db
     shown) if not supplied.
 
 .PARAMETER AppRoot
@@ -402,8 +402,8 @@ try {
     }
 
     if ([string]::IsNullOrWhiteSpace($DatabaseName)) {
-        $enteredName = Read-Host -Prompt 'Enter the DELTA database name [dts_db]'
-        $DatabaseName = if ([string]::IsNullOrWhiteSpace($enteredName)) { 'dts_db' } else { $enteredName.Trim() }
+        $enteredName = Read-Host -Prompt 'Enter the DELTA database name [delta_db]'
+        $DatabaseName = if ([string]::IsNullOrWhiteSpace($enteredName)) { 'delta_db' } else { $enteredName.Trim() }
     }
 
     Initialize-DeltaDatabase -PostgresHost $PostgresHost -Port $Port -Username $Username -Password $Password -DatabaseName $DatabaseName

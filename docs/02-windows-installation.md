@@ -98,13 +98,14 @@ Port:         5432
 2) Install a new PostgreSQL instance
 ```
 
-**Choosing "Reuse"** prompts for the superuser password and validates it live (a real `psql` connection, not just "typed twice consistently"). If authentication succeeds, `setup.ps1` then checks whether the configured DELTA database already exists on that instance and offers:
+**Choosing "Reuse"** prompts for the superuser password and validates it live (a real `psql` connection, not just "typed twice consistently"). If authentication succeeds, `setup.ps1` then checks whether the configured DELTA database already exists on that instance:
 
-1. **Recreate** — drops the existing DELTA database (if present) and recreates it via `init_db.ps1`.
-2. **Upgrade** — runs `upgrade_database.ps1` against the existing database, applying the self-selecting `upgrade_from_*.sql` chain (see [04 — Upgrade mechanism](04-database.md#upgrade-mechanism)).
-3. **Keep** — leaves the database completely untouched.
+- **If it doesn't exist yet**, it's simply created via `init_db.ps1`, then `upgrade_database.ps1` runs unconditionally right after — see below.
+- **If it already exists**, `upgrade_database.ps1` runs against it unconditionally — no prompt of any kind. There is no option to recreate an existing DELTA database as part of this flow, and no confirmation asking whether to. Database recreation is not part of the normal install/update path; if it's ever needed, it belongs in a separate, dedicated maintenance operation, never here.
 
-The application directory's `.env` (`C:\DELTA\.env` by default — see [§Deployment layout](#deployment-layout)) is regenerated with the resulting `DATABASE_URL` regardless of which of the three is chosen. If the database doesn't exist yet on the reused instance, it's simply created — no menu needed.
+Either way — freshly initialized or already existing — `upgrade_database.ps1` always runs against the database before setup continues, applying the self-selecting `upgrade_from_*.sql` chain if the schema version is behind, or reporting that no migration was necessary if it's already current (see [04 — Upgrade mechanism](04-database.md#upgrade-mechanism)). There is no way to keep an existing DELTA database without its schema version being checked — a database at an unrecognized version, or one where the check genuinely fails, stops setup before the application starts or the installation is registered.
+
+The application directory's `.env` (`C:\DELTA\.env` by default — see [§Deployment layout](#deployment-layout)) is regenerated with the resulting `DATABASE_URL` in every case.
 
 **If authentication fails**, the installer does not abort:
 

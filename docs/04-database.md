@@ -61,11 +61,19 @@ Platform-specific invocation (prompts, exact command syntax) is documented in [0
 
 These `\if` meta-commands are interpreted by `psql.exe`/`psql` itself, not by the calling shell — behavior is identical whether invoked from Bash or from `cmd.exe`/PowerShell, since the same binary does the branching either way. This is one of the few pieces of tooling in the artifact that is genuinely OS-agnostic without modification.
 
+`upgrade_database.sql` itself is unmodified and untouched by the installer tooling — `upgrade_database.ps1` (the Windows wrapper `setup.ps1` and standalone operators both invoke) does not trust the chain's own exit code as proof of success. Before running anything, it classifies `dts_system_info.version_no` into one of three outcomes, positively, against two lists audited from this table and from the version `dts_db_schema.sql` seeds (`$Script:DeltaLatestSupportedSchemaVersion` / `$Script:DeltaUpgradableSchemaVersions` in `upgrade_database.ps1`):
+
+- **Already at `0.2.3`** (the latest supported version) — reported as already current; the chain is not run at all.
+- **A known upgradable version** (`0.1.1`, `0.1.3`, `0.2.0`, `0.2.1`, `0.2.2`) — the chain runs, and the resulting version is re-read afterward and checked equals `0.2.3` before the upgrade is reported successful. A chain that exits `0` but leaves the database on some other version — a hole in the `\if` chain, for example — is a hard failure, not a silent success.
+- **Anything else** — refused outright, with the unrecognized version named in the error. An unrecognized version is never treated as "already current" just because no `\if` branch matched it.
+
+It also distinguishes, before ever trusting `version_no`, whether `$DatabaseName` doesn't exist at all, or exists but was never initialized (`dts_system_info` itself missing) — both fail with a message pointing at `init_db.ps1`, never silently initializing the database itself (that stays `init_db.ps1`'s responsibility only).
+
 **Operational notes, true on both platforms:**
 
 - No down-migrations exist. Rollback is restore-from-backup only.
 - `ON_ERROR_STOP=on` halts the script on the first SQL error, but backup before upgrading is a manual, human responsibility — not enforced by any tooling.
-- Upgrading a database more than one recognized version behind has not been verified end-to-end against a real multi-version-behind database in either the Windows or Linux path. Treat it as something to validate during a rehearsal upgrade, not an assumption. See [06](06-deployment-risks.md).
+- The single-hop step (one version behind, e.g. `0.2.2` → `0.2.3`) and the zero-hop "already current" path (fresh `init_db.ps1` immediately followed by `upgrade_database.ps1`) have both been verified end-to-end against a real PostgreSQL 16 instance. A genuine multi-hop upgrade (e.g. `0.1.1` all the way to `0.2.3`) could **not** be verified end-to-end from this repository alone: only the final, cumulative `dts_db_schema.sql` dump ships here, not a real historical `0.1.1`-era database to upgrade from. Simulating one by taking the current dump and rewriting `version_no` back to `0.1.1` is not equivalent and was confirmed directly to fail (`\ir upgrade_from_0.1.2_to_0.1.3.sql` errors with `type "entity_validation_type" already exists`, since that type is already in the current dump) — this failure is an artifact of the simulation, not evidence the real chain is broken, but it means the multi-hop path genuinely remains unverified. Treat it as something to validate during a rehearsal upgrade against a real old backup, not an assumption. See [06](06-deployment-risks.md).
 
 ## Authentication
 
