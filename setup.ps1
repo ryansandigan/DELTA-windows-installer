@@ -77,14 +77,22 @@
     this session's $env:Path), so `dotenv` still resolves in a brand-new
     console or after a reboot, not only for the remainder of this one run.
 
-    Finally, Confirm-DeltaRuntimeNotRunning detects whether a DELTA
-    instance from a previous run is still active (by process command
-    line, matched specifically to this runtime directory - never a
-    generic node.exe sweep) and stops it, so a repeat run never leaves two
-    instances bound to the same port. start.bat itself is deliberately
-    NOT invoked by this script - application startup remains a manual,
-    operator-run step for this validation phase; the final message tells
-    the operator to run it themselves.
+    Next, Confirm-DeltaRuntimeNotRunning detects whether a DELTA instance
+    from a previous run is still active (by process command line, matched
+    specifically to this runtime directory - never a generic node.exe
+    sweep) and stops it, so a repeat run never leaves two instances bound
+    to the same port. Finally, Resolve-DeltaApplicationPort/Update-
+    DeltaApplicationPortEnvironment determine and, if necessary,
+    interactively resolve a port conflict for DELTA's own port, and
+    Start-DeltaRuntimeForValidation/Confirm-DeltaRuntimeStarted start
+    DELTA and verify it (process, then port, then a real HTTP response)
+    before Register-DeltaInstallation ever runs - a failed start or
+    failed verification stops the installer outright, before the registry
+    claims a completed installation. This automatic startup is an interim
+    installation-validation convenience, not a supervised service - see
+    Start-DeltaRuntimeForValidation's own header for what it deliberately
+    does not do (restart policy, crash supervision, watchdog behavior),
+    all of which are deferred to Phase 5 (Windows Service).
 
     This is a multi-phase DELTA installer, built incrementally - see "Future
     phases" at the bottom of this file for how later phases (the Windows
@@ -236,6 +244,28 @@ $Script:EnvTemplatePath          = Join-Path -Path $Script:ProjectRoot -ChildPat
 # own header for why the 'Recreate' choice can only be recorded here, not
 # acted on immediately.
 $Script:DeltaDeploymentLifecycle = 'Upgrade'
+
+# DELTA application startup validation (Start-DeltaRuntimeForValidation /
+# Confirm-DeltaRuntimeStarted, below) - an interim convenience until Phase 5
+# (Windows Service) supersedes it, see those functions' own headers. How
+# long Confirm-DeltaRuntimeStarted waits for the just-started process to
+# bind $Script:DeltaBackendPort, and then to answer an HTTP request, before
+# treating startup as failed rather than merely slow.
+$Script:DeltaStartupPortTimeoutSeconds = 60
+$Script:DeltaStartupHttpTimeoutSeconds = 20
+
+# Set by Resolve-DeltaApplicationPort only when the port conflict it found
+# turned out to be the installer's own managed DELTA instance (per Get-
+# RunningDeltaProcesses - never the registry, see Resolve-
+# DeltaManagedInstanceRestartDecision) and the operator declined a
+# restart, whether just now or via the remembered ManagedInstanceRestartPolicy
+# registry preference (Get-/Set-DeltaManagedInstanceRestartPolicy, Registry
+# Registration section below). Confirm-DeltaRuntimeNotRunning, Start-
+# DeltaRuntimeForValidation, and Confirm-DeltaRuntimeStarted - all called
+# unconditionally from the orchestration block - each become a no-op when
+# this is $true, rather than any of them re-deciding or overriding that
+# choice.
+$Script:DeltaSkipManagedInstanceRestart = $false
 
 # ---------------------------------------------------------------------------
 # Generic helpers
@@ -431,16 +461,39 @@ function Show-MainMenu {
 function Show-InstallationSummary {
     <#
       The final "installation complete" screen. Every piece of state it
-      prints (DeltaHome, EnvPath, StartBatPath) is supplied by the
-      orchestration block below, already established by the phases that
-      ran before it - this performs no installation actions and reads
-      no $Script: state of its own, purely reformatting the same
-      information the previous inline Write-Host block printed.
+      prints (DeltaHome, EnvPath, StartBatPath, Port, Activated) is
+      supplied by the orchestration block below, already established by
+      the phases that ran before it - this performs no installation
+      actions and reads no $Script: state of its own, purely reformatting
+      the same information the previous inline Write-Host block printed.
+
+      $Activated distinguishes two different successful outcomes that
+      must never be reported identically - "the deployment completed"
+      (files, dependencies, .env, database - all updated regardless of
+      $Activated) is not the same fact as "the deployment is active" (the
+      running process is actually serving the code/config just deployed,
+      confirmed by Confirm-DeltaRuntimeStarted's real HTTP check):
+
+        - $true - the normal path: DELTA was (re)started and verified
+          this run. $Port is that already-running instance's actual
+          port, and the "First Run" section below reports DELTA as
+          already up with a URL to browse to.
+        - $false - Resolve-DeltaApplicationPort found the configured
+          port occupied by DELTA's own previous instance and the
+          operator chose not to restart it (Resolve-
+          DeltaManagedInstanceRestartDecision). Confirm-DeltaRuntimeStarted
+          never ran its HTTP check, so this must never claim it did -
+          the "First Run" section below reports the deployment as
+          completed but not yet active, and points at the manual restart
+          needed to activate it, with no browse-to URL implying
+          otherwise.
     #>
     param(
         [Parameter(Mandatory)][string]$DeltaHome,
         [Parameter(Mandatory)][string]$EnvPath,
-        [Parameter(Mandatory)][string]$StartBatPath
+        [Parameter(Mandatory)][string]$StartBatPath,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][bool]$Activated
     )
 
     Show-Section -Title 'Installation Complete' -Subtitle 'Installation completed successfully.'
@@ -461,17 +514,37 @@ function Show-InstallationSummary {
     Write-Host 'Configuration :'
     Write-Detail $EnvPath
 
+    Show-ComponentStatus -Name 'Deployment Status' -Fields ([ordered]@{
+        'Deployment' = 'Completed'
+        'Activation' = if ($Activated) { 'Active' } else { 'Pending (manual restart required)' }
+    })
+
     Write-Host ''
     Write-Host 'First Run'
     Write-Host ''
-    Write-Host 'Start :'
-    Write-Detail $StartBatPath
-    Write-Host ''
-    Write-Host 'Once DELTA has started, browse to:'
-    Write-Detail 'http://localhost:3000'
-    Write-Host ''
-    Write-Host 'Stop :'
-    Write-Detail 'Close the console window start.bat is running in (or press Ctrl+C inside it).'
+    if ($Activated) {
+        Show-Success 'DELTA has been started and verified successfully.'
+        Write-Host ''
+        Write-Host 'Browse to:'
+        Write-Detail "http://localhost:$Port"
+        Write-Host ''
+        Write-Host 'This startup is an installation validation step, not a supervised service -'
+        Write-Host 'see the Windows Service documentation for production deployment. To stop'
+        Write-Host 'DELTA now, end its node.exe process (Task Manager, or taskkill); re-running'
+        Write-Host 'this installer also stops it automatically before starting a fresh instance.'
+        Write-Host ''
+        Write-Host 'To start DELTA manually later (e.g. after a reboot):'
+        Write-Detail $StartBatPath
+    }
+    else {
+        Write-Host "The existing DELTA instance was left running, per the operator's choice above." -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host 'Startup validation was skipped - HTTP validation did not run this time.'
+        Write-Host ''
+        Write-Host 'The currently running instance may still be serving the previous deployment,'
+        Write-Host 'not the one just installed. Restart DELTA manually to activate it:'
+        Write-Detail $StartBatPath
+    }
 
     Write-Host ''
     Write-Host 'Configuration Notes'
@@ -488,8 +561,8 @@ function Show-InstallationSummary {
     Write-Host ''
     Write-Host 'Optional: Reverse Proxy'
     Write-Host ''
-    Write-Host 'DELTA listens on port 3000 by default. Production deployments'
-    Write-Host 'typically place it behind a reverse proxy.'
+    Write-Host "DELTA listens on port $Port for this installation. Production"
+    Write-Host 'deployments typically place it behind a reverse proxy.'
     Write-Host ''
     Write-Host 'Example (NGINX):'
     Write-Host ''
@@ -498,7 +571,7 @@ function Show-InstallationSummary {
     Write-Host '        server_name delta.example.org;'
     Write-Host ''
     Write-Host '        location / {'
-    Write-Host '            proxy_pass http://127.0.0.1:3000;'
+    Write-Host "            proxy_pass http://127.0.0.1:$Port;"
     Write-Host ''
     Write-Host '            proxy_set_header Host $host;'
     Write-Host '            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;'
@@ -513,13 +586,9 @@ function Show-InstallationSummary {
     Write-Host ''
     Write-Host 'Troubleshooting'
     Write-Host ''
-    Write-Host 'If DELTA fails to start because port 3000 is already in use, add'
-    Write-Host 'or change the following line in .env:'
-    Write-Host ''
-    Write-Detail 'PORT=3001'
-    Write-Host ''
-    Write-Host 'Then restart DELTA - close the console window start.bat is'
-    Write-Host 'running in, and run it again:'
+    Write-Host "If a future manual start finds port $Port already in use, add or"
+    Write-Host 'change the PORT line in .env to another available port, then start'
+    Write-Host 'DELTA again:'
     Write-Detail $StartBatPath
 
     Write-Host ''
@@ -794,24 +863,40 @@ function New-ServiceAccountPassword {
     }
 }
 
-function Test-PostgresPort {
+function Test-TcpPortAvailable {
     <#
       Reports whether $Port is free to listen on and, if not, a
       human-readable description (process name + PID) of whatever
-      already owns it, for display to the operator. Uses
-      Get-NetTCPConnection (built into Windows Server's NetTCPIP module)
-      rather than a raw socket bind, since it also identifies the owner.
+      already owns it, for display to the operator, plus the raw owning
+      process ID itself (OwningProcessId). Uses Get-NetTCPConnection
+      (built into Windows Server's NetTCPIP module) rather than a raw
+      socket bind, since it also identifies the owner.
+
+      Originally Test-PostgresPort (Resolve-PostgresPort's own helper) -
+      generalized and renamed once Resolve-DeltaApplicationPort needed the
+      identical "is this port free, and who owns it if not" check for
+      DELTA's own application port. Nothing about the implementation is
+      PostgreSQL-specific; only the name was.
+
+      OwningProcessId exists specifically for Resolve-DeltaApplicationPort's
+      own use: cross-referencing it against Get-RunningDeltaProcesses'
+      PIDs is how that function tells "this port is occupied by our own
+      managed DELTA instance" apart from "this port is occupied by
+      something else entirely" - process ownership is still determined
+      exclusively by Get-RunningDeltaProcesses (command line, application
+      root), never by this function or anything registry-based; this only
+      supplies the PID being cross-referenced.
     #>
     param([Parameter(Mandatory)][int]$Port)
 
     $connection = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $connection) {
-        return [PSCustomObject]@{ Available = $true; OwnerDescription = $null }
+        return [PSCustomObject]@{ Available = $true; OwnerDescription = $null; OwningProcessId = $null }
     }
 
     $owner = Get-Process -Id $connection.OwningProcess -ErrorAction SilentlyContinue
     $description = if ($owner) { "$($owner.ProcessName).exe (PID $($owner.Id))" } else { "PID $($connection.OwningProcess)" }
-    return [PSCustomObject]@{ Available = $false; OwnerDescription = $description }
+    return [PSCustomObject]@{ Available = $false; OwnerDescription = $description; OwningProcessId = $connection.OwningProcess }
 }
 
 function Resolve-PostgresPort {
@@ -827,7 +912,7 @@ function Resolve-PostgresPort {
       5432 unless this function finds it taken.
     #>
     $preferredPort = $Script:PostgresPort
-    $check = Test-PostgresPort -Port $preferredPort
+    $check = Test-TcpPortAvailable -Port $preferredPort
     if ($check.Available) {
         return $preferredPort
     }
@@ -855,7 +940,7 @@ function Resolve-PostgresPort {
             continue
         }
 
-        $recheck = Test-PostgresPort -Port $portNumber
+        $recheck = Test-TcpPortAvailable -Port $portNumber
         if ($recheck.Available) {
             return $portNumber
         }
@@ -1106,6 +1191,59 @@ function Read-ExistingPostgresChoice {
     }
 }
 
+function Get-DeltaUpgradeDatabaseUrlComponents {
+    <#
+      Returns the parsed DATABASE_URL (ConvertFrom-DatabaseUrl, lib\
+      DeltaInstaller.Common.ps1) from the DELTA deployment's EXISTING
+      .env - but only when this run is a genuine Upgrade of a real prior
+      deployment, never for a Fresh Installation. $null in every other
+      case, which every caller here treats as "fall back to the normal,
+      fully-interactive behavior" - never a reason to stop the installer.
+
+      Two conditions, both required:
+
+        1. $Script:DeltaDeploymentLifecycle -eq 'Upgrade'. Excludes
+           'Recreate' and 'Fresh' - both explicit operator choices to
+           NOT carry old configuration forward, even though 'Recreate'
+           technically still has its old .env sitting on disk at the
+           point this is called (New-DeltaEnvironmentFile's own backup+
+           regenerate for that choice hasn't run yet) and 'Fresh' just
+           moved theirs out of the way via Backup-ExistingDeltaDeployment.
+           Reusing old credentials/database name is exactly what those
+           two choices are asking NOT to happen.
+
+        2. .env actually exists on disk at $Script:DeltaRuntimeRoot.
+           Required IN ADDITION to check 1, not redundant with it:
+           $Script:DeltaDeploymentLifecycle defaults to 'Upgrade' and
+           stays there UNTOUCHED whenever Resolve-ExistingDeltaDeployment
+           finds nothing at all at $Script:DeltaRuntimeRoot (see that
+           function's own header) - a genuinely Fresh Installation never
+           explicitly sets it to anything else, so the lifecycle flag
+           ALONE cannot tell "nothing ever existed here" apart from "the
+           operator explicitly chose to upgrade a real deployment". Only
+           an .env that's actually, physically present proves the latter.
+
+      Called independently (and cheaply - a file read plus a string
+      parse, no live network/database call) from both Resolve-
+      ExistingPostgresCredentials (password reuse) and Complete-
+      DatabaseSetup (database name default) rather than computed once
+      and cached in a new $Script: variable - no new persistent or
+      cross-call state needed for something this cheap to just
+      recompute.
+    #>
+    if ($Script:DeltaDeploymentLifecycle -ne 'Upgrade') {
+        return $null
+    }
+
+    $envPath = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath '.env'
+    if (-not (Test-Path -LiteralPath $envPath)) {
+        return $null
+    }
+
+    $databaseUrl = Get-EnvFileValue -Path $envPath -Key 'DATABASE_URL'
+    return ConvertFrom-DatabaseUrl -DatabaseUrl $databaseUrl
+}
+
 function Resolve-ExistingPostgresCredentials {
     <#
       Prompts for and validates the superuser password when reusing an
@@ -1132,8 +1270,38 @@ function Resolve-ExistingPostgresCredentials {
       (Get-PostgresConnectionFailureReason) and shown instead, so a wrong
       port, a wrong password, and a missing database are no longer
       indistinguishable to the operator.
+
+      Upgrade reuse: before ever prompting, tries the password already
+      recorded in the existing DELTA .env's own DATABASE_URL (Get-
+      DeltaUpgradeDatabaseUrlComponents - Upgrade lifecycle only, never
+      Fresh Installation, see that function's own header for exactly
+      what makes that distinction real) against this exact host/port/
+      superuser, live, via the same Test-PostgresCredentials check the
+      interactive prompt below uses. Only ever accepted on a genuine
+      successful authentication - never merely because .env said so -
+      so a stale or hand-edited password still falls straight through to
+      the normal prompt, exactly as if nothing had been tried at all.
     #>
     param([Parameter(Mandatory)][PSCustomObject]$Existing)
+
+    $existingUrlComponents = Get-DeltaUpgradeDatabaseUrlComponents
+    if ($existingUrlComponents) {
+        Write-Step 'Reading database configuration from .env...'
+        Write-Detail 'Existing DATABASE_URL detected.'
+
+        Write-Step "Checking whether the existing DELTA configuration's PostgreSQL credentials still work..."
+        $existingCheck = Test-PostgresCredentials -PostgresHost $Script:PostgresHost -Port $Script:PostgresPort `
+            -Username $Script:PostgresSuperuser -Password $existingUrlComponents.Password
+
+        if ($existingCheck.Success) {
+            Write-Success '    Authentication succeeded.'
+            Write-Detail 'Reusing the existing PostgreSQL credentials.'
+            $Script:PostgresSuperuserPassword = $existingUrlComponents.Password
+            return
+        }
+
+        Write-Detail 'The stored credentials are no longer valid - prompting for the current password.'
+    }
 
     while ($true) {
         $password = Read-Host -Prompt 'Enter the PostgreSQL superuser password' -AsSecureString
@@ -1777,9 +1945,10 @@ function Grant-DeltaRuntimeDirectoryPermission {
       specific account like Administrator), permissions are granted to
       whichever account is actually running this installer right now
       (WindowsIdentity.GetCurrent()), which is also the account that
-      will run start.bat manually for this validation phase. Revisit
-      once Phase 5 introduces an actual dedicated service account to
-      grant this to instead - see docs/08 for the open item.
+      Start-DeltaRuntimeForValidation later starts DELTA as for this
+      validation phase. Revisit once Phase 5 introduces an actual
+      dedicated service account to grant this to instead - see docs/08
+      for the open item.
 
       /T re-applies recursively to anything already inside the
       directory (a no-op on a freshly created empty one, but keeps this
@@ -1870,13 +2039,23 @@ function Initialize-DeltaRuntimeDirectories {
 
 function Read-DeltaDatabaseName {
     <#
-      Prompts for the DELTA database name, defaulting to
-      $Script:DefaultDeltaDatabaseName ("dts_db") on a bare Enter - same
-      prompt-with-suggested-default shape as Resolve-PostgresPort.
+      Prompts for the DELTA database name, defaulting to $DefaultName on
+      a bare Enter - same prompt-with-suggested-default shape as
+      Resolve-PostgresPort. $DefaultName is $Script:DefaultDeltaDatabaseName
+      ("dts_db") unless the caller supplies a different one - Complete-
+      DatabaseSetup passes the name already recorded in the existing
+      .env's DATABASE_URL for an Upgrade run (Get-
+      DeltaUpgradeDatabaseUrlComponents), so a repeat run suggests
+      whatever's already there instead of DELTA's own generic default.
+      A Fresh Installation never has one of those to pass, so this
+      parameter's own default keeps that behavior byte-for-byte
+      unchanged.
     #>
-    $entered = Read-Host -Prompt "Enter the DELTA database name [$($Script:DefaultDeltaDatabaseName)]"
+    param([string]$DefaultName = $Script:DefaultDeltaDatabaseName)
+
+    $entered = Read-Host -Prompt "Enter the DELTA database name [$DefaultName]"
     if ([string]::IsNullOrWhiteSpace($entered)) {
-        return $Script:DefaultDeltaDatabaseName
+        return $DefaultName
     }
     return $entered.Trim()
 }
@@ -1918,6 +2097,25 @@ function Resolve-DeltaEnvironmentTemplatePath {
     Stop-Setup "No configuration template could be found. Checked the installer template ($($Script:EnvTemplatePath)) and the runtime artifact fallback ($fallbackTemplatePath). Cannot generate the environment file."
 }
 
+function Backup-DeltaEnvironmentFile {
+    <#
+      Timestamped backup of an existing .env before this installer writes
+      to it - shared by New-DeltaEnvironmentFile (DATABASE_URL, and any
+      other template-driven regeneration) and Update-DeltaApplicationPortEnvironment
+      (PORT) rather than each keeping its own copy of the same few lines.
+      A no-op if $Path doesn't exist yet - there's nothing to protect.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    $backupPath = "$Path.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    Copy-Item -LiteralPath $Path -Destination $backupPath -Force
+    Write-Detail "Existing .env backed up to: $backupPath"
+}
+
 function New-DeltaEnvironmentFile {
     <#
       Generates <AppRoot>\.env (the deployed runtime directory - see
@@ -1951,11 +2149,21 @@ function New-DeltaEnvironmentFile {
       behavior, security settings, anything) it was never asked to
       manage.
 
-      Adding a future installer-managed value (the parameter doc
-      mentions PORT as a likely future example) means adding one more
-      key to $managedValues below - never a new bespoke match/replace
-      branch - since Update-ManagedEnvironmentLines already applies to
-      every entry in that table generically.
+      Adding a future installer-managed value means adding one more key
+      to $managedValues below - never a new bespoke match/replace branch
+      - since Update-ManagedEnvironmentLines already applies to every
+      entry in that table generically. PORT itself deliberately did NOT
+      end up here: its default (3000) is a plain, static line in
+      .env.example now, like PUBLIC_URL or SESSION_SECRET, passed
+      through completely unmanaged by this function exactly like every
+      other application default - a fresh install gets it for free, no
+      code change needed, precisely because of the architecture
+      described above. Only the CONFLICT case - the operator being
+      forced onto a different port - is genuinely installer-decided
+      state, and that's handled by Update-DeltaApplicationPortEnvironment's
+      own, separate, narrower $managedValues (below, in the DELTA
+      application startup section) - never here, since this function has
+      no idea yet whether the configured port is actually free.
 
       The "read the existing .env, else fall back to the template" dual
       source is orthogonal to that architecture, not an exception to
@@ -2007,9 +2215,7 @@ function New-DeltaEnvironmentFile {
     # "Backup existing .env" + "Generate a new .env from .env.example").
     $targetExists = Test-Path -LiteralPath $envTargetPath
     if ($targetExists) {
-        $backupPath = "$envTargetPath.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-        Copy-Item -LiteralPath $envTargetPath -Destination $backupPath -Force
-        Write-Detail "Existing .env backed up to: $backupPath"
+        Backup-DeltaEnvironmentFile -Path $envTargetPath
     }
 
     $sourceLines = $null
@@ -2372,10 +2578,28 @@ function Complete-DatabaseSetup {
       there unchanged; a reused instance might already have one, which
       is what Complete-DatabaseSetupForExistingPostgres's
       recreate/upgrade/keep decision exists to handle.
+
+      Upgrade reuse: the database name prompt's suggested default comes
+      from the existing .env's own DATABASE_URL (Get-
+      DeltaUpgradeDatabaseUrlComponents - Upgrade lifecycle only, never
+      Fresh Installation) instead of $Script:DefaultDeltaDatabaseName
+      ("dts_db") whenever that parses successfully - the operator still
+      has to confirm it (bare Enter), never a silent, unconfirmed
+      change, exactly like every other prompt-with-a-suggested-default
+      already in this script.
     #>
     Show-Section -Title 'DELTA Database Setup'
 
-    $deltaDatabaseName = Read-DeltaDatabaseName
+    $existingUrlComponents = Get-DeltaUpgradeDatabaseUrlComponents
+    $suggestedDatabaseName = if ($existingUrlComponents) { $existingUrlComponents.DatabaseName } else { $Script:DefaultDeltaDatabaseName }
+
+    if ($existingUrlComponents) {
+        Write-Host 'Existing DELTA database:'
+        Write-Detail $suggestedDatabaseName
+        Write-Host ''
+    }
+
+    $deltaDatabaseName = Read-DeltaDatabaseName -DefaultName $suggestedDatabaseName
     $superuserPassword = Get-CachedPostgresSuperuserPassword
 
     if ($Script:PostgresReuseMode) {
@@ -2565,24 +2789,51 @@ function Install-DeltaDependencies {
 
 function Get-RunningDeltaProcesses {
     <#
-      Identifies the actual DELTA server process(es) - node.exe invoked
-      with build\server\index.js from this specific runtime directory -
-      rather than every node.exe on the machine. Matches on the
-      resolved, absolute path to C:\DELTA\build\server\index.js
-      appearing in the process's own command line: that's the literal
-      argument react-router-serve is invoked with (see docs/01 - Static
-      asset serving, and the NSSM example in docs/02), so an unrelated
-      node.exe running some other application never matches this.
-    #>
-    $markerPath = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath 'build\server\index.js'
-    $escapedMarker = [regex]::Escape($markerPath)
+      Identifies the actual DELTA server process(es) - node.exe running
+      the deployed build\server\index.js entry point from THIS specific
+      runtime directory - rather than every node.exe on the machine.
+      Matching itself is Test-DeltaManagedProcessCommandLine's job (lib\
+      DeltaInstaller.Common.ps1) - see that function's own header for the
+      full two-signal algorithm (entry-point suffix + runtime root, both
+      slash/case-normalized) and why a single absolute-path string match
+      was confirmed unreliable and replaced. This function's only job is
+      supplying the live candidate list (CIM) and this run's own
+      $Script:DeltaRuntimeRoot to that predicate.
 
+      Deliberately scoped to the CURRENT, non-service runtime only - see
+      Test-DeltaManagedProcessCommandLine's own header for why a future
+      Windows Service-managed instance (Phase 5) should be identified via
+      the Service Control Manager instead of an extension of this
+      heuristic.
+
+      An ordinary PowerShell function, not array-guaranteed: like any
+      command whose result count varies (0, 1, or many), a caller that
+      needs collection semantics - .Count, a guaranteed-list foreach,
+      indexing - is responsible for wrapping its own call, e.g. @(Get-
+      RunningDeltaProcesses), rather than this function trying to force
+      array-ness on every possible caller regardless of what it actually
+      needs. (That would not even be reliable done here: PowerShell's
+      implicit return/Write-Output re-enumerates whatever array it's
+      given, so a bare `return @(...)` collapses right back to $null or
+      a scalar for a 0- or 1-element result by the time a caller sees
+      it - confirmed directly to throw "The property 'Count' cannot be
+      found on this object", under this script's own Set-StrictMode
+      -Version Latest, from exactly this shape. Forcing the guarantee
+      through anyway needs an unusual `return ,@(...)` - correct, but a
+      surprising thing to find in an ordinary function, and easy for a
+      future edit to "simplify" back into the bug without realizing it.)
+      Stop-RunningDeltaInstance is this function's one caller that
+      actually needs array semantics, and wraps at its own call site
+      accordingly; Resolve-DeltaApplicationPort (piped directly) and
+      Confirm-DeltaRuntimeStarted (boolean context) don't need to, and
+      deliberately don't.
+    #>
     $candidates = Get-CimInstance -ClassName Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue
     if (-not $candidates) {
         return @()
     }
 
-    return @($candidates | Where-Object { $_.CommandLine -and ($_.CommandLine -match $escapedMarker) })
+    return @($candidates | Where-Object { Test-DeltaManagedProcessCommandLine -CommandLine $_.CommandLine -DeltaRuntimeRoot $Script:DeltaRuntimeRoot })
 }
 
 function Wait-ForProcessExit {
@@ -2602,6 +2853,60 @@ function Wait-ForProcessExit {
     return -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
 }
 
+function Invoke-DeltaTaskkill {
+    <#
+      Runs taskkill.exe for $ProcessId (plus $ExtraArguments, e.g. '/F'),
+      without ever letting its own stderr reach the console or abort the
+      script - confirmed directly that redirecting a failing native
+      command's stderr through PowerShell (2>, in any form - merged with
+      2>&1, or sent to a file - makes no difference) wraps each line in a
+      terminating NativeCommandError under this script's own
+      Set-StrictMode -Version Latest + $ErrorActionPreference = 'Stop',
+      even though the exact same call with NO stderr redirection at all
+      merely lets taskkill's raw text (e.g. "ERROR: The process with PID
+      nnnn could not be terminated. Reason: This process can only be
+      terminated forcefully...") print straight to the console instead.
+      Neither behavior is acceptable here: that message describes the
+      GRACEFUL attempt not having worked yet, which is a normal,
+      expected, already-handled outcome (Stop-RunningDeltaInstance falls
+      back to /F for exactly this reason) - not a real error, and
+      definitely not something that should be allowed to throw.
+
+      $ErrorActionPreference is relaxed to 'Continue' for only the
+      duration of this one call (restored immediately after, even on a
+      throw, via try/finally) so the redirected stderr can be captured
+      instead of raised - Test-DeltaDatabaseExists/Remove-DeltaDatabase
+      already use this exact pattern for the same class of problem, not
+      a new technique introduced here.
+
+      The captured text is never shown on the console - only handed to
+      Write-Verbose, so an operator who wants to see exactly what
+      Windows said can re-run with -Verbose, while the normal install
+      output stays clean. This changes nothing about whether or how
+      taskkill is invoked, its arguments, or its timeout/retry behavior
+      - all of that still belongs entirely to Stop-RunningDeltaInstance.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [string[]]$ExtraArguments = @()
+    )
+
+    $argumentList = @('/PID', $ProcessId) + $ExtraArguments
+    $previousEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $captured = & taskkill.exe $argumentList 2>&1
+    }
+    finally {
+        $ErrorActionPreference = $previousEap
+    }
+
+    $capturedText = ($captured | ForEach-Object { $_.ToString() } | Where-Object { $_ }) -join "`n"
+    if ($capturedText) {
+        Write-Verbose "taskkill.exe $($argumentList -join ' '): $capturedText"
+    }
+}
+
 function Stop-RunningDeltaInstance {
     <#
       Stops any DELTA server process already running from this specific
@@ -2617,41 +2922,588 @@ function Stop-RunningDeltaInstance {
       clean shutdown handshake isn't guaranteed here regardless of
       method, so this makes a real attempt rather than jumping straight
       to a forceful kill.
+
+      The console only ever reports what actually happened: a quiet
+      success line when the graceful attempt alone worked, one
+      informational line when it didn't and the (designed, expected)
+      force fallback took over, and an error only in the one case
+      that's genuinely fatal - both attempts failing. Falling back to
+      force is not itself a failure, so it's never reported as one - see
+      Invoke-DeltaTaskkill for why Windows' own "could not be
+      terminated" message specifically must never reach the console
+      either, on top of that.
     #>
-    $processes = Get-RunningDeltaProcesses
+    # @() wraps the call, not just its result, so a single match is never
+    # unwrapped to a bare object before .Count/foreach below treat it as
+    # a list - see Get-RunningDeltaProcesses' own header for why that
+    # guarantee belongs here, at the one call site that needs it, rather
+    # than inside the function itself.
+    $processes = @(Get-RunningDeltaProcesses)
     if (-not $processes -or $processes.Count -eq 0) {
         Write-Detail 'No running DELTA instance detected.'
         return
     }
 
     foreach ($proc in $processes) {
-        Write-Step "Stopping existing DELTA instance (PID $($proc.ProcessId))..."
+        Write-Step 'Stopping existing DELTA...'
 
-        & taskkill.exe /PID $proc.ProcessId | Out-Null
+        Invoke-DeltaTaskkill -ProcessId $proc.ProcessId
         if (-not (Wait-ForProcessExit -ProcessId $proc.ProcessId -TimeoutSeconds 10)) {
-            Write-Detail "PID $($proc.ProcessId) did not exit gracefully within 10 seconds - forcing termination."
-            & taskkill.exe /PID $proc.ProcessId /F | Out-Null
+            Write-Host ''
+            Write-Detail 'Graceful shutdown did not complete.'
+            Write-Host ''
+            Write-Step 'Forcing shutdown...'
+            Invoke-DeltaTaskkill -ProcessId $proc.ProcessId -ExtraArguments @('/F')
 
             if (-not (Wait-ForProcessExit -ProcessId $proc.ProcessId -TimeoutSeconds 10)) {
-                Stop-Setup "Failed to stop the existing DELTA instance (PID $($proc.ProcessId)) even after forceful termination."
+                Stop-Setup @"
+Unable to stop the existing DELTA instance.
+
+PID:
+$($proc.ProcessId)
+
+The installer cannot safely continue while the previous DELTA instance is still running.
+"@
             }
         }
 
-        Write-Success "    Stopped PID $($proc.ProcessId)."
+        Write-Success '    DELTA stopped successfully.'
     }
 }
 
 function Confirm-DeltaRuntimeNotRunning {
     <#
-      Ensures no DELTA instance from a previous run is still bound to
-      the application port before this run finishes - deliberately does
-      NOT restart it: start.bat remains a manual, operator-run step for
-      this validation phase (see the orchestration block below), so
-      automatically starting anything here would contradict that.
+      Ensures no DELTA instance from a previous run is still bound to the
+      application port before this run starts a fresh one. Deliberately
+      does not restart anything itself - Start-DeltaRuntimeForValidation
+      (called right after this, from the orchestration block) owns that,
+      so this function's only job is guaranteeing a clean start: nothing
+      already bound to $Script:DeltaBackendPort when it runs.
+
+      A no-op when Resolve-DeltaApplicationPort already recorded that the
+      operator chose to leave the existing managed instance running
+      ($Script:DeltaSkipManagedInstanceRestart) - stopping it here would
+      silently override that explicit choice.
     #>
     Show-Section -Title 'DELTA Runtime Status'
+
+    if ($Script:DeltaSkipManagedInstanceRestart) {
+        Write-Detail "Leaving the existing DELTA instance running, per the operator's choice above."
+        return
+    }
+
     Write-Step 'Checking for an already-running DELTA instance...'
     Stop-RunningDeltaInstance
+}
+
+# ---------------------------------------------------------------------------
+# DELTA application startup (installer validation step)
+#
+# An interim convenience until Phase 5 (Windows Service, see
+# docs/08-development-roadmap.md) supersedes it: starts DELTA once, right
+# after installation/upgrade, so the operator gets a working URL
+# immediately instead of having to run start.bat by hand. Deliberately
+# does none of what a real service would - no restart policy, no crash
+# supervision, no watchdog - see Start-DeltaRuntimeForValidation's own
+# header. Registration of the installation as complete
+# (Register-DeltaInstallation) only happens after every function in this
+# section has succeeded - a failed start or a failed verification stops
+# the installer before the registry ever claims success.
+# ---------------------------------------------------------------------------
+
+function Resolve-DeltaApplicationPort {
+    <#
+      Determines the port DELTA will be started on for this run, reusing
+      the exact same PORT-reading contract setup-nginx.ps1/setup-iis.ps1
+      already rely on (Resolve-DeltaBackendPort, lib\DeltaInstaller.Common.ps1)
+      instead of a second .env parser: PORT absent -> $Script:
+      DefaultDeltaBackendPort (3000); present and valid -> used as-is;
+      present and invalid -> Stop-Setup. That call sets $Script:
+      DeltaBackendPort, which this function then treats only as a
+      starting point - .env is never assumed to already describe a port
+      that's actually free right now.
+
+      The "absent" branch is a backward-compatibility path now, not the
+      expected case: .env.example ships PORT="3000" explicitly (a plain
+      default, like PUBLIC_URL - see New-DeltaEnvironmentFile), so every
+      fresh install's .env already states its port outright, and every
+      later run of this installer reads that same value back as the
+      authoritative one - never re-inferring a default on an installation
+      that already has one. "Absent" only remains reachable for a .env
+      an operator hand-edited to remove PORT, or one from before this
+      default existed - Resolve-DeltaBackendPort still needs to do
+      something sane there, but a normal install never exercises it.
+
+      If that port is available, nothing else happens: $Script:
+      DeltaBackendPort is left exactly as Resolve-DeltaBackendPort set
+      it, $Script:DeltaApplicationPortChanged stays $false, and Update-
+      DeltaApplicationPortEnvironment (called later, unconditionally,
+      from the orchestration block) becomes a no-op - this is what keeps
+      an already-correct .env completely untouched by this feature.
+
+      If it's occupied, the FIRST question is whose process this actually
+      is - Get-RunningDeltaProcesses cross-referenced by PID against
+      Test-TcpPortAvailable's own OwningProcessId, never anything read
+      from the registry (that stays exclusively a preference store - see
+      Resolve-DeltaManagedInstanceRestartDecision):
+
+        - If it's this installer's own managed DELTA instance (the
+          previous version, still running), this is not a port conflict
+          at all - it's the exact instance this run is about to replace.
+          Resolve-DeltaManagedInstanceRestartDecision decides whether to
+          proceed with a stop+restart, and $Script:DeltaBackendPort is
+          left completely alone either way. A declined restart sets
+          $Script:DeltaSkipManagedInstanceRestart so Confirm-
+          DeltaRuntimeNotRunning/Start-DeltaRuntimeForValidation/Confirm-
+          DeltaRuntimeStarted (called later, unconditionally, from the
+          orchestration block) each become a no-op rather than
+          overriding that choice.
+        - Otherwise, it's a genuine conflict: explained (owning process,
+          via the same Test-TcpPortAvailable diagnostic Resolve-
+          PostgresPort's analogous prompt already uses) and the operator
+          is prompted for a replacement - re-prompting on an invalid port
+          number (Test-ValidTcpPort) or another occupied one, exactly
+          like Resolve-PostgresPort's own loop, until a valid, genuinely
+          free port is entered. The port is never changed silently: only
+          an explicit operator answer here can move $Script:
+          DeltaBackendPort away from whatever Resolve-DeltaBackendPort
+          first read, and only then does $Script:DeltaApplicationPortChanged
+          become $true.
+    #>
+    $Script:DeltaEnvPath = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath '.env'
+    $Script:DeltaSkipManagedInstanceRestart = $false
+
+    Resolve-DeltaBackendPort
+    $Script:DeltaApplicationPortChanged = $false
+
+    $check = Test-TcpPortAvailable -Port $Script:DeltaBackendPort
+    if ($check.Available) {
+        Write-Success "    Port $($Script:DeltaBackendPort) is available."
+        return
+    }
+
+    $managedProcess = Get-RunningDeltaProcesses | Where-Object { [int]$_.ProcessId -eq [int]$check.OwningProcessId } | Select-Object -First 1
+    if ($managedProcess) {
+        Write-Host ''
+        Write-Host ('-' * $Script:BannerWidth)
+        Write-Host 'DELTA Runtime'
+        Write-Host ('-' * $Script:BannerWidth)
+        Write-Host ''
+        Write-Host 'Configured backend port:'
+        Write-Host $Script:DeltaBackendPort
+        Write-Host ''
+        Write-Host 'Existing DELTA instance detected.'
+        Write-Host ''
+        Write-Host 'PID:'
+        Write-Host $managedProcess.ProcessId
+
+        if (Resolve-DeltaManagedInstanceRestartDecision) {
+            Write-Host ''
+            Write-Host 'Preparing to stop and restart DELTA...'
+        }
+        else {
+            $Script:DeltaSkipManagedInstanceRestart = $true
+            Write-Host ''
+            Write-Host 'Leaving the existing DELTA instance running, untouched, as requested.'
+        }
+        return
+    }
+
+    Write-Host ''
+    Write-Host 'Configured backend port:'
+    Write-Host $Script:DeltaBackendPort
+    Write-Host ''
+    Write-Host 'Port conflict detected.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host "Port $($Script:DeltaBackendPort) is currently used by:"
+    Write-Host ''
+    Write-Host $check.OwnerDescription
+    Write-Host ''
+    Write-Host 'Choose another available port.'
+
+    while ($true) {
+        $entered = Read-Host -Prompt 'Enter DELTA application port'
+        $candidate = $entered.Trim()
+
+        if (-not (Test-ValidTcpPort -Value $candidate)) {
+            Write-Host "'$candidate' is not a valid port number (1-65535). Try again." -ForegroundColor Yellow
+            continue
+        }
+
+        $portNumber = [int]$candidate
+        $recheck = Test-TcpPortAvailable -Port $portNumber
+        if ($recheck.Available) {
+            $Script:DeltaBackendPort = $portNumber
+            $Script:DeltaApplicationPortChanged = $true
+            Write-Host ''
+            Write-Success "    Port $portNumber is available. DELTA will use this port."
+            return
+        }
+
+        Write-Host ''
+        Write-Host 'Port conflict detected.' -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host "Port $portNumber is currently used by:"
+        Write-Host ''
+        Write-Host $recheck.OwnerDescription
+        Write-Host ''
+        Write-Host 'Choose another available port.'
+    }
+}
+
+function Resolve-DeltaManagedInstanceRestartDecision {
+    <#
+      Decides whether to stop and restart an already-running, installer-
+      managed DELTA instance that's occupying the configured port -
+      called only once Resolve-DeltaApplicationPort has already confirmed
+      (via Get-RunningDeltaProcesses, cross-referenced by PID - never via
+      the registry) that the occupying process actually IS that managed
+      instance. The ManagedInstanceRestartPolicy registry value this reads/
+      writes (Get-/Set-DeltaManagedInstanceRestartPolicy - Registry Registration
+      section, below) stores only the operator's remembered PREFERENCE;
+      it plays no part in deciding whose process this is, which stays
+      exclusively Get-RunningDeltaProcesses' job, unchanged.
+
+      Three cases:
+        - No preference recorded yet (Get-DeltaManagedInstanceRestartPolicy
+          returns $null) - a brand new installation, or one from before
+          this preference existed. Shows the one-time explanatory
+          prompt below (bare Enter defaults to Yes/recommended - the same
+          "blank means the recommended choice" convention Read-
+          ExistingPostgresChoice's analogous reuse-instead-of-fresh-install
+          prompt already uses, which is why this doesn't reuse the shared
+          Read-DeltaYesNoConfirmation helper: that one's bare-Enter-means-
+          No convention is for a different situation - an action with no
+          particular recommended answer - not this one), persists
+          whichever answer is given, and that same answer governs this
+          run too - asking twice for the same decision in the same run
+          would be exactly the repetitive UX this feature exists to
+          remove.
+        - Preference is 1 (always restart) - returns $true immediately,
+          no prompt at all.
+        - Preference is 0 (always ask) - asks every time via the shared
+          Read-DeltaYesNoConfirmation helper (bare Enter means No here,
+          correctly - unlike the one-time prompt above, this has no
+          "recommended" framing, just a plain repeated confirmation, so
+          the shared helper's own default fits as-is), but never
+          re-persists a different value from a single answer - 0 means
+          "keep asking me", not "downgrade to a different stored value by
+          answering once".
+    #>
+    $preference = Get-DeltaManagedInstanceRestartPolicy
+
+    if ($null -eq $preference) {
+        Write-Host ''
+        Write-Host ('-' * $Script:BannerWidth)
+        Write-Host ''
+        Write-Host 'Would you like future updates to automatically stop and restart this DELTA instance?'
+        Write-Host ''
+        Write-Host '[Y] Yes (recommended)'
+        Write-Host '[N] No (always ask)'
+        Write-Host ''
+        Write-Host ('-' * $Script:BannerWidth)
+        Write-Host ''
+
+        while ($true) {
+            $choice = Read-Host -Prompt 'Choice [Y]'
+            if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 'Y' }
+
+            switch ($choice.Trim().ToUpperInvariant()) {
+                'Y' {
+                    Set-DeltaManagedInstanceRestartPolicy -Value 1
+                    return $true
+                }
+                'N' {
+                    Set-DeltaManagedInstanceRestartPolicy -Value 0
+                    return $false
+                }
+            }
+            Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
+        }
+    }
+
+    if ($preference -eq 1) {
+        Write-Host ''
+        Write-Host 'Restart policy:'
+        Write-Host 'Always restart automatically.'
+        return $true
+    }
+
+    return Read-DeltaYesNoConfirmation -Body {
+        Write-Host 'Stop and restart it now?'
+    }
+}
+
+function Update-DeltaApplicationPortEnvironment {
+    <#
+      Writes the operator-selected DELTA application port back into .env
+      via the exact same managed-values mechanism (Update-
+      ManagedEnvironmentLines) New-DeltaEnvironmentFile already uses for
+      DATABASE_URL - no second .env-writing mechanism. A no-op whenever
+      Resolve-DeltaApplicationPort didn't have to change anything
+      ($Script:DeltaApplicationPortChanged still $false): a correctly-
+      configured .env - PORT absent and 3000 free, or PORT already set to
+      whatever's actually free - is left completely untouched, never
+      rewritten to the same value it already had.
+    #>
+    if (-not $Script:DeltaApplicationPortChanged) {
+        Write-Detail '.env already reflects an available port - no change needed.'
+        return
+    }
+
+    Write-Step 'Updating .env with the selected DELTA application port...'
+
+    $envTargetPath = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath '.env'
+    if (-not (Test-Path -LiteralPath $envTargetPath)) {
+        Stop-Setup "DELTA environment file not found: $envTargetPath. Run the database setup phase first."
+    }
+
+    Backup-DeltaEnvironmentFile -Path $envTargetPath
+
+    $sourceLines = Get-Content -LiteralPath $envTargetPath
+    $managedValues = [ordered]@{ PORT = $Script:DeltaBackendPort }
+    $updatedLines = Update-ManagedEnvironmentLines -SourceLines $sourceLines -ManagedValues $managedValues
+    Set-Content -LiteralPath $envTargetPath -Value $updatedLines -Encoding utf8
+
+    Write-Success "    .env updated (PORT=$($Script:DeltaBackendPort))."
+}
+
+function Get-DeltaStartupLogPaths {
+    <#
+      The two fixed log file paths Start-DeltaRuntimeForValidation
+      redirects DELTA's stdout/stderr into, and Get-DeltaStartupFailureMessage
+      reads back from on a verification failure - one place computing
+      both so they can never drift apart between the two call sites.
+      Lives under <AppRoot>\logs - already created and proven writable by
+      Initialize-DeltaRuntimeDirectories earlier in this run, so nothing
+      here needs to create or permission it again.
+    #>
+    $logsDirectory = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath 'logs'
+    return [PSCustomObject]@{
+        StdOut = Join-Path -Path $logsDirectory -ChildPath 'delta-startup-stdout.log'
+        StdErr = Join-Path -Path $logsDirectory -ChildPath 'delta-startup-stderr.log'
+    }
+}
+
+function Start-DeltaRuntimeForValidation {
+    <#
+      Starts DELTA so the installer can hand the operator a working URL
+      immediately - an interim convenience for this validation phase,
+      standing in for the eventual Windows Service (Phase 5, see
+      docs/08-development-roadmap.md). Deliberately does none of what a
+      real service would: no restart policy, no crash supervision, no
+      watchdog. It starts the process once; Confirm-DeltaRuntimeStarted
+      (called right after, from the orchestration block) either confirms
+      it came up cleanly or stops the installer outright. Whichever
+      happens, this function's own job ends the moment the process has
+      been launched.
+
+      Runs the exact command start.bat itself wraps - `dotenv -e .env --
+      yarn start` - rather than invoking start.bat directly: start.bat's
+      own trailing `pause` is documented (docs/02 - Windows Service
+      installation) as something that hangs a non-interactive caller
+      indefinitely, which is exactly why the NSSM example there already
+      bypasses start.bat and invokes the underlying command directly
+      instead of wrapping it. This reuses that same lesson rather than
+      re-learning it.
+
+      Launched detached (Start-Process, no -Wait) with its console window
+      hidden and stdout/stderr redirected to <AppRoot>\logs\
+      (Get-DeltaStartupLogPaths) - the only place this run's startup
+      diagnostics go, reused as-is rather than standing up a separate
+      logging mechanism. Confirm-DeltaRuntimeNotRunning must already have
+      run before this - never called from here - so this is always a
+      clean start, never a restart racing a not-yet-stopped previous
+      instance.
+
+      A no-op when $Script:DeltaSkipManagedInstanceRestart is set
+      (Resolve-DeltaApplicationPort) - the operator chose to leave the
+      existing managed instance running rather than restart it, so there
+      is nothing to launch this run.
+    #>
+    Show-Section -Title 'Starting DELTA'
+
+    if ($Script:DeltaSkipManagedInstanceRestart) {
+        Write-Detail 'Skipping automatic startup - the existing DELTA instance was left running untouched.'
+        return
+    }
+
+    Write-Step 'Starting DELTA for installation validation...'
+    Write-Detail 'This is an interim step - DELTA is not yet running as a supervised Windows Service.'
+
+    $logPaths = Get-DeltaStartupLogPaths
+    Write-Detail "Standard output: $($logPaths.StdOut)"
+    Write-Detail "Standard error : $($logPaths.StdErr)"
+
+    try {
+        Start-Process -FilePath 'cmd.exe' `
+            -ArgumentList '/c dotenv -e .env -- yarn start' `
+            -WorkingDirectory $Script:DeltaRuntimeRoot `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $logPaths.StdOut `
+            -RedirectStandardError $logPaths.StdErr `
+            | Out-Null
+    }
+    catch {
+        Stop-Setup "Failed to launch DELTA: $($_.Exception.Message)"
+    }
+
+    Write-Success '    DELTA start requested.'
+}
+
+function Test-DeltaHttpEndpoint {
+    <#
+      A single HTTP probe against $Url - returns $true for any response
+      the server actually sent (status < 500), $false for a connection-
+      level failure (nothing listening yet, connection refused/reset) or
+      a server error. Invoke-WebRequest throws on a non-2xx status in
+      Windows PowerShell 5.1, so a thrown exception that still carries a
+      real HTTP response is treated as "responded", not as a failure -
+      DELTA answering with, say, a redirect or a 404 already proves the
+      HTTP server itself is up, which is all this specific check is
+      responsible for confirming.
+    #>
+    param([Parameter(Mandatory)][string]$Url)
+
+    try {
+        $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        return ($response.StatusCode -lt 500)
+    }
+    catch {
+        $webResponse = $_.Exception.Response
+        if ($webResponse -and $webResponse.StatusCode) {
+            return ([int]$webResponse.StatusCode -lt 500)
+        }
+        return $false
+    }
+}
+
+function Get-DeltaStartupFailureMessage {
+    <#
+      Builds a Stop-Setup message that always points at the two startup
+      log files (Get-DeltaStartupLogPaths) and, when the stderr log
+      actually has content, includes its last few lines inline - so a
+      failed verification is diagnosable straight from the console
+      output that already stopped the installer, not just from a path
+      the operator still has to go open themselves.
+    #>
+    param([Parameter(Mandatory)][string]$Reason)
+
+    $logPaths = Get-DeltaStartupLogPaths
+    $message = "$Reason`n`nStartup logs:`n$($logPaths.StdOut)`n$($logPaths.StdErr)"
+
+    if (Test-Path -LiteralPath $logPaths.StdErr) {
+        $tail = @(Get-Content -LiteralPath $logPaths.StdErr -Tail 15 -ErrorAction SilentlyContinue)
+        if ($tail.Count -gt 0) {
+            $message += "`n`nLast lines of stderr:`n$($tail -join "`n")"
+        }
+    }
+
+    return $message
+}
+
+function Confirm-DeltaRuntimeStarted {
+    <#
+      Layered startup verification, in the order Test-DeltaNginxStartupHealth
+      (setup-nginx.ps1) already established for the same problem: a
+      running process alone is never reported as success, and neither is
+      a bound port on its own - only escalating through process, then
+      port, then a real HTTP round-trip proves DELTA actually came up.
+
+      Each wait loop re-checks Get-RunningDeltaProcesses on every
+      iteration, not just once at the start, so a process that starts and
+      then crashes mid-wait (e.g. a bad DATABASE_URL) fails fast with a
+      real diagnostic instead of running out the full timeout first.
+
+      The port-wait loop specifically tracks whether it has EVER observed
+      the managed process before treating "not found" as a failure -
+      confirmed directly (real captured launch, dotenv-cli -> yarn.js ->
+      the react-router-serve .bin shim -> the final node.exe actually
+      running build/server/index.js) that this multi-hop chain takes
+      real, measurable time to reach its last hop, which is the only one
+      Get-RunningDeltaProcesses can ever match. On the loop's first
+      iteration - which runs immediately, since Start-Process returns as
+      soon as the top-level cmd.exe exists, not once the whole chain has
+      - "not found yet" is the normal, expected state, not evidence of a
+      crash; only a transition from "was found" to "no longer found"
+      means it actually exited. Without this, a perfectly healthy
+      startup that simply takes a moment to descend through that chain
+      gets reported as failed while the real process goes on to start
+      successfully in the background, unaware the installer already gave
+      up on it.
+
+      A no-op when $Script:DeltaSkipManagedInstanceRestart is set - there
+      is nothing to verify this run, since Start-DeltaRuntimeForValidation
+      didn't start anything either. Reports that plainly, in a dedicated
+      banner, rather than letting the run end looking like a normal
+      success: the runtime files, dependencies, .env, and database were
+      all still updated by the phases before this one (a real, completed
+      deployment - see Register-DeltaInstallation, still called
+      unconditionally after this), but the deployment is not yet ACTIVE -
+      the process actually serving traffic is still whatever was running
+      before this install/update started. Those are two different facts,
+      and this is the one place that draws the line between them, so
+      nothing downstream (the final summary included) can imply HTTP
+      validation succeeded when it never ran.
+    #>
+    Show-Section -Title 'Verifying DELTA Startup'
+
+    if ($Script:DeltaSkipManagedInstanceRestart) {
+        Write-Host ''
+        Write-Host ('-' * $Script:BannerWidth)
+        Write-Host ''
+        Write-Host 'Deployment completed.'
+        Write-Host ''
+        Write-Host 'The existing DELTA instance was left running.'
+        Write-Host ''
+        Write-Host 'The updated deployment will become active after DELTA is restarted manually.'
+        Write-Host ''
+        Write-Host 'Current running instance may still be the previous deployment.'
+        Write-Host ''
+        Write-Host ('-' * $Script:BannerWidth)
+        return
+    }
+
+    Write-Step 'Waiting for DELTA to start listening on its configured port...'
+    $portDeadline = (Get-Date).AddSeconds($Script:DeltaStartupPortTimeoutSeconds)
+    $isListening = $false
+    $hasBeenObservedRunning = $false
+    while ((Get-Date) -lt $portDeadline) {
+        if (Get-RunningDeltaProcesses) {
+            $hasBeenObservedRunning = $true
+        }
+        elseif ($hasBeenObservedRunning) {
+            Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it finished starting.')
+        }
+        if (-not (Test-TcpPortAvailable -Port $Script:DeltaBackendPort).Available) {
+            $isListening = $true
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $isListening) {
+        Stop-Setup (Get-DeltaStartupFailureMessage -Reason "DELTA did not start listening on port $($Script:DeltaBackendPort) within $($Script:DeltaStartupPortTimeoutSeconds) seconds.")
+    }
+    Write-Success "    DELTA is listening on port $($Script:DeltaBackendPort)."
+
+    Write-Step 'Confirming DELTA responds over HTTP...'
+    $url = "http://localhost:$($Script:DeltaBackendPort)/"
+    $httpDeadline = (Get-Date).AddSeconds($Script:DeltaStartupHttpTimeoutSeconds)
+    $isResponding = $false
+    while ((Get-Date) -lt $httpDeadline) {
+        if (-not (Get-RunningDeltaProcesses)) {
+            Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it responded over HTTP.')
+        }
+        if (Test-DeltaHttpEndpoint -Url $url) {
+            $isResponding = $true
+            break
+        }
+        Start-Sleep -Milliseconds 1000
+    }
+    if (-not $isResponding) {
+        Stop-Setup (Get-DeltaStartupFailureMessage -Reason "DELTA did not respond over HTTP at $url within $($Script:DeltaStartupHttpTimeoutSeconds) seconds.")
+    }
+    Write-Success "    DELTA responded successfully at $url."
 }
 
 function Initialize-Setup {
@@ -2941,9 +3793,12 @@ function Resolve-ExistingDeltaDeployment {
 # path the way this installer's own scripts historically have (see
 # $Script:DefaultDeltaRuntimeRoot in lib\DeltaInstaller.Common.ps1 - that
 # remains only a prompt default, never an assumption an installed copy
-# actually lives there). Deliberately just these two values for now - see
-# this section's own Register-DeltaInstallation for why nothing else is
-# written yet.
+# actually lives there). Register-DeltaInstallation owns InstallPath/Version
+# here; Get-/Set-DeltaManagedInstanceRestartPolicy (below) own a third,
+# independent value on the same key, ManagedInstanceRestartPolicy - an
+# operator PREFERENCE only, never used to identify which process is
+# DELTA's (that stays exclusively Get-RunningDeltaProcesses' job, see
+# Resolve-DeltaApplicationPort/Resolve-DeltaManagedInstanceRestartDecision).
 $Script:DeltaRegistryKeyPath = 'HKLM:\SOFTWARE\PreventionWeb\DELTA'
 
 function Register-DeltaInstallation {
@@ -2962,6 +3817,18 @@ function Register-DeltaInstallation {
       canceled installation must never register itself as complete. Only
       the purely cosmetic final summary runs after this, so "this function
       ran" and "the installation succeeded" are the same fact.
+
+      Still runs unconditionally even when $Script:DeltaSkipManagedInstanceRestart
+      is set (the operator declined to restart an already-running managed
+      instance - see Resolve-DeltaApplicationPort/Confirm-DeltaRuntimeStarted):
+      "the deployment succeeded" (files, dependencies, .env, database -
+      everything this registers) and "the deployment is active" (the
+      running process actually reflects it) are different facts, and only
+      the first one is this function's job. Show-InstallationSummary's own
+      -Activated parameter is what reports the second one honestly -
+      InstallPath/Version being current and accurate is true, and worth
+      recording, regardless of which process happens to be listening on
+      the configured port right now.
 
       Idempotent by construction, not by an explicit "does the key already
       exist" branch: Set-ItemProperty creates InstallPath/Version if
@@ -3005,6 +3872,74 @@ function Register-DeltaInstallation {
     Write-Detail "Version: $($Script:DeltaInstallerVersion)"
 }
 
+function Get-DeltaManagedInstanceRestartPolicy {
+    <#
+      Reads ManagedInstanceRestartPolicy from $Script:DeltaRegistryKeyPath -
+      the operator's remembered answer to "should future runs
+      automatically stop and restart an already-running, installer-
+      managed DELTA instance without asking" (Resolve-
+      DeltaManagedInstanceRestartDecision). Returns $null when the value
+      has never been set (a brand new installation, or one from before
+      this preference existed) - callers use $null specifically to mean
+      "ask the first-time setup question", never confusing it with an
+      explicit 0 ("always ask").
+
+      Uses the same Get-RegistryPropertyValue helper (lib\
+      DeltaInstaller.Common.ps1) Get-DeltaInstallPath already relies on
+      for the identical "read a possibly-absent registry value safely
+      under Set-StrictMode" problem, rather than a second copy of that
+      pattern. Read-only: never creates the registry key - a missing key
+      here just means "no preference recorded yet", already
+      indistinguishable from, and handled identically to, a key that
+      exists but lacks this one value.
+    #>
+    $entry = Get-ItemProperty -LiteralPath $Script:DeltaRegistryKeyPath -Name 'ManagedInstanceRestartPolicy' -ErrorAction SilentlyContinue
+    $rawValue = Get-RegistryPropertyValue -InputObject $entry -Name 'ManagedInstanceRestartPolicy'
+    if ($null -eq $rawValue) {
+        return $null
+    }
+    return [int]$rawValue
+}
+
+function Set-DeltaManagedInstanceRestartPolicy {
+    <#
+      Persists the operator's ManagedInstanceRestartPolicy answer to
+      $Script:DeltaRegistryKeyPath - the same registry key Register-
+      DeltaInstallation already owns (InstallPath/Version), just a third,
+      independent value on it, stored as a DWord (Windows' own convention
+      for a small-integer registry value). Named as a "policy", not an
+      "AutoRestart" flag, specifically so a future third option (e.g. a
+      maintenance-window-only restart) could be added as a new accepted
+      value under this same name later, without a second registry value
+      or a migration from the old one - even though only 0 ("ask") and 1
+      ("always restart") are actually accepted today
+      (Resolve-DeltaManagedInstanceRestartDecision).
+
+      Requires Administrator privileges, the same per-action check every
+      other HKLM write in this script already uses - but this can run
+      before Register-DeltaInstallation itself (a first-time restart
+      decision can arise before this installer would otherwise touch the
+      registry at all, on an ordinary "Update DELTA" run), so the key is
+      created here too if it doesn't exist yet, exactly the way Register-
+      DeltaInstallation does for the same key.
+    #>
+    param([Parameter(Mandatory)][ValidateSet(0, 1)][int]$Value)
+
+    if (-not (Test-IsAdministrator)) {
+        Stop-Setup "Administrator privileges are required to write to $($Script:DeltaRegistryKeyPath). Re-run this script from an elevated PowerShell session."
+    }
+
+    try {
+        if (-not (Test-Path -LiteralPath $Script:DeltaRegistryKeyPath)) {
+            New-Item -Path $Script:DeltaRegistryKeyPath -Force -ErrorAction Stop | Out-Null
+        }
+        Set-ItemProperty -LiteralPath $Script:DeltaRegistryKeyPath -Name 'ManagedInstanceRestartPolicy' -Value $Value -Type DWord -ErrorAction Stop
+    }
+    catch {
+        Stop-Setup "Failed to save the DELTA restart preference in the Windows Registry ($($Script:DeltaRegistryKeyPath)): $($_.Exception.Message). This usually means Administrator privileges are required - re-run this script from an elevated PowerShell session."
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Orchestration
 #
@@ -3032,19 +3967,20 @@ try {
     Install-DeltaDependencies
     Initialize-DeltaRuntimeDirectories
     Complete-DatabaseSetup
+    Resolve-DeltaApplicationPort
+    Update-DeltaApplicationPortEnvironment
     Confirm-DeltaRuntimeNotRunning
+    Start-DeltaRuntimeForValidation
+    Confirm-DeltaRuntimeStarted
     Register-DeltaInstallation
 
     # Future phases (not yet implemented):
-    # Install-WindowsService (Phase 5)
+    # Install-WindowsService (Phase 5) - supersedes Start-DeltaRuntimeForValidation/
+    #   Confirm-DeltaRuntimeStarted above, which exist only as an interim,
+    #   installation-validation convenience (no restart policy, no crash
+    #   supervision, no watchdog - see Start-DeltaRuntimeForValidation's own
+    #   header) until a real supervised service takes over DELTA's lifecycle.
     # Validate-Deployment    (Phase 6)
-    #
-    # Application startup (start.bat) is intentionally NOT invoked here -
-    # for this validation phase it remains a manual, operator-run step
-    # (see the final message below), isolated from everything setup.ps1
-    # itself is responsible for. Wiring it in is deferred to Phase 5
-    # (Windows Service), once the app is meant to run unattended rather
-    # than in a console the operator is watching.
     #
     # Database upgrade path (detect an existing DELTA installation ->
     # validate it -> update DATABASE_URL if required -> invoke
@@ -3058,14 +3994,19 @@ try {
 
     # Final installation summary - purely a console-output concern. Every
     # piece of state it prints (DeltaRuntimeRoot, the .env/start.bat paths
-    # derived from it) was already established by the phases above; this
-    # section performs no installation actions of its own, and reuses
-    # Show-InstallationSummary rather than inlining its own formatting.
+    # derived from it, the resolved application port, whether the
+    # deployment is actually active) was already established by the
+    # phases above; this section performs no installation actions of its
+    # own, and reuses Show-InstallationSummary rather than inlining its
+    # own formatting. Activated is the exact inverse of $Script:
+    # DeltaSkipManagedInstanceRestart - "startup validation genuinely ran
+    # and passed" is the only thing that flag ever gates.
     $deltaHome    = $Script:DeltaRuntimeRoot
     $envPath      = Join-Path -Path $deltaHome -ChildPath '.env'
     $startBatPath = Join-Path -Path $deltaHome -ChildPath 'start.bat'
+    $activated    = -not $Script:DeltaSkipManagedInstanceRestart
 
-    Show-InstallationSummary -DeltaHome $deltaHome -EnvPath $envPath -StartBatPath $startBatPath
+    Show-InstallationSummary -DeltaHome $deltaHome -EnvPath $envPath -StartBatPath $startBatPath -Port $Script:DeltaBackendPort -Activated $activated
 
     exit 0
 }

@@ -663,6 +663,91 @@ Please install DELTA using setup.ps1 before running setup-nginx.ps1.
 }
 
 # ---------------------------------------------------------------------------
+# DELTA managed process matching
+# ---------------------------------------------------------------------------
+
+function Test-DeltaManagedProcessCommandLine {
+    <#
+      The actual matching predicate behind setup.ps1's own Get-
+      RunningDeltaProcesses - factored out into this shared, pure,
+      side-effect-free function (no CIM query, no $Script: state read
+      beyond its own parameters) specifically so it can be exercised
+      directly against known command lines, real and adversarial,
+      without a live process - see tools\test-delta-process-matching.ps1.
+
+      Requires BOTH of the following - deliberately never either alone,
+      since a single string match was confirmed unreliable (see history
+      below):
+
+        1. $CommandLine, slash/case-normalized, contains the DELTA entry
+           point's relative SUFFIX - "build/server/index.js" - rather
+           than any specific absolute or relative form of it. This is
+           deliberately a suffix match: a live capture of the real
+           `dotenv -e .env -- yarn start` invocation confirmed the actual
+           argument is always the relative, forward-slashed
+           "./build/server/index.js" from package.json's own "start"
+           script (`react-router-serve ./build/server/index.js`), never
+           an absolute path - regardless of whether some other part of
+           the command line (e.g. an npm/yarn .bin shim's own resolved
+           module path) happens to be absolute.
+        2. The same normalized $CommandLine also contains
+           $DeltaRuntimeRoot, normalized the same way. Signal 1 alone
+           would also match a completely unrelated Node application
+           elsewhere on the machine that happens to share the same
+           build/server/index.js convention (a real risk with this
+           specific application framework, not a hypothetical one) -
+           this is what preserves Get-RunningDeltaProcesses' original
+           guarantee of never matching an unrelated node.exe. Callers
+           pass $DeltaRuntimeRoot fresh from $Script:DeltaRuntimeRoot on
+           every call rather than this function caching or hardcoding
+           it, so a later reinstall to a different directory is picked
+           up automatically without this function needing to change.
+
+      Normalization is one simple transform applied identically to both
+      sides - collapse every run of \ or / into a single / - rather than
+      a slash-tolerant regex character class repeated across multiple
+      patterns, so there is exactly one place "what counts as the same
+      path" is decided. Comparison is case-insensitive throughout (-match's
+      own default), matching Windows' own path case-insensitivity.
+
+      History: the original implementation matched a single absolute
+      path string (Join-Path $Script:DeltaRuntimeRoot 'build\server\index.js')
+      against the full command line. Confirmed by direct reproduction
+      (a live capture of the actual react-router-serve invocation) that
+      this NEVER matches a genuinely running DELTA instance, because the
+      real command line only ever contains the relative form of that
+      path - this function replaces that broken check, not merely
+      patches it.
+
+      Deliberately scoped to the CURRENT, non-service runtime only. Once
+      Phase 5 (Windows Service) exists, a service-managed DELTA instance
+      should be identified through the Service Control Manager and its
+      own configured PID - not by extending this command-line heuristic
+      indefinitely to also cover that case.
+    #>
+    param(
+        [AllowNull()][string]$CommandLine,
+        [Parameter(Mandatory)][string]$DeltaRuntimeRoot
+    )
+
+    if ([string]::IsNullOrEmpty($CommandLine)) {
+        return $false
+    }
+
+    $normalizedCommandLine = $CommandLine -replace '[\\/]+', '/'
+    $normalizedRuntimeRoot = ($DeltaRuntimeRoot.TrimEnd('\', '/')) -replace '[\\/]+', '/'
+
+    if ([string]::IsNullOrEmpty($normalizedRuntimeRoot)) {
+        return $false
+    }
+
+    $hasEntryPoint  = $normalizedCommandLine -match [regex]::Escape('build/server/index.js')
+    $hasRuntimeRoot = $normalizedCommandLine -match [regex]::Escape($normalizedRuntimeRoot)
+
+    return ($hasEntryPoint -and $hasRuntimeRoot)
+}
+
+# ---------------------------------------------------------------------------
 # .env file reading
 # ---------------------------------------------------------------------------
 
@@ -1090,13 +1175,17 @@ function Resolve-DeltaBackendPort {
           proxy pointed at the wrong port.
 
       Sets $Script:DeltaBackendPort in the CALLER's script scope -
-      consumed by both setup-nginx.ps1 (New-DeltaNginxConfiguration,
-      Show-DeltaNginxSummary) and setup-iis.ps1 (Phase 5's own existing-
-      website summary). The error message below deliberately does not
-      name either caller script by name (unlike Resolve-DeltaInstallation's
-      own still-outstanding "revisit this" note - see that function's own
-      header) - "re-run this script" is accurate regardless of which of
-      the two actually invoked it.
+      consumed by setup-nginx.ps1 (New-DeltaNginxConfiguration,
+      Show-DeltaNginxSummary), setup-iis.ps1 (Phase 5's own existing-
+      website summary), and setup.ps1's own Resolve-DeltaApplicationPort
+      (installation-time startup validation - see that function's own
+      header), which layers an interactive "is it actually free, and if
+      not, ask the operator" check on top of this read-only detection.
+      The error message below deliberately does not name any specific
+      caller script (unlike Resolve-DeltaInstallation's own still-
+      outstanding "revisit this" note - see that function's own header) -
+      "re-run this script" is accurate regardless of which of the three
+      actually invoked it.
     #>
 
     Write-PhaseBanner 'DELTA Backend Port Detection'
@@ -1497,6 +1586,82 @@ function New-DatabaseUrl {
     }
 }
 
+function ConvertFrom-DatabaseUrl {
+    <#
+      The reverse of New-DatabaseUrl: parses a postgresql:// connection
+      string back into its components, so an installer-managed .env this
+      script wrote on a PREVIOUS run can be read back on a later one
+      (Upgrade lifecycle credential/database-name reuse - setup.ps1)
+      instead of only ever being able to write DATABASE_URL, never read
+      it back apart.
+
+      Uses [System.Uri] rather than a hand-rolled regex - postgresql://
+      URLs follow the same generic scheme://user:pass@host:port/path
+      syntax .NET's own URI parser already handles correctly, confirmed
+      directly against real values (including a password containing @,
+      :, and / all percent-encoded, exactly the characters New-DatabaseUrl's
+      own header documents encoding) round-tripping back to their
+      original plaintext via UnescapeDataString. Only Username/Password
+      are decoded - symmetric with New-DatabaseUrl only ever encoding
+      those same two components.
+
+      Returns $null - never throws - for anything that isn't a fully
+      usable connection string: not a well-formed URI, or missing a
+      username, password, host, or database name. Every caller here
+      needs "couldn't parse" to be trivially distinguishable from a
+      successful parse without a try/catch of its own, since "fall back
+      to the normal fully-interactive behavior" is the only correct
+      response to any of those, never a reason to stop the installer.
+
+      Password is returned as a SecureString, not the plaintext
+      .NET's own UnescapeDataString produces - converted immediately,
+      matching how a password is handled everywhere else in this project
+      (Read-PostgresSuperuserPassword, Test-PostgresCredentials) rather
+      than introducing the one place a DATABASE_URL's password would
+      otherwise sit in memory as a plain string for longer than
+      necessary.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$DatabaseUrl)
+
+    if ([string]::IsNullOrWhiteSpace($DatabaseUrl)) {
+        return $null
+    }
+
+    try {
+        $uri = [System.Uri]$DatabaseUrl
+    }
+    catch {
+        return $null
+    }
+
+    if (-not $uri.IsAbsoluteUri -or -not $uri.UserInfo -or -not $uri.Host -or $uri.Port -lt 0) {
+        return $null
+    }
+
+    $userInfoParts = $uri.UserInfo.Split(':', 2)
+    $username = [System.Uri]::UnescapeDataString($userInfoParts[0])
+    $plainPassword = if ($userInfoParts.Count -gt 1) { [System.Uri]::UnescapeDataString($userInfoParts[1]) } else { '' }
+    $databaseName = $uri.AbsolutePath.TrimStart('/')
+
+    if (-not $username -or -not $plainPassword -or -not $databaseName) {
+        return $null
+    }
+
+    try {
+        $securePassword = ConvertTo-SecureString -String $plainPassword -AsPlainText -Force
+        return [PSCustomObject]@{
+            Username     = $username
+            Password     = $securePassword
+            PostgresHost = $uri.Host
+            Port         = $uri.Port.ToString()
+            DatabaseName = $databaseName
+        }
+    }
+    finally {
+        $plainPassword = $null
+    }
+}
+
 # ---------------------------------------------------------------------------
 # PostgreSQL discovery
 # ---------------------------------------------------------------------------
@@ -1659,7 +1824,7 @@ function Get-PostgresListeningPort {
       PostgreSQL Windows service is actually listening on, by resolving
       the service to its process ID (Win32_Service) and then looking at
       what that process has bound in LISTEN state (Get-NetTCPConnection)
-      - the same underlying cmdlet Test-PostgresPort (setup.ps1) already
+      - the same underlying cmdlet Test-TcpPortAvailable (setup.ps1) already
       uses in the opposite direction. Tried after
       Get-PostgresPortFromConfigFile (method 1) specifically because it
       catches the case that method can't: an effective port that differs

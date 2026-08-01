@@ -45,8 +45,8 @@ Keeping these as three separate functions (rather than one large `Install-Postgr
 | Phase 2B — PostGIS Installation | ⬜ Planned | |
 | Phase 2C — Database Initialization | ⬜ Planned | Absorbs the [UTF-8/locale risk](06-deployment-risks.md#utf-8-and-locale-at-database-creation). |
 | Phase 3 — Yarn & Dependencies | 🔶 In progress | Renumbered from Phase 4 when PostgreSQL split into 2A/2B/2C. Wraps `init_website.bat` idempotently rather than fixing it directly — see phase detail below. |
-| Phase 4 — Environment Configuration | ⬜ Planned | Renumbered from Phase 6. |
-| Phase 5 — Windows Service | ⬜ Planned | Renumbered from Phase 7. |
+| Phase 4 — Environment Configuration | ⬜ Planned | Renumbered from Phase 6. `.env` PORT resolution/update (`Resolve-DeltaApplicationPort`, `Update-DeltaApplicationPortEnvironment`) landed early as part of the startup-validation work below, ahead of the rest of this phase. |
+| Phase 5 — Windows Service | ⬜ Planned | Renumbered from Phase 7. An **interim, non-supervised stand-in** already exists (`Start-DeltaRuntimeForValidation` / `Confirm-DeltaRuntimeStarted`, see that section's own detail below) — `setup.ps1` starts and verifies DELTA automatically today, but with no restart policy, crash supervision, or watchdog. This phase supersedes that stand-in; it doesn't start from nothing. |
 | Phase 6 — Validation | ⬜ Planned | Renumbered from Phase 8. |
 
 Legend: ✅ Completed · 🔶 In progress · ⬜ Planned
@@ -259,7 +259,7 @@ Legend: ✅ Completed · 🔶 In progress · ⬜ Planned
 - [x] Production installation
 - [ ] Dependency validation (beyond presence checks)
 
-**Repeat-run safety — DELTA process detection (added alongside this phase):** `setup.ps1` now also ends with `Confirm-DeltaRuntimeNotRunning`, which detects a DELTA server process left over from a previous run (matched by `build\server\index.js` appearing in a `node.exe` process's own command line, scoped to `C:\DELTA` specifically — never a blanket `node.exe` sweep) and stops it, attempting a graceful `taskkill` before escalating to a forceful one. This exists purely so a repeat `setup.ps1` run can't leave two instances bound to the same port; it does **not** start the application back up — `start.bat` remains a manual, operator-run step for this validation phase (see [02 §Running the application](02-windows-installation.md#smoke-test)), deliberately isolated from everything `setup.ps1` itself does.
+**Repeat-run safety — DELTA process detection (added alongside this phase):** `setup.ps1` includes `Confirm-DeltaRuntimeNotRunning`, which detects a DELTA server process left over from a previous run (matched by `build\server\index.js` appearing in a `node.exe` process's own command line, scoped to the resolved application directory specifically — never a blanket `node.exe` sweep) and stops it, attempting a graceful `taskkill` before escalating to a forceful one. This exists so a repeat `setup.ps1` run can't leave two instances bound to the same port. **It is followed by an automatic restart**: `Start-DeltaRuntimeForValidation` / `Confirm-DeltaRuntimeStarted` (see [Phase 5](#phase-5--windows-service) below and [02 §Automatic startup](02-windows-installation.md#automatic-startup)) start DELTA back up and verify it before the installer registers itself as complete — an interim installation-validation convenience, not the supervised startup Phase 5 will eventually own.
 
 ---
 
@@ -294,6 +294,8 @@ Legend: ✅ Completed · 🔶 In progress · ⬜ Planned
 **Status:** ⬜ Planned
 
 **Objective:** Run the DELTA Node process as a supervised Windows Service — see [02 — Windows Service installation](02-windows-installation.md#windows-service-installation) for the manual reference procedure this phase automates, and [06 — Windows Service shutdown behavior](06-deployment-risks.md#windows-service-shutdown-behavior) for the one open risk this phase must specifically resolve, not just wrap.
+
+**Interim stand-in already in place:** `setup.ps1` already starts DELTA automatically and verifies it (`Start-DeltaRuntimeForValidation`, `Confirm-DeltaRuntimeStarted` — process running, port listening, HTTP responding, in that order) as an installation-validation convenience, so operators get a working URL immediately instead of waiting for this phase. It deliberately implements none of this phase's actual scope — no restart-on-crash, no throttle policy, no service registration, no graceful-shutdown handling — it starts the process once and reports success or failure for that one start. This phase supersedes it outright rather than building alongside it; once `Install-WindowsService` lands, `Start-DeltaRuntimeForValidation`'s detached process and this phase's supervised service must never both be trying to own DELTA's lifecycle at the same time.
 
 **Dependencies:** Phases 1, 2C, 3, 4 (Node.js, the database, dependencies, and environment must all be ready before the service can start successfully).
 

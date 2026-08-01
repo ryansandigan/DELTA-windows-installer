@@ -25,8 +25,8 @@
 4. Run `init_website.bat` (installs Yarn, project dependencies, `dotenv-cli`).
 5. Run `init_db.bat` (creates the database, loads the schema — see [04](04-database.md#initialization-fresh-install)).
 6. Create and populate `.env` in the application directory.
-7. Smoke-test with `start.bat`.
-8. Register and start the Windows Service.
+7. Start DELTA and verify it responds — `setup.ps1` now does this automatically as an interim installation-validation step; see [§Automatic startup](#automatic-startup).
+8. Register and start the Windows Service (supersedes step 7's interim automatic startup once implemented — see [§Windows Service installation](#windows-service-installation)).
 9. Install and configure Nginx.
 10. Validate — see [07](07-windows-poc.md#validation-checklist).
 
@@ -78,7 +78,7 @@ Steps 1–2 above are being replaced by a PowerShell installer (`setup.ps1`), bu
 | PostGIS installation | Not yet automated (**Phase 2B**, planned) | ⬜ Still manual — install via Stack Builder as described in [Prerequisites](#prerequisites) above |
 | DELTA database initialization | Not yet automated (**Phase 2C**, planned) | ⬜ Still manual — continue using `init_db.bat` per [§Running the installer scripts](#running-the-installer-scripts) below |
 | Application dependency installation (Yarn, `node_modules`, `dotenv-cli`) | `setup.ps1` — `Install-DeltaDependencies` (**Phase 3**) | ✅ Implemented, idempotently — skips `init_website.bat` entirely if dependencies are already present. **Not yet a from-scratch fix**: it wraps the shipped `init_website.bat` as-is rather than correcting its known gaps at the source — see [08 §Phase 3](08-development-roadmap.md#phase-3--yarn--dependencies). Also applies a permanent, idempotent `dotenv-cli` PATH fix (`Add-YarnGlobalBinToPersistentPath`) — see [§Running the installer scripts](#running-the-installer-scripts) below. |
-| Application startup (`start.bat`) | Not automated — deliberate, for this validation phase | ⬜ Manual by design. `setup.ps1` ends by detecting and stopping any DELTA instance left running from a previous run, then reports the runtime is ready and tells the operator to run `start.bat` themselves. Wiring startup in is deferred to Phase 5 (Windows Service). |
+| Application startup | `setup.ps1` — `Resolve-DeltaApplicationPort` / `Update-DeltaApplicationPortEnvironment` / `Start-DeltaRuntimeForValidation` / `Confirm-DeltaRuntimeStarted` | ✅ Implemented, as an **interim installation-validation step** — not a substitute for Phase 5 (Windows Service). See [§Automatic startup](#automatic-startup) below. |
 
 Do not assume PostGIS or the DELTA database are handled by running `setup.ps1` today — only run it for Node.js and the bare PostgreSQL server, then continue the rest of this guide manually until Phases 2B and 2C land. This section will be updated as each phase completes; the authoritative status lives in [08](08-development-roadmap.md#progress-dashboard), not here.
 
@@ -150,10 +150,11 @@ Both scripts end in `pause` and are meant to be run interactively, not from an u
 
 ## Environment variables
 
-Create `.env` in the application directory (`C:\DELTA` by default, or whatever was chosen at the `Resolve-DeltaAppRoot` prompt — see [§Deployment layout](#deployment-layout)). When `setup.ps1` is used, `Install-DeltaRuntime` creates that directory and the database stage generates this file automatically from `.env.example`; only `DATABASE_URL` is populated for you, so the other variables below still need to be filled in. The full variable reference (purpose, required/optional) lives in [05 — Environment variable compatibility](05-windows-compatibility-assessment.md#environment-variable-compatibility) — this section lists only what's specific to a Windows deployment:
+Create `.env` in the application directory (`C:\DELTA` by default, or whatever was chosen at the `Resolve-DeltaAppRoot` prompt — see [§Deployment layout](#deployment-layout)). When `setup.ps1` is used, `Install-DeltaRuntime` creates that directory and the database stage generates this file automatically from `.env.example`: `DATABASE_URL` is computed and written for you, `PORT` ships as an explicit default (`3000`) in the template itself and is confirmed or changed by [§Automatic startup](#automatic-startup) below, and the other variables still need to be filled in. The full variable reference (purpose, required/optional) lives in [05 — Environment variable compatibility](05-windows-compatibility-assessment.md#environment-variable-compatibility) — this section lists only what's specific to a Windows deployment:
 
 ```env
 DATABASE_URL=postgresql://<user>:<password>@localhost:5432/<database>
+PORT=3000
 SESSION_SECRET=<random-secret>
 NODE_ENV=production
 PUBLIC_URL=https://<externally-visible-host>
@@ -165,19 +166,113 @@ LOG_DIR=logs
 - `HOSTNAME` is not populated automatically on Windows the way it is on Linux; set it explicitly if per-instance log correlation matters ([06 #9](06-deployment-risks.md#hostname-log-field)).
 - `NODE_ENV=production` marks session cookies `Secure` — this **requires** Nginx to be terminating HTTPS in front of the app for login to persist. See [§Reverse proxy configuration](#reverse-proxy-configuration).
 
-## Smoke test
+## Automatic startup
+
+**`setup.ps1` now starts DELTA automatically at the end of a successful install or update and verifies it actually works** (except in one specific, explicitly-reported case — see [§Deployment completed vs. deployment activated](#deployment-completed-vs-deployment-activated) below). This is an interim installation-validation convenience — it stands in for Phase 5 (Windows Service, see [08](08-development-roadmap.md#phase-5--windows-service)), not a replacement for it: there is no restart policy, no crash supervision, and no watchdog behavior. It starts DELTA once and verifies that one start succeeded; a real service is still required for production-grade supervision.
+
+The sequence, all in `setup.ps1`, after the database stage:
+
+1. **`Resolve-DeltaApplicationPort`** — reads `PORT` from the just-generated `.env` (via the same `Resolve-DeltaBackendPort` helper `setup-nginx.ps1`/`setup-iis.ps1` already use — see [§Reverse proxy configuration](#reverse-proxy-configuration)). `.env.example` ships `PORT=3000` as an explicit default (like `PUBLIC_URL` or `SESSION_SECRET`), so a fresh install always has a concrete value here — falling back to `3000` for an absent `PORT` only remains as a backward-compatibility path for a hand-edited or pre-existing `.env`, never the expected case going forward. If that port is free, it's used as-is. If it's occupied, the installer first determines *whose* process that is (see [§Restarting an already-running managed instance](#restarting-an-already-running-managed-instance) below) — only a genuine conflict with something else prompts for a replacement port, re-prompting on an invalid or also-occupied value until a valid, free one is supplied. **The port is never changed silently**; only an explicit operator answer moves it.
+2. **`Update-DeltaApplicationPortEnvironment`** — writes the resolved `PORT` back into `.env` (via the same managed-values mechanism `DATABASE_URL` already uses), but only if the operator actually had to pick a different port. A `.env` whose configured port was already free — the default `3000` from the template, or whatever a previous run already settled on — is left completely untouched: the installer never re-decides a port that's already correctly recorded.
+3. **`Confirm-DeltaRuntimeNotRunning`** — stops any DELTA instance left running from a previous `setup.ps1` run. Matching requires both the `build/server/index.js` entry point *and* the resolved application directory to appear in a `node.exe` process's own command line (slash- and case-normalized, so `./build/server/index.js`, `.\build\server\index.js`, and an absolute form all match equally — see `Test-DeltaManagedProcessCommandLine` in `lib\DeltaInstaller.Common.ps1`) — never a blanket sweep of every `node.exe`, and never fooled by an unrelated Node application elsewhere that happens to share the same entry-point convention. A no-op if the operator chose to leave an already-running managed instance untouched (see below).
+4. **`Start-DeltaRuntimeForValidation`** — starts DELTA detached, running the same `dotenv -e .env -- yarn start` command `start.bat` wraps (never `start.bat` itself — its trailing `pause` would hang a non-interactive caller, exactly as the [Windows Service installation](#windows-service-installation) section below already warns), with stdout/stderr redirected to `<AppRoot>\logs\delta-startup-stdout.log` / `delta-startup-stderr.log`. Also a no-op in the same case.
+5. **`Confirm-DeltaRuntimeStarted`** — layered verification, never trusting a single signal: the process must still be running, then the configured port must actually be listening, then an HTTP request to `http://localhost:<PORT>/` must get a real response. If any of these fails, the installer stops immediately with a diagnostic pointing at the two log files above (including the last lines of stderr inline when available) — the installation is **not** registered as complete.
+
+Once verification succeeds, the final summary reports DELTA as already running and gives the operator the exact URL to browse to — no manual step required for a first run.
+
+### Restarting an already-running managed instance
+
+On an "Update DELTA" run, the configured port is very often occupied by DELTA's own *previous* run — not a real conflict. `Resolve-DeltaApplicationPort` tells the two apart by cross-referencing the port's owning process ID against `Get-RunningDeltaProcesses` (the same command-line/application-root matching `Confirm-DeltaRuntimeNotRunning` already uses — **process ownership is never determined from the registry**, only from that existing detection). If the owner isn't DELTA, it's a genuine conflict and the installer prompts for a different port as described above.
+
+If the owner *is* the managed DELTA instance, this is presented as the routine maintenance operation it actually is — not a conflict, since nothing is wrong:
+
+```
+----------------------------------------
+DELTA Runtime
+----------------------------------------
+
+Configured backend port:
+3000
+
+Existing DELTA instance detected.
+
+PID:
+7400
+```
+
+Restarting it (rather than treating it as a conflict) is the obvious next step, but asking every single time becomes repetitive during routine maintenance — so the installer remembers the operator's answer in the registry, under the same key `Register-DeltaInstallation` already uses:
+
+```
+HKLM\SOFTWARE\PreventionWeb\DELTA
+    ManagedInstanceRestartPolicy   REG_DWORD   0 or 1
+```
+
+Named as a *policy*, not an `AutoRestart` flag, so a future third option (e.g. restart only during a maintenance window) could be added as a new accepted value under this same name later, without a second registry value or a migration — only `0` and `1` are actually accepted today.
+
+- **Not yet set** (a fresh installation, or one from before this preference existed) — the installer asks once, right after the banner above:
+
+  ```
+  ----------------------------------------
+
+  Would you like future updates to automatically stop and restart this DELTA instance?
+
+  [Y] Yes (recommended)
+  [N] No (always ask)
+
+  ----------------------------------------
+  ```
+
+  The answer is both persisted for future runs *and* applied to this one — a "Yes" restarts the instance now and every time from then on; a "No" leaves it running now, is saved as `0`, and the installer asks again on the next run that hits this same situation.
+- **`1`** — the installer proceeds automatically:
+
+  ```
+  Restart policy:
+  Always restart automatically.
+
+  Preparing to stop and restart DELTA...
+  ```
+- **`0`** — the installer asks again each time (a plain "stop and restart it now?" confirmation, bare Enter meaning No), without changing the saved preference.
+
+This preference is registry state only — it is never used to decide *whether* a given process is DELTA's; that determination stays exclusively with `Get-RunningDeltaProcesses`, unchanged by this feature.
+
+#### Deployment completed vs. deployment activated
+
+Declining a restart (either the first time, or the per-run question under `0`) leaves the existing instance running exactly as it was — `Confirm-DeltaRuntimeNotRunning` and `Start-DeltaRuntimeForValidation` become no-ops, and `Confirm-DeltaRuntimeStarted` never runs its HTTP check. The installer still registers the installation (`Register-DeltaInstallation` runs unconditionally — the files, dependencies, `.env`, and database genuinely were updated; that fact doesn't depend on which process happens to be listening on the port right now), but it does **not** report this the same way as a normal successful run. Two separate, deliberately distinct signals cover this:
+
+- **A banner at the point verification is skipped:**
+
+  ```
+  ----------------------------------------
+
+  Deployment completed.
+
+  The existing DELTA instance was left running.
+
+  The updated deployment will become active after DELTA is restarted manually.
+
+  Current running instance may still be the previous deployment.
+
+  ----------------------------------------
+  ```
+
+- **The final summary's "Deployment Status" section**, which always shows both facts explicitly rather than one combined verdict:
+
+  | Outcome | Deployment | Activation |
+  |---|---|---|
+  | Restarted and verified | Completed | Active |
+  | Existing instance left running | Completed | Pending (manual restart required) |
+
+  In the second case, the summary's "First Run" section skips the browse-to URL entirely and points at `start.bat` for a manual restart instead — the installer never implies HTTP validation succeeded when it never ran.
+
+`start.bat` itself still exists and is still useful for a *manual* restart later — after a reboot, for instance, since nothing yet keeps DELTA running across one (that's exactly what Phase 5 will add):
 
 ```powershell
 .\start.bat
 ```
 
-Confirms the app boots and connects to PostgreSQL before wrapping it as a service. `start.bat` wraps `dotenv -e .env -- yarn start`, which runs `react-router-serve ./build/server/index.js` — a plain Node CLI invocation with no OS-conditional behavior.
-
-**This step is always manual, even when `setup.ps1` was used for everything before it.** For this validation phase, application startup is deliberately isolated from the installer — `setup.ps1` never invokes `start.bat` itself. What it does do, at the very end of a run, is detect whether a DELTA instance from a *previous* run is still active (matched specifically to `C:\DELTA\build\server\index.js` in a process's command line — never a blanket sweep of every `node.exe`) and stop it, so re-running `setup.ps1` can't leave two instances bound to the same port. It then reports the runtime is ready and prints the exact `start.bat` path to run. This isolation is intentional, not an oversight — see [08 §Repeat-run safety](08-development-roadmap.md#phase-3--yarn--dependencies) — and is expected to change once Phase 5 (Windows Service) wires startup in properly.
-
 ## Windows Service installation
 
-Wrap the Node process directly — do not point the service at `start.bat` itself, since its trailing `pause` will hang the service indefinitely on every start. Substitute the actual application directory for `C:\DELTA` below if a different one was chosen at install time (see [§Deployment layout](#deployment-layout)) — future automation of this step (Phase 5) will use `$Script:DeltaRuntimeRoot` directly rather than a literal path.
+Wrap the Node process directly — do not point the service at `start.bat` itself, since its trailing `pause` will hang the service indefinitely on every start. Substitute the actual application directory for `C:\DELTA` below if a different one was chosen at install time (see [§Deployment layout](#deployment-layout)) — future automation of this step (Phase 5) will use `$Script:DeltaRuntimeRoot` directly rather than a literal path. Once implemented, Phase 5 supersedes [§Automatic startup](#automatic-startup) above — `Start-DeltaRuntimeForValidation`'s unsupervised detached process is an interim stand-in for exactly this service, not something meant to run alongside it.
 
 ```powershell
 nssm install DeltaApp "C:\Program Files\nodejs\node.exe" "node_modules\@react-router\serve\dist\cli.js .\build\server\index.js"
