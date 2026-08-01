@@ -254,6 +254,21 @@ $Script:EnvTemplatePath          = Join-Path -Path $Script:ProjectRoot -ChildPat
 # acted on immediately.
 $Script:DeltaDeploymentLifecycle = 'Upgrade'
 
+# Also set by Resolve-ExistingDeltaDeployment. True for a genuine Fresh
+# Installation - either no existing DELTA deployment was found at all
+# (the default, never touched by that function in that case - see its own
+# header), or the operator explicitly chose lifecycle option 3 ('Fresh'),
+# which backs the old deployment up out of the way first and then behaves
+# exactly like a first-ever install for everything after it. False only
+# when a real existing deployment was found and the operator chose to
+# Upgrade or Recreate it in place - $Script:DeltaDeploymentLifecycle alone
+# cannot distinguish "nothing ever existed here" from "explicitly chose to
+# upgrade a real deployment" (both are 'Upgrade'), which is exactly why
+# this separate flag exists. Read by Show-InstallationSummary to decide
+# whether offering the optional reverse-proxy setup makes sense - never
+# meaningful for Update/Recreate, which may already have one configured.
+$Script:DeltaIsFreshInstallation = $true
+
 # DELTA application startup validation (Start-DeltaRuntimeForValidation /
 # Confirm-DeltaRuntimeStarted, below) - an interim convenience until Phase 5
 # (Windows Service) supersedes it, see those functions' own headers. How
@@ -467,6 +482,76 @@ function Show-MainMenu {
     }
 }
 
+function Invoke-DeltaOptionalReverseProxySetup {
+    <#
+      The optional, final step of a Fresh Installation only - offered
+      once DELTA has already been started and verified this run (called
+      from inside Show-InstallationSummary's own $Activated branch, right
+      after it prints the "Browse to" URL, before the rest of that
+      summary continues). Never shown for Update or Recreate - see
+      $Script:DeltaIsFreshInstallation's own declaration for why a real
+      existing deployment may already have a reverse proxy configured,
+      making this offer meaningless there - and never reached at all for
+      a failed or aborted installation, since Show-InstallationSummary
+      itself is only ever called once every phase before it has already
+      succeeded.
+
+      Owns none of the actual reverse-proxy logic itself.
+      setup-nginx.ps1/setup-iis.ps1 remain the single implementation of
+      NGINX/IIS setup, invoked here exactly as an operator running either
+      one manually would - via the call operator (&), the same
+      established, empirically-verified pattern Invoke-DeltaDatabaseInit/
+      Invoke-DeltaDatabaseUpgrade already use for init_db.ps1/
+      upgrade_database.ps1: the child script's own top-level try/catch/
+      exit is fully independent of this one, so its `exit 0`/`exit 1`
+      never terminates this installer. Both scripts discover the DELTA
+      installation they just helped create themselves (via the registry
+      key Register-DeltaInstallation already wrote), so nothing needs to
+      be passed to them.
+
+      Deliberately does not branch on the child script's exit code -
+      reverse proxy configuration is optional, so whether it succeeded,
+      failed, or was cancelled, this always returns control back to
+      Show-InstallationSummary the same way, letting the normal
+      installation summary continue exactly as it does today. A failure
+      inside either script shows its own error naturally (both already
+      print their own red failure banner before exiting 1) - never
+      wrapped, duplicated, or re-interpreted here.
+    #>
+    Show-Section -Title 'Optional Reverse Proxy Setup'
+
+    Write-Host 'DELTA is now running successfully.'
+    Write-Host ''
+    Write-Host 'You may configure a reverse proxy now, or do it later.'
+    Write-Host ''
+    Write-Host '1. Configure NGINX'
+    Write-Host '2. Configure IIS'
+    Write-Host '3. Skip for now'
+    Write-Host ''
+
+    while ($true) {
+        $choice = Read-Host -Prompt 'Selection'
+        Write-Host ''
+
+        switch ($choice.Trim()) {
+            '1' {
+                & (Join-Path -Path $Script:ProjectRoot -ChildPath 'setup-nginx.ps1')
+                return
+            }
+            '2' {
+                & (Join-Path -Path $Script:ProjectRoot -ChildPath 'setup-iis.ps1')
+                return
+            }
+            '3' {
+                return
+            }
+        }
+
+        Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
+        Write-Host ''
+    }
+}
+
 function Show-InstallationSummary {
     <#
       The final "installation complete" screen. Every piece of state it
@@ -474,7 +559,14 @@ function Show-InstallationSummary {
       supplied by the orchestration block below, already established by
       the phases that ran before it - this performs no installation
       actions and reads no $Script: state of its own, purely reformatting
-      the same information the previous inline Write-Host block printed.
+      the same information the previous inline Write-Host block printed -
+      with one deliberate exception: once it has just reported DELTA as
+      genuinely up (the $Activated branch below), it reads
+      $Script:DeltaIsFreshInstallation directly to decide whether to offer
+      the optional reverse-proxy setup at that exact point, via
+      Invoke-DeltaOptionalReverseProxySetup - see that function's own
+      header for why it belongs there and not anywhere in the
+      orchestration block itself.
 
       $Activated distinguishes two different successful outcomes that
       must never be reported identically - "the deployment completed"
@@ -537,6 +629,11 @@ function Show-InstallationSummary {
         Write-Host 'Browse to:'
         Write-Detail "http://localhost:$Port"
         Write-Host ''
+
+        if ($Script:DeltaIsFreshInstallation) {
+            Invoke-DeltaOptionalReverseProxySetup
+        }
+
         Write-Host 'This startup is an installation validation step, not a supervised service -'
         Write-Host 'see the Windows Service documentation for production deployment. To stop'
         Write-Host 'DELTA now, end its node.exe process (Task Manager, or taskkill); re-running'
@@ -3740,6 +3837,13 @@ function Resolve-ExistingDeltaDeployment {
           the entire existing deployment out of the way before this
           returns. A declined confirmation re-shows the same
           three-option menu rather than aborting the installer outright.
+
+      Also sets $Script:DeltaIsFreshInstallation to match: true only for
+      Fresh, false for Upgrade/Recreate. Left at its own default (true)
+      when this function returns early above, since "nothing was found"
+      is itself a genuine Fresh Installation - see that flag's own
+      declaration for why it has to exist separately from
+      $Script:DeltaDeploymentLifecycle.
     #>
     $foundItems = Get-ExistingDeltaDeploymentItems
     $anyFound = @($foundItems.Values | Where-Object { $_ }).Count -gt 0
@@ -3761,6 +3865,7 @@ function Resolve-ExistingDeltaDeployment {
         }
 
         $Script:DeltaDeploymentLifecycle = $choice
+        $Script:DeltaIsFreshInstallation = ($choice -eq 'Fresh')
         break
     }
 
