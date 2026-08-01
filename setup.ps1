@@ -62,15 +62,20 @@
 
     Phase 3 (Install-DeltaDependencies) installs the DELTA runtime's own
     Node dependencies - Yarn, `yarn install --production`, dotenv-cli - by
-    running dts_shared_binary's own init_website.bat, but only when they
-    aren't already present (Test-DeltaRuntimeDependenciesInstalled), so a
-    repeat run doesn't reinstall them every time. A confirmed gap found
-    during Windows validation - dotenv-cli lands in Yarn's own global bin,
-    which nothing else puts on PATH - is fixed permanently and
-    idempotently by Add-YarnGlobalBinToPersistentPath, which appends that
-    directory to the persistent User PATH (not just this session's
-    $env:Path), so `dotenv` still resolves in a brand-new console or
-    after a reboot, not only for the remainder of this one run.
+    running dts_shared_binary's own init_website.bat, unconditionally,
+    every run. There is deliberately no existence-based idempotency gate
+    in front of it: Install-DeltaRuntime always redeploys the latest
+    package.json immediately before this phase runs, so the only question
+    worth asking is whether dependencies currently match that file - and
+    init_website.bat's own commands (npm/yarn install) already answer
+    that correctly and cheaply every time they run, without this script
+    trying to predict the answer from node_modules' mere presence first.
+    A confirmed gap found during Windows validation - dotenv-cli lands in
+    Yarn's own global bin, which nothing else puts on PATH - is fixed
+    permanently and idempotently by Add-YarnGlobalBinToPersistentPath,
+    which appends that directory to the persistent User PATH (not just
+    this session's $env:Path), so `dotenv` still resolves in a brand-new
+    console or after a reboot, not only for the remainder of this one run.
 
     Finally, Confirm-DeltaRuntimeNotRunning detects whether a DELTA
     instance from a previous run is still active (by process command
@@ -258,6 +263,271 @@ $Script:DeltaDeploymentLifecycle = 'Upgrade'
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# Presentation helpers (this script only)
+#
+# Purely cosmetic - none of these decide anything or perform any
+# installation action. They exist so setup.ps1's own screens (the main
+# menu, each phase's "component already present" check, and the final
+# summary) share one consistent look instead of each call site hand-
+# rolling its own sequence of blank-line-separated Write-Host calls.
+#
+# Deliberately kept local to this script rather than promoted into
+# lib\DeltaInstaller.Common.ps1: Write-SetupBanner/Write-PhaseBanner/
+# Write-Success there are still used unchanged by init_db.ps1,
+# upgrade_database.ps1, and lib\DeltaRuntimeArtifact.ps1, and this
+# refactor's scope is setup.ps1's own presentation only.
+# ---------------------------------------------------------------------------
+
+function Show-Section {
+    <#
+      The full-width '====' banner used for setup.ps1's own major
+      screens - the installer banner, each phase, DELTA Runtime
+      Deployment, Registry Registration, and the final summary.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [string]$Subtitle
+    )
+    $rule = '=' * $Script:BannerWidth
+    Write-Host ''
+    Write-Host $rule
+    Write-Host $Title
+    if ($Subtitle) {
+        Write-Host $Subtitle
+    }
+    Write-Host $rule
+    Write-Host ''
+}
+
+function Show-Warning {
+    <#
+      A standalone warning screen - "WARNING" followed by one or more
+      message lines, each followed by a blank line, matching this
+      installer's existing warning formatting (Confirm-
+      DeltaFreshInstallation) exactly, just named and reusable.
+    #>
+    param([Parameter(Mandatory)][string[]]$Message)
+    Write-Host ''
+    Write-Host 'WARNING' -ForegroundColor Yellow
+    Write-Host ''
+    foreach ($line in $Message) {
+        Write-Host $line
+        Write-Host ''
+    }
+}
+
+function Show-Success {
+    <#
+      Presentation-layer success line for this script's own new UI
+      call sites (Show-InstallationSummary's checklist, phase
+      completion messages) - functionally identical to the shared
+      Write-Success, kept as a distinct name so this region doesn't
+      reach back into the older vocabulary.
+    #>
+    param([Parameter(Mandatory)][string]$Message)
+    Write-Host $Message -ForegroundColor Green
+}
+
+function Show-ComponentStatus {
+    <#
+      The consistent "a component was already found on this machine"
+      screen each phase's detection branch prints - Node.js,
+      PostgreSQL, PostGIS, and Phase 3's runtime-dependency check all
+      funnel their "already installed" / "needs updating" / "different
+      version present" messaging through this one layout instead of
+      each hand-rolling its own sequence of Write-Host calls.
+
+      $Fields is an ordered label/value list (e.g. Version/Status, or
+      Installed/Required) so every caller's labels line up on the same
+      colon column regardless of how many rows it has. $Message is the
+      trailing line(s) explaining what happens next ("Skipping
+      installation.", "Updating installation...").
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$Fields,
+        [string[]]$Message
+    )
+
+    $labelWidth = ($Fields.Keys | Measure-Object -Property Length -Maximum).Maximum
+    $rowFormat  = "{0,-$labelWidth} : {1}"
+
+    Write-Host ''
+    Write-Host $Name
+    Write-Host ''
+    foreach ($label in $Fields.Keys) {
+        Write-Host ($rowFormat -f $label, $Fields[$label])
+    }
+    if ($Message) {
+        Write-Host ''
+        foreach ($line in $Message) {
+            Write-Host $line
+        }
+    }
+}
+
+function Show-MainMenu {
+    <#
+      The first screen shown after the installer banner (Initialize-
+      Setup). Purely a presentation-layer front door: it does not
+      decide *how* an existing DELTA deployment is handled -
+      Resolve-ExistingDeltaDeployment still owns that, completely
+      unchanged, once Resolve-DeltaAppRoot below knows the target
+      directory. It only tells the operator up front whether a DELTA
+      installation was found (via the existing, unmodified
+      Get-DeltaInstallPath discovery helper - never re-implemented
+      here) and gives them a chance to back out before anything below
+      touches disk.
+
+      Returns $true if the orchestration below should proceed, $false
+      if the operator chose to stop here (bare-N on the fresh-install
+      prompt, or "Exit" on the existing-install menu) - the caller
+      exits immediately in that case, before any installation action
+      has run.
+    #>
+    $existingInstallPath = Get-DeltaInstallPath
+
+    if (-not $existingInstallPath) {
+        Write-Host 'No existing DELTA installation was detected.'
+        Write-Host ''
+        Write-Host 'This installer will install:'
+        Write-Host ''
+        Write-Host '  - DELTA Application'
+        Write-Host "  - Node.js v$($Script:RequiredNodeVersion)"
+        Write-Host "  - PostgreSQL $($Script:RequiredPostgresVersion)"
+        Write-Host "  - PostGIS $($Script:RequiredPostGISVersion)"
+        Write-Host ''
+        $choice = Read-Host -Prompt 'Continue? [Y/N]'
+        Write-Host ''
+        return ($choice.Trim() -in @('Y', 'y'))
+    }
+
+    while ($true) {
+        Write-Host 'Existing DELTA installation detected.'
+        Write-Host ''
+        Write-Host 'Location:'
+        Write-Host $existingInstallPath
+        Write-Host ''
+        Write-Host 'Choose an option:'
+        Write-Host ''
+        Write-Host '1. Update DELTA'
+        Write-Host '2. Reinstall DELTA'
+        Write-Host '3. Exit'
+        Write-Host ''
+        $choice = Read-Host -Prompt 'Selection'
+        Write-Host ''
+
+        switch ($choice.Trim()) {
+            '1' { return $true }
+            '2' { return $true }
+            '3' { return $false }
+        }
+
+        Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
+        Write-Host ''
+    }
+}
+
+function Show-InstallationSummary {
+    <#
+      The final "installation complete" screen. Every piece of state it
+      prints (DeltaHome, EnvPath, StartBatPath) is supplied by the
+      orchestration block below, already established by the phases that
+      ran before it - this performs no installation actions and reads
+      no $Script: state of its own, purely reformatting the same
+      information the previous inline Write-Host block printed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$DeltaHome,
+        [Parameter(Mandatory)][string]$EnvPath,
+        [Parameter(Mandatory)][string]$StartBatPath
+    )
+
+    Show-Section -Title 'Installation Complete' -Subtitle 'Installation completed successfully.'
+
+    Write-Host 'Installed Components'
+    Write-Host ''
+    Show-Success '[OK] DELTA Runtime'
+    Show-Success '[OK] Node.js'
+    Show-Success '[OK] PostgreSQL'
+    Show-Success '[OK] PostGIS'
+
+    Write-Host ''
+    Write-Host 'Application'
+    Write-Host ''
+    Write-Host 'Location :'
+    Write-Detail $DeltaHome
+    Write-Host ''
+    Write-Host 'Configuration :'
+    Write-Detail $EnvPath
+
+    Write-Host ''
+    Write-Host 'First Run'
+    Write-Host ''
+    Write-Host 'Start :'
+    Write-Detail $StartBatPath
+    Write-Host ''
+    Write-Host 'Once DELTA has started, browse to:'
+    Write-Detail 'http://localhost:3000'
+    Write-Host ''
+    Write-Host 'Stop :'
+    Write-Detail 'Close the console window start.bat is running in (or press Ctrl+C inside it).'
+
+    Write-Host ''
+    Write-Host 'Configuration Notes'
+    Write-Host ''
+    Write-Host 'A default .env file has already been created. It is suitable for'
+    Write-Host 'initial installation and local testing.'
+    Write-Host ''
+    Write-Host 'Before production deployment, review and update:'
+    Write-Detail '- PUBLIC_URL'
+    Write-Detail '- Database settings'
+    Write-Detail '- SMTP configuration'
+    Write-Detail '- Authentication settings'
+
+    Write-Host ''
+    Write-Host 'Optional: Reverse Proxy'
+    Write-Host ''
+    Write-Host 'DELTA listens on port 3000 by default. Production deployments'
+    Write-Host 'typically place it behind a reverse proxy.'
+    Write-Host ''
+    Write-Host 'Example (NGINX):'
+    Write-Host ''
+    Write-Host '    server {'
+    Write-Host '        listen 80;'
+    Write-Host '        server_name delta.example.org;'
+    Write-Host ''
+    Write-Host '        location / {'
+    Write-Host '            proxy_pass http://127.0.0.1:3000;'
+    Write-Host ''
+    Write-Host '            proxy_set_header Host $host;'
+    Write-Host '            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;'
+    Write-Host '            proxy_set_header X-Forwarded-Proto $scheme;'
+    Write-Host '            proxy_set_header X-Real-IP $remote_addr;'
+    Write-Host '        }'
+    Write-Host '    }'
+    Write-Host ''
+    Write-Host 'IIS and other reverse proxies are also supported - see the'
+    Write-Host 'deployment documentation for detailed guidance.'
+
+    Write-Host ''
+    Write-Host 'Troubleshooting'
+    Write-Host ''
+    Write-Host 'If DELTA fails to start because port 3000 is already in use, add'
+    Write-Host 'or change the following line in .env:'
+    Write-Host ''
+    Write-Detail 'PORT=3001'
+    Write-Host ''
+    Write-Host 'Then restart DELTA - close the console window start.bat is'
+    Write-Host 'running in, and run it again:'
+    Write-Detail $StartBatPath
+
+    Write-Host ''
+    Write-Host ('=' * $Script:BannerWidth)
+    Write-Host ''
+}
+
+# ---------------------------------------------------------------------------
 # Download
 # ---------------------------------------------------------------------------
 
@@ -352,7 +622,7 @@ function Install-NodeJs {
       downloading or installing anything.
     #>
 
-    Write-PhaseBanner 'Phase 1 - Node.js'
+    Show-Section -Title 'Phase 1 - Node.js'
     Write-Step 'Checking for an existing Node.js installation...'
     $nodePath = Find-NodeExecutable
 
@@ -360,29 +630,17 @@ function Install-NodeJs {
         $installedVersion = Get-InstalledNodeVersion -NodeExecutablePath $nodePath
 
         if ($installedVersion -eq $Script:RequiredNodeVersion) {
-            Write-Host ''
-            Write-Host 'Node.js detected.'
-            Write-Host ''
-            Write-Host 'Version:'
-            Write-Host "v$installedVersion"
-            Write-Host ''
-            Write-Host 'Status:'
-            Write-Host 'Already installed.'
-            Write-Host ''
-            Write-Host 'Skipping installation.'
+            Show-ComponentStatus -Name 'Node.js' -Fields ([ordered]@{
+                'Version' = "v$installedVersion"
+                'Status'  = 'Already installed'
+            }) -Message @('Skipping installation.')
             return
         }
 
-        Write-Host ''
-        Write-Host 'Node.js detected.'
-        Write-Host ''
-        Write-Host 'Installed:'
-        Write-Host $(if ($installedVersion) { "v$installedVersion" } else { '(unknown version)' })
-        Write-Host ''
-        Write-Host 'Required:'
-        Write-Host "v$($Script:RequiredNodeVersion)"
-        Write-Host ''
-        Write-Host 'Updating installation...'
+        Show-ComponentStatus -Name 'Node.js' -Fields ([ordered]@{
+            'Installed' = $(if ($installedVersion) { "v$installedVersion" } else { '(unknown version)' })
+            'Required'  = "v$($Script:RequiredNodeVersion)"
+        }) -Message @('Updating installation...')
     }
     else {
         Write-Detail 'Node.js was not found on this system.'
@@ -418,13 +676,10 @@ function Install-NodeJs {
     }
 
     Write-Host ''
-    Write-Success 'Node.js successfully installed.'
+    Show-Success 'Node.js successfully installed.'
     Write-Host ''
-    Write-Host 'Node:'
-    Write-Host "v$finalVersion"
-    Write-Host ''
-    Write-Host 'npm:'
-    Write-Host ($npmVersion | Select-Object -First 1).ToString().Trim()
+    Write-Host "Node : v$finalVersion"
+    Write-Host "npm  : $(($npmVersion | Select-Object -First 1).ToString().Trim())"
 }
 
 # ---------------------------------------------------------------------------
@@ -956,7 +1211,7 @@ function Install-PostgreSql {
       separate phases (2B, the database stage below).
     #>
 
-    Write-PhaseBanner 'Phase 2A - PostgreSQL'
+    Show-Section -Title 'Phase 2A - PostgreSQL'
     Write-Step 'Checking for an existing PostgreSQL installation...'
     $existing = Find-PostgresInstallation
 
@@ -973,37 +1228,25 @@ function Install-PostgreSql {
                     $Script:PostgresReuseMode = $true
 
                     Write-Host ''
-                    Write-Success 'Reusing the existing PostgreSQL installation.'
+                    Show-Success 'Reusing the existing PostgreSQL installation.'
                     return
                 }
 
                 Write-Detail 'Proceeding with a new PostgreSQL installation alongside the existing one.'
             }
             else {
-                Write-Host ''
-                Write-Host 'PostgreSQL detected.'
-                Write-Host ''
-                Write-Host 'Version:'
-                Write-Host $existing.Version
-                Write-Host ''
-                Write-Host 'Status:'
-                Write-Host 'Already installed.'
-                Write-Host ''
-                Write-Host 'Skipping installation.'
+                Show-ComponentStatus -Name 'PostgreSQL' -Fields ([ordered]@{
+                    'Version' = $existing.Version
+                    'Status'  = 'Already installed'
+                }) -Message @('Skipping installation.')
                 return
             }
         }
         else {
-            Write-Host ''
-            Write-Host 'PostgreSQL detected.'
-            Write-Host ''
-            Write-Host 'Installed:'
-            Write-Host $(if ($existing.Version) { $existing.Version } else { '(unknown version)' })
-            Write-Host ''
-            Write-Host 'Required:'
-            Write-Host "$($Script:RequiredPostgresMajorVersion).x"
-            Write-Host ''
-            Write-Host "A different PostgreSQL major version is installed. PostgreSQL major versions install side by side rather than in place, so PostgreSQL $($Script:RequiredPostgresMajorVersion) will be installed alongside the existing instance."
+            Show-ComponentStatus -Name 'PostgreSQL' -Fields ([ordered]@{
+                'Installed' = $(if ($existing.Version) { $existing.Version } else { '(unknown version)' })
+                'Required'  = "$($Script:RequiredPostgresMajorVersion).x"
+            }) -Message @("A different PostgreSQL major version is installed. PostgreSQL major versions install side by side rather than in place, so PostgreSQL $($Script:RequiredPostgresMajorVersion) will be installed alongside the existing instance.")
         }
     }
     else {
@@ -1038,16 +1281,11 @@ function Install-PostgreSql {
     }
 
     Write-Host ''
-    Write-Success 'PostgreSQL successfully installed.'
+    Show-Success 'PostgreSQL successfully installed.'
     Write-Host ''
-    Write-Host 'Version:'
-    Write-Host $confirmed.Version
-    Write-Host ''
-    Write-Host 'Service:'
-    Write-Host $confirmed.ServiceStatus
-    Write-Host ''
-    Write-Host 'psql:'
-    Write-Host 'Available'
+    Write-Host "Version : $($confirmed.Version)"
+    Write-Host "Service : $($confirmed.ServiceStatus)"
+    Write-Host 'psql    : Available'
 }
 
 # ---------------------------------------------------------------------------
@@ -1346,7 +1584,7 @@ function Install-PostGIS {
       whether Phase 2C has ever run.
     #>
 
-    Write-PhaseBanner 'Phase 2B - PostGIS'
+    Show-Section -Title 'Phase 2B - PostGIS'
 
     $existing = Find-PostgresInstallation
     if (-not $existing.Found -or -not $existing.PsqlPath) {
@@ -1358,16 +1596,10 @@ function Install-PostGIS {
     $check = Test-PostGISAvailable -PsqlPath $existing.PsqlPath -SuperuserPassword $superuserPassword
 
     if ($check.Available) {
-        Write-Host ''
-        Write-Host 'PostGIS detected.'
-        Write-Host ''
-        Write-Host 'Version:'
-        Write-Host $check.VersionString
-        Write-Host ''
-        Write-Host 'Status:'
-        Write-Host 'Already installed and usable.'
-        Write-Host ''
-        Write-Host 'Skipping installation.'
+        Show-ComponentStatus -Name 'PostGIS' -Fields ([ordered]@{
+            'Version' = $check.VersionString
+            'Status'  = 'Already installed and usable'
+        }) -Message @('Skipping installation.')
         return
     }
 
@@ -1386,10 +1618,9 @@ function Install-PostGIS {
     }
 
     Write-Host ''
-    Write-Success 'PostGIS successfully installed.'
+    Show-Success 'PostGIS successfully installed.'
     Write-Host ''
-    Write-Host 'Version:'
-    Write-Host $confirmed.VersionString
+    Write-Host "Version : $($confirmed.VersionString)"
 }
 
 # ---------------------------------------------------------------------------
@@ -1451,7 +1682,7 @@ function Install-DeltaRuntime {
       real reported bug.
     #>
 
-    Write-PhaseBanner 'DELTA Runtime Deployment'
+    Show-Section -Title 'DELTA Runtime Deployment'
 
     if (-not (Test-Path -LiteralPath $Script:DeltaRuntimeSourceDirectory)) {
         Stop-Setup "DELTA artifact source not found: $($Script:DeltaRuntimeSourceDirectory)"
@@ -1617,7 +1848,7 @@ function Initialize-DeltaRuntimeDirectories {
       markdown content as cwd-relative did not identify any requirement
       for one.
     #>
-    Write-PhaseBanner 'DELTA Runtime Directories'
+    Show-Section -Title 'DELTA Runtime Directories'
 
     $directories = @(
         (Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath 'uploads'),
@@ -2142,7 +2373,7 @@ function Complete-DatabaseSetup {
       is what Complete-DatabaseSetupForExistingPostgres's
       recreate/upgrade/keep decision exists to handle.
     #>
-    Write-PhaseBanner 'DELTA Database Setup'
+    Show-Section -Title 'DELTA Database Setup'
 
     $deltaDatabaseName = Read-DeltaDatabaseName
     $superuserPassword = Get-CachedPostgresSuperuserPassword
@@ -2194,49 +2425,6 @@ function Get-YarnGlobalBinDirectory {
     }
 
     return ($output | Select-Object -First 1).ToString().Trim()
-}
-
-function Test-DotenvCliAvailable {
-    <#
-      Checks whether dotenv-cli is actually present in Yarn's own global
-      bin directory - not whether `dotenv` currently resolves on PATH,
-      since that's exactly the thing Add-YarnGlobalBinToPersistentPath
-      fixes independently of whether a (re-)install is actually needed.
-    #>
-    $yarnGlobalBin = Get-YarnGlobalBinDirectory
-    if (-not $yarnGlobalBin) {
-        return $false
-    }
-
-    $dotenvCmd = Join-Path -Path $yarnGlobalBin -ChildPath 'dotenv.cmd'
-    return (Test-Path -LiteralPath $dotenvCmd)
-}
-
-function Test-DeltaRuntimeDependenciesInstalled {
-    <#
-      The idempotency check for this phase: true only if Yarn is
-      resolvable, the DELTA runtime's own node_modules exists and is
-      non-empty, and dotenv-cli is present in Yarn's global bin. All
-      three have to hold for init_website.bat to be safely skippable -
-      any one missing means something in the chain didn't complete.
-    #>
-    if (-not (Test-YarnAvailable)) {
-        return $false
-    }
-
-    $nodeModulesPath = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath 'node_modules'
-    if (-not (Test-Path -LiteralPath $nodeModulesPath)) {
-        return $false
-    }
-    if (-not (Get-ChildItem -Path $nodeModulesPath -ErrorAction SilentlyContinue | Select-Object -First 1)) {
-        return $false
-    }
-
-    if (-not (Test-DotenvCliAvailable)) {
-        return $false
-    }
-
-    return $true
 }
 
 function Invoke-DeltaWebsiteInit {
@@ -2349,36 +2537,25 @@ function Add-YarnGlobalBinToPersistentPath {
 function Install-DeltaDependencies {
     <#
       Phase 3 of the DELTA installer: Yarn, the application's own
-      production dependencies, and dotenv-cli. Idempotent: if everything
-      required is already present (Test-DeltaRuntimeDependenciesInstalled),
-      init_website.bat is skipped entirely rather than re-run
-      unconditionally, so a repeat setup.ps1 run doesn't pay for a fresh
-      dependency install every time.
+      production dependencies, and dotenv-cli. Runs unconditionally,
+      every time - Install-DeltaRuntime always redeploys the latest
+      package.json immediately before this phase runs (fresh install,
+      upgrade, or recreate alike), so init_website.bat's own npm/yarn
+      install commands are the authoritative, always-correct answer to
+      "does anything need installing," not a node_modules existence
+      check performed here first. Those commands are themselves
+      idempotent - a no-op re-run costs a quick resolution check, not a
+      fresh install - so there is nothing to protect by gating them.
 
-      The dotenv-cli PATH fix always runs after this regardless of
-      whether init_website.bat itself ran - a *new* PowerShell session
-      (this run) has no reason to already have Yarn's global bin on
-      PATH even when dependencies were installed by an earlier run, and
-      the fix itself (Add-YarnGlobalBinToPersistentPath) is idempotent
-      either way.
+      The dotenv-cli PATH fix always runs after this - a *new*
+      PowerShell session (this run) has no reason to already have
+      Yarn's global bin on PATH even when dependencies were installed
+      by an earlier run, and the fix itself
+      (Add-YarnGlobalBinToPersistentPath) is idempotent either way.
     #>
-    Write-PhaseBanner 'Phase 3 - DELTA Runtime Dependencies'
+    Show-Section -Title 'Phase 3 - DELTA Runtime Dependencies'
 
-    if (Test-DeltaRuntimeDependenciesInstalled) {
-        Write-Host ''
-        Write-Host 'Runtime dependencies detected.'
-        Write-Host ''
-        Write-Host 'Status:'
-        Write-Host 'Already installed.'
-        Write-Host ''
-        Write-Host 'Skipping init_website.bat.'
-    }
-    else {
-        Write-Detail 'Runtime dependencies not fully present - running init_website.bat.'
-        Write-Host ''
-        Invoke-DeltaWebsiteInit
-    }
-
+    Invoke-DeltaWebsiteInit
     Add-YarnGlobalBinToPersistentPath
 }
 
@@ -2472,13 +2649,13 @@ function Confirm-DeltaRuntimeNotRunning {
       this validation phase (see the orchestration block below), so
       automatically starting anything here would contradict that.
     #>
-    Write-PhaseBanner 'DELTA Runtime Status'
+    Show-Section -Title 'DELTA Runtime Status'
     Write-Step 'Checking for an already-running DELTA instance...'
     Stop-RunningDeltaInstance
 }
 
 function Initialize-Setup {
-    Write-SetupBanner -Title 'DELTA Windows Installer' -Subtitle "Version $Script:DeltaInstallerVersion"
+    Show-Section -Title 'DELTA Windows Installer' -Subtitle "Version $Script:DeltaInstallerVersion"
 
     # Install logs live under %TEMP% (ephemeral, per-run detail); cached
     # installer binaries live under .\installers (persistent, see
@@ -2632,13 +2809,10 @@ function Confirm-DeltaFreshInstallation {
       Backup-ExistingDeltaDeployment - "removes" always really means
       "moves to a timestamped backup," never an actual delete.
     #>
-    Write-Host ''
-    Write-Host 'WARNING' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host 'You are about to perform a completely fresh DELTA installation.'
-    Write-Host ''
-    Write-Host 'This will remove the existing application directory.'
-    Write-Host ''
+    Show-Warning -Message @(
+        'You are about to perform a completely fresh DELTA installation.'
+        'This will remove the existing application directory.'
+    )
     Write-Host 'Type YES to continue:'
     Write-Host ''
     $confirmation = Read-Host -Prompt '>'
@@ -2806,7 +2980,7 @@ function Register-DeltaInstallation {
       needing to elevate.
     #>
 
-    Write-PhaseBanner 'Registry Registration'
+    Show-Section -Title 'Registry Registration'
     Write-Step 'Registering the DELTA installation in the Windows Registry...'
     Write-Detail "Key: $($Script:DeltaRegistryKeyPath)"
 
@@ -2841,6 +3015,13 @@ function Register-DeltaInstallation {
 
 try {
     Initialize-Setup
+
+    if (-not (Show-MainMenu)) {
+        Write-Host ''
+        Write-Host 'Installation canceled.'
+        exit 0
+    }
+
     Update-DeltaRuntimeArtifact -RuntimeDirectory $Script:DeltaRuntimeSourceDirectory -ProjectRoot $Script:ProjectRoot
     Resolve-DeltaAppRoot
     Resolve-ExistingDeltaDeployment
@@ -2848,9 +3029,9 @@ try {
     Install-PostgreSql
     Install-PostGIS
     Install-DeltaRuntime
+    Install-DeltaDependencies
     Initialize-DeltaRuntimeDirectories
     Complete-DatabaseSetup
-    Install-DeltaDependencies
     Confirm-DeltaRuntimeNotRunning
     Register-DeltaInstallation
 
@@ -2878,83 +3059,13 @@ try {
     # Final installation summary - purely a console-output concern. Every
     # piece of state it prints (DeltaRuntimeRoot, the .env/start.bat paths
     # derived from it) was already established by the phases above; this
-    # section performs no installation actions of its own, and reuses the
-    # existing Write-SetupBanner/Write-PhaseBanner/Write-Detail vocabulary
-    # rather than introducing new formatting primitives.
+    # section performs no installation actions of its own, and reuses
+    # Show-InstallationSummary rather than inlining its own formatting.
     $deltaHome    = $Script:DeltaRuntimeRoot
     $envPath      = Join-Path -Path $deltaHome -ChildPath '.env'
     $startBatPath = Join-Path -Path $deltaHome -ChildPath 'start.bat'
 
-    Write-SetupBanner -Title 'DELTA Installation Summary' -Subtitle 'Installation completed successfully.'
-
-    Write-Success '    [OK] Node.js'
-    Write-Success '    [OK] PostgreSQL'
-    Write-Success '    [OK] PostGIS'
-    Write-Success '    [OK] DELTA Runtime'
-
-    Write-PhaseBanner 'Application Location'
-    Write-Host 'DELTA Home:'
-    Write-Detail $deltaHome
-    Write-Host ''
-    Write-Host 'Configuration:'
-    Write-Detail $envPath
-
-    Write-PhaseBanner 'First Run'
-    Write-Host 'Start DELTA:'
-    Write-Detail $startBatPath
-    Write-Host ''
-    Write-Host 'Once DELTA has started, browse to:'
-    Write-Detail 'http://localhost:3000'
-    Write-Host ''
-    Write-Host 'Stop DELTA:'
-    Write-Detail 'Close the console window start.bat is running in (or press Ctrl+C inside it).'
-
-    Write-PhaseBanner 'Configuration'
-    Write-Host 'A default .env file has already been created. It is suitable for'
-    Write-Host 'initial installation and local testing.'
-    Write-Host ''
-    Write-Host 'Before production deployment, review and update:'
-    Write-Detail '- PUBLIC_URL'
-    Write-Detail '- Database settings'
-    Write-Detail '- SMTP configuration'
-    Write-Detail '- Authentication settings'
-
-    Write-PhaseBanner 'Optional: Reverse Proxy'
-    Write-Host 'DELTA listens on port 3000 by default. Production deployments'
-    Write-Host 'typically place it behind a reverse proxy.'
-    Write-Host ''
-    Write-Host 'Example (NGINX):'
-    Write-Host ''
-    Write-Host '    server {'
-    Write-Host '        listen 80;'
-    Write-Host '        server_name delta.example.org;'
-    Write-Host ''
-    Write-Host '        location / {'
-    Write-Host '            proxy_pass http://127.0.0.1:3000;'
-    Write-Host ''
-    Write-Host '            proxy_set_header Host $host;'
-    Write-Host '            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;'
-    Write-Host '            proxy_set_header X-Forwarded-Proto $scheme;'
-    Write-Host '            proxy_set_header X-Real-IP $remote_addr;'
-    Write-Host '        }'
-    Write-Host '    }'
-    Write-Host ''
-    Write-Host 'IIS and other reverse proxies are also supported - see the'
-    Write-Host 'deployment documentation for detailed guidance.'
-
-    Write-PhaseBanner 'Troubleshooting'
-    Write-Host 'If DELTA fails to start because port 3000 is already in use, add'
-    Write-Host 'or change the following line in .env:'
-    Write-Host ''
-    Write-Detail 'PORT=3001'
-    Write-Host ''
-    Write-Host 'Then restart DELTA - close the console window start.bat is'
-    Write-Host 'running in, and run it again:'
-    Write-Detail $startBatPath
-
-    Write-Host ''
-    Write-Host ('=' * $Script:BannerWidth)
-    Write-Host ''
+    Show-InstallationSummary -DeltaHome $deltaHome -EnvPath $envPath -StartBatPath $startBatPath
 
     exit 0
 }
