@@ -101,6 +101,43 @@ function Stop-Setup {
     throw $Message
 }
 
+function Read-DeltaYesNoConfirmation {
+    <#
+      The shared shape behind every Y/N confirmation prompt in this
+      project (setup-nginx.ps1's own Read-DeltaNginxInstallConfirmation,
+      Read-DeltaNginxStartConfirmation, Read-DeltaNginxForceStopConfirmation
+      - three copies of the identical surrounding boilerplate before this
+      was promoted here): a '-' rule, the caller-supplied body, a '[y/N]'
+      prompt, and a closing rule. Bare Enter (or anything other than Y/y)
+      always means No - the same "blank means the safe choice" convention
+      every confirmation in this project follows.
+
+      $Body is a scriptblock that writes whatever question-specific text
+      belongs between the opening rule and the prompt (ending in whatever
+      question line makes sense for that caller - "Continue?", "Start
+      NGINX now?", etc.) - this function has no opinion on that content,
+      only on the rule/prompt/rule frame around it. Invoked with `& $Body`
+      exactly like Wait-Until invokes its own -Condition scriptblock above
+      - PowerShell scriptblocks retain the scope they were lexically
+      defined in, so a $Body written inline at a call site can still read
+      that caller's own local variables (e.g. Read-DeltaNginxForceStopConfirmation's
+      $Targets) without needing to pass them through this function
+      explicitly.
+    #>
+    param([Parameter(Mandatory)][scriptblock]$Body)
+
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+    Write-Host ''
+    & $Body
+    Write-Host ''
+    $choice = Read-Host -Prompt '[y/N]'
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+
+    return ($choice.Trim() -in @('Y', 'y'))
+}
+
 function Test-IsAdministrator {
     $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -247,6 +284,69 @@ function Start-ProcessWithActivityIndicator {
     }
 
     return $Process
+}
+
+function Write-DeltaTemplateFile {
+    <#
+      Engine-agnostic template rendering, shared by setup-nginx.ps1's own
+      New-DeltaNginxConfiguration and (per
+      docs\todo\TODO-setup-iis-enhancements.md, Phase 6) setup-iis.ps1's
+      future web.config generation - originally setup-nginx.ps1's own
+      Install-NginxConfigFile, promoted here once it became clear the
+      function itself has no NGINX-specific knowledge at all: it knows
+      nothing about nginx.conf, web.config, or XML, it simply loads a
+      template, applies token replacements, and writes the result out.
+
+      Writes $TemplatePath to $DestinationPath, unconditionally - no
+      diffing against, or backing up, whatever might already be there.
+      That is a decision each caller's own pre-conditions justify (e.g.
+      setup-nginx.ps1 only ever calls this immediately after Install-Nginx
+      has just extracted a brand-new NGINX, so there is no pre-existing,
+      operator-meaningful configuration here worth protecting) - this
+      function itself has no opinion on when that's safe, it just writes.
+
+      $Replacements (optional) is an ordered set of literal token -> value
+      substitutions applied to the template's text before it's written
+      out. Omitted (or empty) for templates that need no substitution at
+      all, in which case this still just copies the file byte-for-byte.
+
+      Deliberately NOT Set-Content -Encoding utf8 for the substituted
+      case: confirmed directly that Windows PowerShell 5.1's "utf8"
+      encoding always prepends a UTF-8 byte-order mark, and nginx does
+      not skip it - a BOM-prefixed conf.d\delta.conf fails `nginx -t`
+      outright with "unknown directive" pointing at the file's own first
+      line. [System.IO.File]::WriteAllText with an explicit
+      UTF8Encoding($false) writes the same bytes back out with no BOM at
+      all, which is what every other template (copied verbatim via
+      Copy-Item, and therefore already BOM-free) also produces. Nothing
+      about this guarantee is NGINX-specific - any consumer's generated
+      file benefits from staying BOM-free the same way.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TemplatePath,
+        [Parameter(Mandatory)][string]$DestinationPath,
+        [Parameter(Mandatory)][string]$Description,
+        [System.Collections.IDictionary]$Replacements
+    )
+
+    $destinationDirectory = Split-Path -Path $DestinationPath -Parent
+    if (-not (Test-Path -Path $destinationDirectory)) {
+        New-Item -Path $destinationDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    if ($Replacements -and $Replacements.Count -gt 0) {
+        $content = Get-Content -LiteralPath $TemplatePath -Raw
+        foreach ($token in $Replacements.Keys) {
+            $content = $content.Replace($token, [string]$Replacements[$token])
+        }
+        $noBomUtf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($DestinationPath, $content, $noBomUtf8)
+    }
+    else {
+        Copy-Item -LiteralPath $TemplatePath -Destination $DestinationPath -Force
+    }
+
+    Write-Success "    $Description written: $DestinationPath"
 }
 
 function Wait-Until {
@@ -514,6 +614,52 @@ function Get-DeltaInstallPath {
     }
 
     return $null
+}
+
+function Resolve-DeltaInstallation {
+    <#
+      The shared "confirm DELTA is actually installed before doing
+      anything engine-specific" step - originally setup-nginx.ps1's own
+      Resolve-DeltaInstallation, promoted here once setup-iis.ps1 needed
+      the identical behavior (docs\todo\TODO-setup-iis-enhancements.md,
+      Phase 1: "Resolve-DeltaInstallation itself is a strong candidate to
+      promote... promoting it removes that risk [of the two copies
+      diverging] entirely and is the preferred outcome"). Has no
+      NGINX/IIS-specific knowledge at all - it only calls the shared
+      Get-DeltaInstallPath discovery helper above, so both setup-nginx.ps1
+      and setup-iis.ps1 consume this exact same implementation rather than
+      each carrying their own copy.
+
+      Stops immediately (Stop-Setup) if Get-DeltaInstallPath returns
+      $null - a reverse proxy for a DELTA installation that doesn't exist
+      makes no sense, so nothing else in either caller is allowed to run
+      in that case.
+
+      Sets $Script:DeltaInstallPath and $Script:DeltaEnvPath (via
+      Join-Path, never string concatenation) in the CALLER's script scope
+      - both are consumed downstream (e.g. Show-DeltaNginxSummary,
+      Resolve-DeltaBackendPort) to report exactly which DELTA installation
+      this run resolved.
+    #>
+
+    Write-PhaseBanner 'DELTA Installation Discovery'
+    Write-Step 'Locating the DELTA installation...'
+
+    $Script:DeltaInstallPath = Get-DeltaInstallPath
+    if (-not $Script:DeltaInstallPath) {
+        Stop-Setup @'
+DELTA installation not found.
+
+Please install DELTA using setup.ps1 before running setup-nginx.ps1.
+'@
+    }
+
+    $Script:DeltaEnvPath = Join-Path -Path $Script:DeltaInstallPath -ChildPath '.env'
+
+    Write-Success '    DELTA installation found.'
+    Write-Host ''
+    Write-Host 'Location:'
+    Write-Host $Script:DeltaInstallPath
 }
 
 # ---------------------------------------------------------------------------
@@ -885,6 +1031,435 @@ function Resolve-DeltaWebsiteDomain {
         Write-Host $validation.Reason -ForegroundColor Yellow
         Write-Host ''
     }
+}
+
+# ---------------------------------------------------------------------------
+# DELTA backend port detection
+# ---------------------------------------------------------------------------
+
+# The fallback used when the DELTA .env file has no PORT entry at all -
+# Resolve-DeltaBackendPort below sets $Script:DeltaBackendPort once it has
+# actually read the DELTA installation's own .env file, never assumed up
+# front. Originally setup-nginx.ps1's own constant, promoted here alongside
+# Resolve-DeltaBackendPort itself once setup-iis.ps1 needed the identical
+# behavior (docs\todo\TODO-setup-iis-enhancements.md, Phase 5's own "Reuse
+# the shared: ... Resolve-DeltaBackendPort") - it has no NGINX-specific
+# meaning at all, so both scripts share this one definition.
+$Script:DefaultDeltaBackendPort = 3000
+
+function Test-ValidTcpPort {
+    <#
+      Reports whether $Value is a valid TCP port number (1-65535) - not
+      just "parses as an integer", since -1 and 70000 both parse fine but
+      are exactly the invalid examples this phase's own requirements call
+      out by name. [int]::TryParse rather than a regex first: it already
+      rejects non-numeric input (PORT=abc) without this needing its own
+      digits-only pattern, and this only needs the range check on top of
+      that.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+
+    $parsedPort = 0
+    if (-not [int]::TryParse($Value, [ref]$parsedPort)) {
+        return $false
+    }
+    return ($parsedPort -ge 1 -and $parsedPort -le 65535)
+}
+
+function Resolve-DeltaBackendPort {
+    <#
+      Originally setup-nginx.ps1's own Resolve-DeltaBackendPort (Automatic
+      DELTA Backend Port Detection), promoted here once setup-iis.ps1
+      needed the identical behavior (docs\todo\TODO-setup-iis-enhancements.md,
+      Phase 5) - it has no NGINX/IIS-specific knowledge at all, reading
+      PORT from the resolved DELTA installation's own .env file
+      ($Script:DeltaEnvPath - built by Resolve-DeltaInstallation above,
+      never a hardcoded C:\DELTA assumption of either caller's own) via
+      the shared Get-EnvFileValue helper, rather than a second,
+      engine-specific .env parser.
+
+      Three outcomes:
+        - PORT absent entirely -> $Script:DefaultDeltaBackendPort (3000).
+        - PORT present and a valid TCP port (Test-ValidTcpPort) -> that
+          value, used as-is.
+        - PORT present but NOT a valid TCP port (PORT=abc, PORT=-1,
+          PORT=70000) -> Stop-Setup. Never silently falls back to the
+          default in this case - an administrator who explicitly
+          configured an invalid value needs to fix it themselves, not
+          have this script quietly paper over it and generate a reverse
+          proxy pointed at the wrong port.
+
+      Sets $Script:DeltaBackendPort in the CALLER's script scope -
+      consumed by both setup-nginx.ps1 (New-DeltaNginxConfiguration,
+      Show-DeltaNginxSummary) and setup-iis.ps1 (Phase 5's own existing-
+      website summary). The error message below deliberately does not
+      name either caller script by name (unlike Resolve-DeltaInstallation's
+      own still-outstanding "revisit this" note - see that function's own
+      header) - "re-run this script" is accurate regardless of which of
+      the two actually invoked it.
+    #>
+
+    Write-PhaseBanner 'DELTA Backend Port Detection'
+    Write-Step "Reading PORT from $($Script:DeltaEnvPath)..."
+
+    $rawPort = Get-EnvFileValue -Path $Script:DeltaEnvPath -Key 'PORT'
+
+    if ([string]::IsNullOrWhiteSpace($rawPort)) {
+        $Script:DeltaBackendPort = $Script:DefaultDeltaBackendPort
+        Write-Detail "PORT is not set - using the default DELTA backend port ($($Script:DeltaBackendPort))."
+    }
+    else {
+        if (-not (Test-ValidTcpPort -Value $rawPort)) {
+            Stop-Setup @"
+Invalid PORT value in $($Script:DeltaEnvPath): '$rawPort'
+
+PORT must be a valid TCP port number (1-65535).
+
+Correct the PORT value in the DELTA .env file, then re-run this script.
+"@
+        }
+
+        $Script:DeltaBackendPort = [int]$rawPort
+        Write-Success "    Backend port detected: $($Script:DeltaBackendPort)"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# SSL certificate file selection
+# ---------------------------------------------------------------------------
+
+function Select-DeltaSslFile {
+    <#
+      Opens a standard Windows file selection dialog
+      (System.Windows.Forms.OpenFileDialog) and returns the selected file's
+      full path, or $null if the administrator closed/canceled the dialog
+      without choosing one - never a manually-typed path, per this
+      feature's own requirement (locating a certificate or key file
+      wherever it happens to live on disk is exactly what a file picker is
+      for). Requires an STA thread, which is WinForms' own hard
+      requirement, not something this function works around - powershell.exe
+      (the Windows PowerShell 5.1 host this project's scripts target)
+      defaults to STA, so this is not expected to be an issue in practice.
+
+      Originally setup-nginx.ps1's own Select-DeltaSslFile, promoted here
+      once setup-iis.ps1's own Phase 7 (Windows SSL Certificate) needed the
+      identical file-picker behavior for selecting a .pfx - it has no
+      NGINX-specific knowledge at all (the caller supplies the dialog
+      title and filter), so both scripts share this one implementation
+      rather than carrying two copies that could drift apart.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Filter
+    )
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    }
+    catch {
+        Stop-Setup "Unable to open a file selection dialog - System.Windows.Forms could not be loaded: $($_.Exception.Message)"
+    }
+
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Title = $Title
+    $dialog.Filter = $Filter
+    $dialog.CheckFileExists = $true
+    $dialog.Multiselect = $false
+
+    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
+        return $null
+    }
+
+    return $dialog.FileName
+}
+
+function Test-DeltaSslFileExtension {
+    <#
+      Reports whether $Path's extension is one of $AllowedExtensions
+      (case-insensitive - Windows filesystems already are, so a literal
+      ".PFX"/".CRT" selected via the file dialog must be accepted the same
+      as ".pfx"/".crt"). Originally setup-nginx.ps1's own
+      Test-DeltaSslFileExtension, promoted alongside Select-DeltaSslFile
+      for the identical reason - no certificate-format-specific knowledge
+      at all, just an extension check against a caller-supplied list.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string[]]$AllowedExtensions
+    )
+
+    $extension = [System.IO.Path]::GetExtension($Path)
+    return $AllowedExtensions -contains $extension.ToLowerInvariant()
+}
+
+# ---------------------------------------------------------------------------
+# Certificate conversion (PEM certificate + private key -> PKCS#12)
+# ---------------------------------------------------------------------------
+#
+# Generic certificate helpers - no IIS-specific knowledge at all. Added for
+# setup-iis.ps1's own Phase 7 (Windows SSL Certificate) "Certificate +
+# Private Key" input option, but deliberately placed here rather than in
+# setup-iis.ps1 itself: converting a cert+key pair into an importable PFX
+# is exactly the kind of engine-agnostic operation this project's own
+# "shared, engine-agnostic logic lives in lib\DeltaInstaller.Common.ps1"
+# principle already established for backend port/website domain
+# resolution - a future setup-nginx.ps1 enhancement, or any other script
+# in this project, could reuse this identically. setup-iis.ps1 itself only
+# orchestrates (prompts, picks files, calls this, hands the result to its
+# own already-existing Import-PfxCertificate step) - it does not own any
+# of the actual conversion logic.
+#
+# Uses BouncyCastle.Cryptography (vendored under lib\BouncyCastle\, MIT
+# licensed - see that directory's own README.md/LICENSE.md) as the
+# conversion engine, per this phase's own explicit requirement: "Do not
+# implement or maintain a custom ASN.1 parser. Do not implement custom
+# PBES2 or OpenSSL-compatible decryption. Prefer the mature library."
+# Confirmed directly (see docs\todo\TODO-setup-iis-enhancements.md's own
+# Phase 7 investigation/validation notes) that .NET Framework 4.8's own
+# RSA/ECDsa classes lack the PEM/DER convenience methods needed to do this
+# natively, and that BouncyCastle's PemReader correctly and transparently
+# handles unencrypted PKCS#1/PKCS#8, encrypted PKCS#8, and even the legacy
+# OpenSSL "Proc-Type: 4,ENCRYPTED" PKCS#1 format - none of which a
+# hand-written parser could safely or reasonably cover.
+
+function Install-DeltaBouncyCastleTypes {
+    <#
+      Idempotently loads BouncyCastle.Cryptography.dll
+      (lib\BouncyCastle\, vendored - see that directory's own README.md
+      for exactly which package/version and why) via Add-Type, and
+      registers a small compiled helper type,
+      DeltaBouncyCastlePasswordFinder, implementing BouncyCastle's own
+      Org.BouncyCastle.OpenSsl.IPasswordFinder interface - PowerShell
+      cannot implement a .NET interface directly, so a tiny C# class
+      compiled via Add-Type -TypeDefinition is the standard, minimal way
+      to bridge a plain password into BouncyCastle's own PemReader
+      decryption callback. Both checks are idempotent (safe to call every
+      time a caller needs BouncyCastle - Add-Type throws if a type is
+      redefined in the same process, so this always checks for the
+      type's existence first rather than assuming it has/hasn't run yet).
+
+      Requires $Script:ProjectRoot to already be set by the caller (see
+      this file's own header for why) - the vendored DLL's path is
+      resolved relative to it, never a hardcoded absolute path.
+    #>
+
+    if (-not ('Org.BouncyCastle.X509.X509Certificate' -as [type])) {
+        $bouncyCastlePath = Join-Path -Path $Script:ProjectRoot -ChildPath 'lib\BouncyCastle\BouncyCastle.Cryptography.dll'
+        if (-not (Test-Path -LiteralPath $bouncyCastlePath)) {
+            Stop-Setup "Required assembly not found: $bouncyCastlePath"
+        }
+        Add-Type -Path $bouncyCastlePath
+    }
+
+    if (-not ('DeltaBouncyCastlePasswordFinder' -as [type])) {
+        $bouncyCastlePath = Join-Path -Path $Script:ProjectRoot -ChildPath 'lib\BouncyCastle\BouncyCastle.Cryptography.dll'
+        Add-Type -ReferencedAssemblies $bouncyCastlePath -TypeDefinition @'
+using Org.BouncyCastle.OpenSsl;
+public class DeltaBouncyCastlePasswordFinder : IPasswordFinder
+{
+    private readonly char[] _password;
+    public DeltaBouncyCastlePasswordFinder(char[] password) { _password = (char[])password.Clone(); }
+    public char[] GetPassword() { return (char[])_password.Clone(); }
+}
+'@
+    }
+}
+
+function Test-DeltaPrivateKeyEncrypted {
+    <#
+      Whether $Path's PEM content is an encrypted private key - checked
+      by looking for the two textual markers that unambiguously indicate
+      encryption regardless of format, rather than attempting a blind
+      decrypt first: "-----BEGIN ENCRYPTED PRIVATE KEY-----" (modern,
+      PKCS#8/PBES2) or a "Proc-Type: 4,ENCRYPTED" header line (the legacy
+      OpenSSL PKCS#1 convention, "-----BEGIN RSA PRIVATE KEY-----" plus a
+      DEK-Info header). Both markers are always present in the PEM text
+      itself for an encrypted key, by definition of the format - the same
+      simple, reliable check real tooling (e.g. `openssl` itself) uses to
+      decide whether a passphrase is even needed, per this phase's own
+      "If the key is not encrypted: Do not prompt" requirement.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $content = Get-Content -LiteralPath $Path -Raw
+    return [bool]($content -match 'BEGIN ENCRYPTED PRIVATE KEY' -or $content -match 'Proc-Type:\s*4\s*,\s*ENCRYPTED')
+}
+
+function ConvertTo-DeltaPfxFromCertificateAndKey {
+    <#
+      Combines a PEM-encoded certificate and its private key into a
+      PKCS#12 (.pfx) file, using BouncyCastle as the parsing/encoding
+      engine - never a custom ASN.1 parser, never custom PBES2/OpenSSL-
+      compatible decryption, per this phase's own explicit requirement.
+
+      Supports whatever BouncyCastle's own PemReader supports without
+      this function needing to know the specifics itself: RSA or EC,
+      PKCS#1 or PKCS#8, unencrypted or encrypted (including the legacy
+      OpenSSL PKCS#1 scheme) - $KeyPassphrase is only ever needed for the
+      encrypted cases and is passed straight through to BouncyCastle via
+      DeltaBouncyCastlePasswordFinder, never inspected or parsed here.
+
+      $PfxPassword protects the OUTPUT file this function writes - it has
+      nothing to do with $KeyPassphrase (the INPUT key's own passphrase,
+      if any). Converts each SecureString to plain text only transiently,
+      for the narrowest possible scope, via the existing shared
+      ConvertTo-PlainText helper, and clears the local variable
+      immediately afterward - the same discipline this file's own
+      Read-PostgresSuperuserPassword/New-DatabaseUrl already follow for
+      credential material.
+
+      Throws (via Stop-Setup) with a specific, human-readable message on
+      any parse failure - a wrong passphrase, an unsupported/corrupt
+      file, or a certificate/key file that doesn't actually contain what
+      its name implies - rather than letting a raw BouncyCastle exception
+      surface unexplained.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$CertificatePath,
+        [Parameter(Mandatory)][string]$PrivateKeyPath,
+        [AllowNull()][SecureString]$KeyPassphrase,
+        [Parameter(Mandatory)][SecureString]$PfxPassword,
+        [Parameter(Mandatory)][string]$DestinationPfxPath
+    )
+
+    Install-DeltaBouncyCastleTypes
+
+    Write-Detail "Certificate: $CertificatePath"
+    Write-Detail "Private key: $PrivateKeyPath"
+
+    try {
+        $certReader = New-Object Org.BouncyCastle.OpenSsl.PemReader((New-Object System.IO.StringReader((Get-Content -LiteralPath $CertificatePath -Raw))))
+        $bcCertificate = $certReader.ReadObject()
+    }
+    catch {
+        Stop-Setup "Failed to read the certificate file ($CertificatePath): $($_.Exception.Message)"
+    }
+    if (-not ($bcCertificate -is [Org.BouncyCastle.X509.X509Certificate])) {
+        Stop-Setup "The selected certificate file does not contain a valid X.509 certificate: $CertificatePath"
+    }
+
+    $keyReaderArgs = @((New-Object System.IO.StringReader((Get-Content -LiteralPath $PrivateKeyPath -Raw))))
+    if ($KeyPassphrase) {
+        $plainPassphrase = ConvertTo-PlainText -SecureString $KeyPassphrase
+        try {
+            $passwordFinder = New-Object DeltaBouncyCastlePasswordFinder(, $plainPassphrase.ToCharArray())
+        }
+        finally {
+            $plainPassphrase = $null
+        }
+        $keyReaderArgs += $passwordFinder
+    }
+
+    try {
+        $keyReader = New-Object Org.BouncyCastle.OpenSsl.PemReader($keyReaderArgs)
+        $bcKeyObject = $keyReader.ReadObject()
+    }
+    catch {
+        Stop-Setup "Failed to read the private key file ($PrivateKeyPath) - it may require a different passphrase, or use an unsupported format: $($_.Exception.Message)"
+    }
+    if (-not $bcKeyObject) {
+        Stop-Setup "The selected private key file could not be parsed: $PrivateKeyPath"
+    }
+
+    $privateKeyParameter = if ($bcKeyObject -is [Org.BouncyCastle.Crypto.AsymmetricCipherKeyPair]) { $bcKeyObject.Private } else { $bcKeyObject }
+    if (-not ($privateKeyParameter -is [Org.BouncyCastle.Crypto.AsymmetricKeyParameter]) -or -not $privateKeyParameter.IsPrivate) {
+        Stop-Setup "The selected private key file does not contain a usable private key: $PrivateKeyPath"
+    }
+
+    $pkcs12Store = [Org.BouncyCastle.Pkcs.Pkcs12StoreBuilder]::new().Build()
+    $alias = 'delta'
+    $certificateEntry = New-Object Org.BouncyCastle.Pkcs.X509CertificateEntry($bcCertificate)
+    $pkcs12Store.SetCertificateEntry($alias, $certificateEntry)
+    $keyEntry = New-Object Org.BouncyCastle.Pkcs.AsymmetricKeyEntry($privateKeyParameter)
+    $pkcs12Store.SetKeyEntry($alias, $keyEntry, [Org.BouncyCastle.Pkcs.X509CertificateEntry[]]@($certificateEntry))
+
+    $plainPfxPassword = ConvertTo-PlainText -SecureString $PfxPassword
+    try {
+        $fileStream = New-Object System.IO.FileStream($DestinationPfxPath, [System.IO.FileMode]::Create)
+        try {
+            $pkcs12Store.Save($fileStream, $plainPfxPassword.ToCharArray(), (New-Object Org.BouncyCastle.Security.SecureRandom))
+        }
+        catch {
+            Stop-Setup "Failed to build the PKCS#12 (.pfx) file: $($_.Exception.Message)"
+        }
+        finally {
+            $fileStream.Close()
+        }
+    }
+    finally {
+        $plainPfxPassword = $null
+    }
+}
+
+function New-DeltaRandomPassword {
+    <#
+      A cryptographically random password/token, for internal-only,
+      immediately-discarded uses that never need to be memorable or
+      typed by anyone - the throwaway PFX password
+      New-DeltaIisTemporaryPfxFromCertificateAndKey (setup-iis.ps1)
+      protects its own temporary .pfx with, per this phase's own
+      "administrator never sees it" requirement. Uses
+      RNGCryptoServiceProvider (a real CSPRNG), not [guid]::NewGuid() or
+      Get-Random - GUIDs are not documented or guaranteed to be
+      cryptographically unpredictable, and this value is standing in for
+      a real credential (however short-lived), so it is generated to the
+      same standard as one.
+    #>
+    param([int]$ByteLength = 32)
+
+    $randomBytes = New-Object byte[] $ByteLength
+    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+    try {
+        $rng.GetBytes($randomBytes)
+    }
+    finally {
+        $rng.Dispose()
+    }
+    return [Convert]::ToBase64String($randomBytes)
+}
+
+function Remove-DeltaTemporaryFileSecurely {
+    <#
+      Best-effort secure delete: overwrites $Path's own bytes with fresh
+      cryptographically random data before removing it, so a temporary
+      file that held private key material doesn't simply get unlinked
+      (leaving the original bytes recoverable on disk until something
+      else happens to reuse those blocks) - per this phase's own
+      "securely delete afterward" requirement for the temporary PKCS#12
+      this installer generates. The overwrite is best-effort (SSD wear-
+      leveling means even this guarantee is inherently weaker than on a
+      spinning disk - documented here rather than silently overstated);
+      the file is always removed regardless of whether the overwrite
+      itself succeeded, and this never throws - callers use it from
+      `finally` blocks where a cleanup failure must never mask (or be
+      masked by) the real error already in flight.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    try {
+        $fileLength = (Get-Item -LiteralPath $Path).Length
+        if ($fileLength -gt 0) {
+            $randomBytes = New-Object byte[] $fileLength
+            $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+            try {
+                $rng.GetBytes($randomBytes)
+            }
+            finally {
+                $rng.Dispose()
+            }
+            [System.IO.File]::WriteAllBytes($Path, $randomBytes)
+        }
+    }
+    catch {
+        # Best-effort overwrite only - still remove the file below
+        # regardless of whether this succeeded.
+    }
+
+    Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
 }
 
 function New-DatabaseUrl {

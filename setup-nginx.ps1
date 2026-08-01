@@ -230,61 +230,15 @@ $Script:NginxMainConfigTemplate       = Join-Path -Path $Script:ProjectRoot -Chi
 $Script:DeltaHttpVHostConfigTemplate  = Join-Path -Path $Script:ProjectRoot -ChildPath 'templates\nginx\delta-http.conf'
 $Script:DeltaHttpsVHostConfigTemplate = Join-Path -Path $Script:ProjectRoot -ChildPath 'templates\nginx\delta-https.conf'
 
-# DELTA Backend Port Detection (docs\todo\TODO-setup-nginx-enhancements.md,
-# Phase 4) - the fallback used when the DELTA .env file has no PORT entry
-# at all. Resolve-DeltaBackendPort sets $Script:DeltaBackendPort once it
-# has actually read the DELTA installation's own .env file - never
-# assumed up front the way the backend port used to be hardcoded here.
-$Script:DefaultDeltaBackendPort = 3000
-
 # ---------------------------------------------------------------------------
 # DELTA installation discovery
 # ---------------------------------------------------------------------------
-
-function Resolve-DeltaInstallation {
-    <#
-      The first real action this script takes - before even checking for
-      an existing NGINX installation. Confirms a real DELTA installation
-      exists on this machine via the shared discovery helper,
-      Get-DeltaInstallPath (lib\DeltaInstaller.Common.ps1, dot-sourced
-      above) - never a hardcoded C:\DELTA assumption of this script's own.
-      That helper already implements the full resolution order (the
-      registry key setup.ps1's own Register-DeltaInstallation writes,
-      falling back to the legacy C:\DELTA\.env convention for
-      installations that predate it) - this script is a CONSUMER of that
-      discovery, not a second implementation of it, so nothing here
-      re-checks the registry or the legacy path itself.
-
-      Stops immediately (Stop-Setup) if Get-DeltaInstallPath returns
-      $null - a reverse proxy for a DELTA installation that doesn't exist
-      makes no sense, so nothing else in this script (not even the
-      existing-NGINX check) is allowed to run in that case.
-
-      $Script:DeltaEnvPath is built via Join-Path from the resolved
-      $Script:DeltaInstallPath, never string concatenation - both are
-      script-scoped so Show-DeltaNginxSummary can display exactly which
-      DELTA installation this reverse proxy was set up for.
-    #>
-
-    Write-PhaseBanner 'DELTA Installation Discovery'
-    Write-Step 'Locating the DELTA installation...'
-
-    $Script:DeltaInstallPath = Get-DeltaInstallPath
-    if (-not $Script:DeltaInstallPath) {
-        Stop-Setup @'
-DELTA installation not found.
-
-Please install DELTA using setup.ps1 before running setup-nginx.ps1.
-'@
-    }
-
-    $Script:DeltaEnvPath = Join-Path -Path $Script:DeltaInstallPath -ChildPath '.env'
-
-    Write-Success '    DELTA installation found.'
-    Write-Host ''
-    Write-Host 'Location:'
-    Write-Host $Script:DeltaInstallPath
-}
+#
+# Resolve-DeltaInstallation itself now lives in lib\DeltaInstaller.Common.ps1
+# (dot-sourced above) - it has no NGINX-specific knowledge at all, and
+# setup-iis.ps1 needs the identical behavior, so both consume the same
+# shared implementation rather than carrying two copies that could drift
+# apart. See that function's own header for the full behavior description.
 
 # ---------------------------------------------------------------------------
 # Port prerequisite check
@@ -526,76 +480,14 @@ function Test-DeltaNginxPortPrerequisites {
 # ---------------------------------------------------------------------------
 # DELTA backend port detection
 # ---------------------------------------------------------------------------
-
-function Test-ValidTcpPort {
-    <#
-      Reports whether $Value is a valid TCP port number (1-65535) - not
-      just "parses as an integer", since -1 and 70000 both parse fine but
-      are exactly the invalid examples this phase's own requirements call
-      out by name. [int]::TryParse rather than a regex first: it already
-      rejects non-numeric input (PORT=abc) without this needing its own
-      digits-only pattern, and this only needs the range check on top of
-      that.
-    #>
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
-
-    $parsedPort = 0
-    if (-not [int]::TryParse($Value, [ref]$parsedPort)) {
-        return $false
-    }
-    return ($parsedPort -ge 1 -and $parsedPort -le 65535)
-}
-
-function Resolve-DeltaBackendPort {
-    <#
-      Phase 4 (docs\todo\TODO-setup-nginx-enhancements.md, "Automatic
-      DELTA Backend Port Detection"). Reads PORT from the resolved DELTA
-      installation's own .env file ($Script:DeltaEnvPath - built in
-      Resolve-DeltaInstallation from Get-DeltaInstallPath, never a
-      hardcoded C:\DELTA assumption of this script's own) via the shared
-      Get-EnvFileValue helper (lib\DeltaInstaller.Common.ps1), rather than
-      a second, DELTA-nginx-specific .env parser.
-
-      Three outcomes, matching this phase's own requirements exactly:
-        - PORT absent entirely -> $Script:DefaultDeltaBackendPort (3000).
-        - PORT present and a valid TCP port (Test-ValidTcpPort) -> that
-          value, used as-is.
-        - PORT present but NOT a valid TCP port (PORT=abc, PORT=-1,
-          PORT=70000) -> Stop-Setup. Never silently falls back to the
-          default in this case - an administrator who explicitly
-          configured an invalid value needs to fix it themselves, not
-          have this script quietly paper over it and generate a reverse
-          proxy pointed at the wrong port.
-
-      Sets $Script:DeltaBackendPort (consumed by New-DeltaNginxConfiguration
-      and Show-DeltaNginxSummary) - the one place in this script that
-      decides what the backend port actually is.
-    #>
-
-    Write-PhaseBanner 'DELTA Backend Port Detection'
-    Write-Step "Reading PORT from $($Script:DeltaEnvPath)..."
-
-    $rawPort = Get-EnvFileValue -Path $Script:DeltaEnvPath -Key 'PORT'
-
-    if ([string]::IsNullOrWhiteSpace($rawPort)) {
-        $Script:DeltaBackendPort = $Script:DefaultDeltaBackendPort
-        Write-Detail "PORT is not set - using the default DELTA backend port ($($Script:DeltaBackendPort))."
-    }
-    else {
-        if (-not (Test-ValidTcpPort -Value $rawPort)) {
-            Stop-Setup @"
-Invalid PORT value in $($Script:DeltaEnvPath): '$rawPort'
-
-PORT must be a valid TCP port number (1-65535).
-
-Correct the PORT value in the DELTA .env file, then re-run setup-nginx.ps1.
-"@
-        }
-
-        $Script:DeltaBackendPort = [int]$rawPort
-        Write-Success "    Backend port detected: $($Script:DeltaBackendPort)"
-    }
-}
+#
+# Resolve-DeltaBackendPort/Test-ValidTcpPort/$Script:DefaultDeltaBackendPort
+# now live in lib\DeltaInstaller.Common.ps1 (dot-sourced above) - they have
+# no NGINX-specific knowledge at all, and setup-iis.ps1 needs the identical
+# behavior (docs\todo\TODO-setup-iis-enhancements.md, Phase 5), so both
+# scripts consume the same shared implementation rather than carrying two
+# copies that could drift apart. See that function's own header for the
+# full behavior description.
 
 # ---------------------------------------------------------------------------
 # Native command output helper
@@ -637,25 +529,20 @@ function Read-DeltaNginxInstallConfirmation {
       "blank means the safe choice" convention as uninstall.ps1's own
       "(y/N)" data-directory-deletion prompt - an administrator who
       presses Enter without reading closely should land on the option
-      that installs nothing, not the one that does.
+      that installs nothing, not the one that does. The rule/prompt/rule
+      frame itself is Read-DeltaYesNoConfirmation (lib\DeltaInstaller.Common.ps1)
+      - only the NGINX-specific body text below belongs to this script.
     #>
 
-    Write-Host ''
-    Write-Host ('-' * $Script:BannerWidth)
-    Write-Host ''
-    Write-Host "NGINX $($Script:NginxVersion) will be installed."
-    Write-Host ''
-    Write-Host 'Installation Directory'
-    Write-Host ''
-    Write-Detail $Script:NginxHome
-    Write-Host ''
-    Write-Host 'Continue?'
-    Write-Host ''
-    $choice = Read-Host -Prompt '[y/N]'
-    Write-Host ''
-    Write-Host ('-' * $Script:BannerWidth)
-
-    return ($choice.Trim() -in @('Y', 'y'))
+    return Read-DeltaYesNoConfirmation -Body {
+        Write-Host "NGINX $($Script:NginxVersion) will be installed."
+        Write-Host ''
+        Write-Host 'Installation Directory'
+        Write-Host ''
+        Write-Detail $Script:NginxHome
+        Write-Host ''
+        Write-Host 'Continue?'
+    }
 }
 
 function Show-DeltaNginxInstallCancelledNotice {
@@ -878,63 +765,12 @@ function Read-SslCertificateChoice {
     }
 }
 
-function Select-DeltaSslFile {
-    <#
-      Opens a standard Windows file selection dialog
-      (System.Windows.Forms.OpenFileDialog) and returns the selected file's
-      full path, or $null if the administrator closed/canceled the dialog
-      without choosing one - never a manually-typed path, per this
-      feature's own requirement (locating a certificate or key file
-      wherever it happens to live on disk is exactly what a file picker is
-      for). Requires an STA thread, which is WinForms' own hard
-      requirement, not something this function works around - powershell.exe
-      (the Windows PowerShell 5.1 host this script targets; see
-      #Requires -Version 5.1 above) defaults to STA, so this is not expected
-      to be an issue in practice.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$Title,
-        [Parameter(Mandatory)][string]$Filter
-    )
-
-    try {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-    }
-    catch {
-        Stop-Setup "Unable to open a file selection dialog - System.Windows.Forms could not be loaded: $($_.Exception.Message)"
-    }
-
-    $dialog = New-Object System.Windows.Forms.OpenFileDialog
-    $dialog.Title = $Title
-    $dialog.Filter = $Filter
-    $dialog.CheckFileExists = $true
-    $dialog.Multiselect = $false
-
-    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
-        return $null
-    }
-
-    return $dialog.FileName
-}
-
-function Test-DeltaSslFileExtension {
-    <#
-      Reports whether $Path's extension is one of $AllowedExtensions
-      (case-insensitive - Windows filesystems already are, so a literal
-      ".CRT" selected via the file dialog must be accepted the same as
-      ".crt"). A small, standalone helper rather than inlined at each call
-      site, since Install-DeltaSslCertificate below needs the identical
-      check twice (certificate, then private key) against two different
-      allowed-extension lists.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string[]]$AllowedExtensions
-    )
-
-    $extension = [System.IO.Path]::GetExtension($Path)
-    return $AllowedExtensions -contains $extension.ToLowerInvariant()
-}
+# Select-DeltaSslFile/Test-DeltaSslFileExtension now live in
+# lib\DeltaInstaller.Common.ps1 (dot-sourced above) - they have no
+# NGINX-specific knowledge at all, and setup-iis.ps1 needs the identical
+# file-picker/extension-check behavior for its own Phase 7 (Windows SSL
+# Certificate), so both scripts consume the same shared implementation
+# rather than carrying two copies that could drift apart.
 
 function Test-DeltaSslCertificateFilesExist {
     <#
@@ -1190,68 +1026,6 @@ function Install-DeltaSslCertificate {
 # Configuration
 # ---------------------------------------------------------------------------
 
-function Install-NginxConfigFile {
-    <#
-      Writes $TemplatePath to $DestinationPath, unconditionally - no
-      diffing against, or backing up, whatever might already be there. That
-      is deliberate, not an oversight: this only ever runs immediately
-      after Install-Nginx has just extracted a brand-new NGINX (see the
-      orchestration block's existing-installation check, which runs before
-      any of this and refuses to proceed at all if NGINX was already
-      present) - there is no pre-existing, operator-meaningful
-      configuration here worth diffing against or protecting, only NGINX's
-      own freshly-extracted stock nginx.conf sample. Backing up a file that
-      was never anything but this script's own install artifact would add
-      complexity without protecting anything real.
-
-      $Replacements (optional) is an ordered set of literal token ->
-      value substitutions applied to the template's text before it's
-      written out - used by New-DeltaNginxConfiguration to bake the
-      detected backend port (Phase 4) and configured website domain
-      (Phase 5) into the DELTA vhost template's
-      __DELTA_BACKEND_PORT__/__DELTA_ENV_PATH__/__DELTA_SERVER_NAME__
-      placeholders. Omitted (or
-      empty) for templates that need no substitution at all (the main
-      nginx.conf template), in which case this still just copies the file
-      byte-for-byte exactly as before.
-
-      Deliberately NOT Set-Content -Encoding utf8 for the substituted
-      case: confirmed directly that Windows PowerShell 5.1's "utf8"
-      encoding always prepends a UTF-8 byte-order mark, and nginx does
-      not skip it - a BOM-prefixed conf.d\delta.conf fails `nginx -t`
-      outright with "unknown directive" pointing at the file's own first
-      line. [System.IO.File]::WriteAllText with an explicit
-      UTF8Encoding($false) writes the same bytes back out with no BOM at
-      all, which is what every other template here (copied verbatim via
-      Copy-Item, and therefore already BOM-free) also produces.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$TemplatePath,
-        [Parameter(Mandatory)][string]$DestinationPath,
-        [Parameter(Mandatory)][string]$Description,
-        [System.Collections.IDictionary]$Replacements
-    )
-
-    $destinationDirectory = Split-Path -Path $DestinationPath -Parent
-    if (-not (Test-Path -Path $destinationDirectory)) {
-        New-Item -Path $destinationDirectory -ItemType Directory -Force | Out-Null
-    }
-
-    if ($Replacements -and $Replacements.Count -gt 0) {
-        $content = Get-Content -LiteralPath $TemplatePath -Raw
-        foreach ($token in $Replacements.Keys) {
-            $content = $content.Replace($token, [string]$Replacements[$token])
-        }
-        $noBomUtf8 = New-Object System.Text.UTF8Encoding($false)
-        [System.IO.File]::WriteAllText($DestinationPath, $content, $noBomUtf8)
-    }
-    else {
-        Copy-Item -LiteralPath $TemplatePath -Destination $DestinationPath -Force
-    }
-
-    Write-Success "    $Description written: $DestinationPath"
-}
-
 function New-DeltaNginxConfiguration {
     <#
       Phase 3 (docs\todo\TODO-setup-nginx-enhancements.md, "Separate HTTP
@@ -1261,7 +1035,9 @@ function New-DeltaNginxConfiguration {
       readable and version-controlled on their own. See this script's own
       header for why conf\nginx.conf itself is replaced outright rather
       than left as NGINX's own heavily-commented sample file, and why no
-      backup step is needed here (Install-NginxConfigFile).
+      backup step is needed here (Write-DeltaTemplateFile,
+      lib\DeltaInstaller.Common.ps1 - the engine-agnostic template writer
+      this function bakes the port/domain tokens into).
 
       Automatically picks the DELTA virtual host template based on
       $Script:SslCertificateConfigured (set by Install-DeltaSslCertificate,
@@ -1299,7 +1075,7 @@ function New-DeltaNginxConfiguration {
     }
 
     Write-Step 'Writing main NGINX configuration...'
-    Install-NginxConfigFile -TemplatePath $Script:NginxMainConfigTemplate -DestinationPath $Script:NginxMainConfigPath -Description 'Main configuration'
+    Write-DeltaTemplateFile -TemplatePath $Script:NginxMainConfigTemplate -DestinationPath $Script:NginxMainConfigPath -Description 'Main configuration'
 
     $vHostReplacements = @{
         '__DELTA_BACKEND_PORT__' = $Script:DeltaBackendPort
@@ -1308,7 +1084,7 @@ function New-DeltaNginxConfiguration {
     }
 
     Write-Step "Writing DELTA reverse proxy configuration ($deltaVHostMode)..."
-    Install-NginxConfigFile -TemplatePath $deltaVHostTemplate -DestinationPath $Script:DeltaVHostConfigPath -Description "DELTA virtual host configuration ($deltaVHostMode)" -Replacements $vHostReplacements
+    Write-DeltaTemplateFile -TemplatePath $deltaVHostTemplate -DestinationPath $Script:DeltaVHostConfigPath -Description "DELTA virtual host configuration ($deltaVHostMode)" -Replacements $vHostReplacements
 }
 
 # ---------------------------------------------------------------------------
@@ -1396,21 +1172,15 @@ function Read-DeltaNginxStartConfirmation {
       there is no path where NGINX fails validation and this still asks
       whether to start it. Bare Enter (or anything other than Y/y)
       defaults to No, the same convention as
-      Read-DeltaNginxInstallConfirmation.
+      Read-DeltaNginxInstallConfirmation - both share the same
+      Read-DeltaYesNoConfirmation frame (lib\DeltaInstaller.Common.ps1).
     #>
 
-    Write-Host ''
-    Write-Host ('-' * $Script:BannerWidth)
-    Write-Host ''
-    Write-Host 'NGINX configuration validation succeeded.'
-    Write-Host ''
-    Write-Host 'Start NGINX now?'
-    Write-Host ''
-    $choice = Read-Host -Prompt '[y/N]'
-    Write-Host ''
-    Write-Host ('-' * $Script:BannerWidth)
-
-    return ($choice.Trim() -in @('Y', 'y'))
+    return Read-DeltaYesNoConfirmation -Body {
+        Write-Host 'NGINX configuration validation succeeded.'
+        Write-Host ''
+        Write-Host 'Start NGINX now?'
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -2070,28 +1840,22 @@ function Read-DeltaNginxForceStopConfirmation {
       silently perform this action"), it is never run without the
       administrator explicitly confirming it first. Bare Enter (or
       anything other than Y/y) defaults to No, the same convention as
-      every other confirmation in this script.
+      every other confirmation in this script - Read-DeltaYesNoConfirmation
+      (lib\DeltaInstaller.Common.ps1) provides that shared frame.
     #>
     param([Parameter(Mandatory)][array]$Targets)
 
-    Write-Host ''
-    Write-Host ('-' * $Script:BannerWidth)
-    Write-Host ''
-    Write-Host 'The following managed NGINX process(es) will be forcefully terminated:'
-    Write-Host ''
-    foreach ($targetProcess in $Targets) {
-        Write-Detail "PID $($targetProcess.Id)"
+    return Read-DeltaYesNoConfirmation -Body {
+        Write-Host 'The following managed NGINX process(es) will be forcefully terminated:'
+        Write-Host ''
+        foreach ($targetProcess in $Targets) {
+            Write-Detail "PID $($targetProcess.Id)"
+        }
+        Write-Host ''
+        Write-Host 'This is not a graceful shutdown and may drop active connections.' -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host 'Continue?'
     }
-    Write-Host ''
-    Write-Host 'This is not a graceful shutdown and may drop active connections.' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host 'Continue?'
-    Write-Host ''
-    $choice = Read-Host -Prompt '[y/N]'
-    Write-Host ''
-    Write-Host ('-' * $Script:BannerWidth)
-
-    return ($choice.Trim() -in @('Y', 'y'))
 }
 
 function Invoke-DeltaNginxForceStop {
