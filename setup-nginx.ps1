@@ -26,17 +26,26 @@
     Once a DELTA installation has been confirmed, the next thing this
     script does - before installing anything, before writing a single
     configuration file - is check whether C:\nginx\nginx.exe already
-    exists. If it does, the script stops
-    immediately (Show-ExistingNginxNotice) and touches nothing at all: no
-    file is written, no backup is made, no signal is sent to whatever may
-    already be running. This installer must never assume it owns an
-    existing NGINX installation - a real, hand-configured, already-running
-    reverse proxy at this exact default path is a realistic thing to find
-    on a real machine, not a hypothetical edge case, and overwriting it
-    would be a production incident, not a convenience.
+    exists. If it does, the script hands off to an interactive management
+    menu (Show-DeltaNginxManagementMenu) instead of installing or
+    reconfiguring anything - nothing here ever touches nginx.conf/
+    delta.conf or installs anything, and the options offered depend on
+    Get-DeltaNginxRuntimeState (see the "Runtime state" section below):
+    Validate/Reload/Restart/Stop/Exit when actually Running, just Start/
+    Exit when cleanly Stopped, and a specific explanation plus Force Stop/
+    Exit when Broken (an inconsistency between the pid file and the
+    process list - see that section's own header for why this exists and
+    what it protects against). This installer must never assume it owns
+    an existing NGINX installation - a real, hand-configured,
+    already-running reverse proxy at this exact default path is a
+    realistic thing to find on a real machine, not a hypothetical edge
+    case, and overwriting it would be a production incident, not a
+    convenience.
 
     Only once that check has passed (no existing installation found) does
-    it proceed, in five phases:
+    it ask for one more explicit confirmation - Read-DeltaNginxInstallConfirmation,
+    a Y/N prompt (default No) naming the version to be installed and the
+    installation directory - before proceeding, in seven phases:
 
       1. Install-Nginx - installs the one pinned version, $Script:NginxVersion
          (see the Configuration section below), from a local
@@ -48,17 +57,44 @@
          ship that directory itself.
 
       2. Install-DeltaSslCertificate - the SSL Certificate Wizard (see
-         docs\todo\TODO-setup-nginx-enhancements.md, Phase 2). Asks the
-         administrator whether an SSL certificate already exists and, if
-         so, walks them through selecting it (and its private key) via
-         standard Windows file selection dialogs, validates both, and
-         copies them into C:\nginx\certs\ as delta.crt/delta.key. Answering
-         "No" is a complete no-op. Deliberately narrow in scope for now -
-         see that function's own header for what later phases (HTTP/HTTPS
-         template selection, automatic PORT detection, existing-certificate
-         overwrite handling) still own instead.
+         docs\todo\TODO-setup-nginx-enhancements.md, Phase 2), now also
+         covering Existing Certificate Handling (Phase 6). If
+         C:\nginx\certs\delta.crt and delta.key are BOTH already present,
+         asks the administrator to Replace, Keep, or Cancel instead of the
+         original "do you already have one?" question - Replace and the
+         original "Yes" both hand off to the same Install-DeltaSslCertificateFiles
+         (selects the certificate and private key via standard Windows
+         file selection dialogs, validates both, copies them into
+         C:\nginx\certs\), Keep leaves the existing files untouched but
+         still configures HTTPS, and Cancel exits immediately (`exit 0`,
+         bypassing this try/catch entirely) with nothing written or
+         started. Either a fresh install or a kept existing certificate
+         sets $Script:SslCertificateConfigured to $true. Answering "No" (no
+         certificate at all, existing or new) is a complete no-op.
 
-      3. New-DeltaNginxConfiguration - writes C:\nginx\conf\nginx.conf and
+      3. Resolve-DeltaBackendPort - Automatic DELTA Backend Port Detection
+         (docs\todo\TODO-setup-nginx-enhancements.md, Phase 4). Reads PORT
+         from the resolved DELTA installation's own .env file
+         ($Script:DeltaEnvPath) via the shared Get-EnvFileValue helper
+         (lib\DeltaInstaller.Common.ps1), falling back to
+         $Script:DefaultDeltaBackendPort (3000) when PORT isn't set at
+         all - but stopping the installer outright if PORT is present and
+         not a valid TCP port number, rather than silently falling back.
+         Sets $Script:DeltaBackendPort, consumed by a later phase.
+
+      4. Resolve-DeltaWebsiteDomain (lib\DeltaInstaller.Common.ps1) -
+         Website Domain Configuration (docs\todo\TODO-setup-nginx-
+         enhancements.md, Phase 5). Prompts for the public hostname the
+         generated virtual host should answer to, defaulting to
+         "localhost" on a bare Enter, re-prompting (with the specific
+         reason) on anything Test-DeltaWebsiteDomain rejects - a scheme, a
+         port, a path, a space, a wildcard, or a string that isn't a valid
+         DNS hostname. Deliberately implemented in the shared lib file,
+         not this script, since it has no NGINX-specific knowledge at all
+         - see that function's own header. Sets $Script:DeltaWebsiteDomain,
+         consumed by the next phase.
+
+      5. New-DeltaNginxConfiguration - writes C:\nginx\conf\nginx.conf and
          C:\nginx\conf\conf.d\delta.conf from the canonical templates in
          templates\nginx\ (this repository), rather than generating either
          file line-by-line from PowerShell. This deliberately replaces the
@@ -66,25 +102,41 @@
          in conf\nginx.conf with a minimal, DELTA-specific file. No backup
          step here - by the time this runs, the existing-installation check
          above has already guaranteed there is nothing pre-existing worth
-         protecting. Still always the plain HTTP template regardless of
-         whether phase 2 just installed a certificate - wiring SSL into the
-         generated configuration is a later phase, not this one.
+         protecting. Automatically picks the DELTA virtual host template -
+         templates\nginx\delta-https.conf if phase 2 just installed a
+         certificate, templates\nginx\delta-http.conf otherwise (see
+         docs\todo\TODO-setup-nginx-enhancements.md, Phase 3) - the
+         administrator never selects a template manually. Bakes
+         $Script:DeltaBackendPort and $Script:DeltaWebsiteDomain into that
+         template's proxy_pass/server_name directives as it writes it out.
 
-      4. Test-DeltaNginxConfiguration - runs `nginx -t` against the
+      6. Test-DeltaNginxConfiguration - runs `nginx -t` against the
          configuration just written. A validation failure stops the script
-         immediately, before NGINX is ever started.
+         immediately, before NGINX is ever started, and before the
+         administrator is ever asked whether to start it.
 
-      5. Start-DeltaNginx - starts NGINX. On this path it is always a fresh
-         start, never a reload - the existing-installation check above
-         guarantees nothing at $Script:NginxHome was already running.
+      7. Start-DeltaNginx - starts NGINX, but only if the administrator
+         says so: Read-DeltaNginxStartConfirmation (Y/N, default No) is
+         only ever reached once Test-DeltaNginxConfiguration has already
+         succeeded, and answering No skips Start-DeltaNginx entirely
+         (Show-DeltaNginxSummary still runs either way). Whenever it does
+         run, this is always a fresh start, never a reload - the
+         existing-installation check above guarantees nothing at
+         $Script:NginxHome was already running. A running process alone
+         is never reported as success - Test-DeltaNginxStartupHealth
+         (Managed Runtime State, see the "Runtime state" section below)
+         confirms the pid file exists and actually matches the running
+         process, and that every port this configuration should be
+         listening on actually is, before "NGINX started successfully."
+         is ever printed.
 
     Finishes by printing a summary (Show-DeltaNginxSummary).
 
     Re-running this script after it has already installed NGINX once is
     safe in the sense that nothing gets corrupted - but it will simply
-    detect the NGINX it just installed and stop with the same
-    already-installed notice everything else does. This script installs
-    and configures NGINX exactly once; it is not a repeatable reconciler.
+    detect the NGINX it just installed and hand off to the same
+    management menu everything else does. This script installs and
+    configures NGINX exactly once; it is not a repeatable reconciler.
 #>
 
 Set-StrictMode -Version Latest
@@ -106,6 +158,15 @@ $Script:NginxMainConfigPath  = Join-Path -Path $Script:NginxConfDirectory -Child
 $Script:NginxConfDDirectory  = Join-Path -Path $Script:NginxConfDirectory -ChildPath 'conf.d'
 $Script:DeltaVHostConfigPath = Join-Path -Path $Script:NginxConfDDirectory -ChildPath 'delta.conf'
 
+# Managed Runtime State (docs\todo\TODO-setup-nginx-enhancements.md, Phase 7) -
+# the pid file location this installer owns and asserts, rather than trusting
+# nginx's own undocumented compiled-in default to agree with $Script:NginxHome.
+# templates\nginx\nginx.conf pins an explicit `pid logs/nginx.pid;` directive
+# to match this exactly (see that template's own header) - Get-DeltaNginxPidFilePath
+# is the one place this script computes it, so nothing else re-derives it.
+$Script:NginxLogsDirectory = Join-Path -Path $Script:NginxHome -ChildPath 'logs'
+$Script:NginxPidFilePath   = Join-Path -Path $Script:NginxLogsDirectory -ChildPath 'nginx.pid'
+
 # SSL Certificate Wizard (docs\todo\TODO-setup-nginx-enhancements.md, Phase
 # 2) - NGINX's own dedicated certs directory, never the original file
 # locations the administrator selected them from (Install-DeltaSslCertificate
@@ -117,11 +178,24 @@ $Script:NginxCertificateKeyPath = Join-Path -Path $Script:NginxCertsDirectory -C
 $Script:SupportedCertificateExtensions = @('.crt', '.cer', '.pem')
 $Script:SupportedPrivateKeyExtensions  = @('.key', '.pem')
 
-# Set by Install-DeltaSslCertificate only when it actually copies a
-# certificate into place - stays $false on the "No" (no-op) answer, or if
-# that phase is never reached at all. Read by Show-DeltaNginxSummary to
-# decide whether to display the SSL Certificate section at all.
+# Set by Install-DeltaSslCertificate/Install-DeltaSslCertificateFiles
+# whenever HTTPS should be configured - a certificate was either just
+# copied into place, or an already-existing one (Phase 6 - Existing
+# Certificate Handling) was explicitly kept. Stays $false on the "No"
+# (no-op) answer, or if that phase is never reached at all. Read by
+# New-DeltaNginxConfiguration to pick the HTTP/HTTPS template and by
+# Show-DeltaNginxSummary to decide whether to display the SSL Certificate
+# section at all.
 $Script:SslCertificateConfigured = $false
+
+# 'New' once Install-DeltaSslCertificateFiles actually copies a
+# certificate into place this run, 'Existing' once the operator chooses
+# to keep an already-present one (Phase 6) instead - $null whenever
+# $Script:SslCertificateConfigured is $false, since there is nothing to
+# attribute a source to. Read only by Show-DeltaNginxSummary, purely for
+# the audit-trail distinction this phase's own requirements call for
+# ("Newly installed" vs "Existing certificate retained").
+$Script:SslCertificateSource = $null
 
 # The one NGINX version this installer ever installs - pinned, not "latest",
 # so a run today and a run next year install byte-for-byte the same NGINX.
@@ -145,12 +219,23 @@ $Script:InstallersDirectory = Join-Path -Path $Script:ProjectRoot -ChildPath 'in
 
 # Canonical configuration templates (this repository) copied into place -
 # see this file's own header for why these are maintained as real, readable
-# files rather than generated via PowerShell string concatenation.
-$Script:NginxMainConfigTemplate  = Join-Path -Path $Script:ProjectRoot -ChildPath 'templates\nginx\nginx.conf'
-$Script:DeltaVHostConfigTemplate = Join-Path -Path $Script:ProjectRoot -ChildPath 'templates\nginx\delta.conf'
+# files rather than generated via PowerShell string concatenation. Two
+# dedicated DELTA virtual host templates, not one with conditional SSL
+# directives (docs\todo\TODO-setup-nginx-enhancements.md, Phase 3) -
+# New-DeltaNginxConfiguration picks exactly one of the two based on
+# $Script:SslCertificateConfigured; both are written to the same
+# destination, $Script:DeltaVHostConfigPath, so nothing downstream needs to
+# know which template produced it.
+$Script:NginxMainConfigTemplate       = Join-Path -Path $Script:ProjectRoot -ChildPath 'templates\nginx\nginx.conf'
+$Script:DeltaHttpVHostConfigTemplate  = Join-Path -Path $Script:ProjectRoot -ChildPath 'templates\nginx\delta-http.conf'
+$Script:DeltaHttpsVHostConfigTemplate = Join-Path -Path $Script:ProjectRoot -ChildPath 'templates\nginx\delta-https.conf'
 
-$Script:DeltaBackendUrl  = 'http://localhost:3000'
-$Script:DeltaFrontendUrl = 'http://localhost'
+# DELTA Backend Port Detection (docs\todo\TODO-setup-nginx-enhancements.md,
+# Phase 4) - the fallback used when the DELTA .env file has no PORT entry
+# at all. Resolve-DeltaBackendPort sets $Script:DeltaBackendPort once it
+# has actually read the DELTA installation's own .env file - never
+# assumed up front the way the backend port used to be hardcoded here.
+$Script:DefaultDeltaBackendPort = 3000
 
 # ---------------------------------------------------------------------------
 # DELTA installation discovery
@@ -202,6 +287,317 @@ Please install DELTA using setup.ps1 before running setup-nginx.ps1.
 }
 
 # ---------------------------------------------------------------------------
+# Port prerequisite check
+# ---------------------------------------------------------------------------
+#
+# Operational safety enhancement (docs\todo\TODO-setup-nginx-enhancements.md,
+# Phase 8). Runs immediately after Resolve-DeltaInstallation and BEFORE the
+# orchestration block's own top-level "does nginx.exe already exist" branch -
+# deliberately in front of BOTH the fresh-install workflow and the existing-
+# installation management menu, not only the former. That placement is what
+# lets this correctly tell "a required port is already owned by THIS
+# installer's own managed NGINX instance" (never a conflict) apart from "a
+# required port is owned by something else entirely" (a genuine, fail-fast
+# prerequisite failure) - a distinction docs\todo's own "Managed NGINX
+# Exception" requirement only matters at all once nginx.exe already exists,
+# which is exactly the branch this section's placement keeps in scope.
+#
+# Nothing about the runtime-state management or the management menu itself
+# (both from the prior phase) is touched here - this is purely an additional
+# gate placed in front of both existing workflows, reusing Get-
+# DeltaNginxVHostSummary/Get-DeltaNginxManagedProcesses/Get-DeltaProcessById
+# rather than a second implementation of any of them.
+
+function Get-DeltaNginxRequiredPorts {
+    <#
+      Determines the ports this run needs to check - deliberately NOT the
+      same thing as Get-DeltaNginxExpectedPorts (Runtime state section,
+      Phase 7's own Startup Validation), which decides based on
+      $Script:SslCertificateConfigured - a flag this run's own SSL wizard
+      sets, and the wizard has not run yet at the point this prerequisite
+      check executes (it runs before installation confirmation, which
+      itself runs before the wizard). Using Get-DeltaNginxVHostSummary
+      instead reflects an EXISTING installation's real, already-generated
+      deployment mode when there is one; a fresh install (no vhost file
+      written yet - the administrator has not even been asked about a
+      certificate) naturally falls back to port 80 alone, the one port
+      required regardless of which mode the not-yet-run SSL wizard ends
+      up choosing. Never assumes HTTPS.
+    #>
+    if ((Get-DeltaNginxVHostSummary).IsHttps) {
+        return ,@(80, 443)
+    }
+    return ,@(80)
+}
+
+function Get-ListeningTcpPortOwner {
+    <#
+      For $Port, returns a [PSCustomObject] describing whoever is bound to
+      it in the LISTEN state - ProcessId, ProcessName, ExecutablePath, and
+      (diagnostic only) ServiceName - or $null if nothing is listening on
+      it at all. Get-NetTCPConnection (the same NetTCPIP-module primitive
+      Test-DeltaNginxPortListening already uses) supplies the owning PID;
+      Get-DeltaProcessById (Runtime state section) resolves the process
+      itself without throwing if it has already exited; the Windows
+      Service Name, if any, is resolved via CIM (Win32_Service) purely for
+      the administrator's own diagnosis - never consulted to decide
+      whether a port is actually free.
+    #>
+    param([Parameter(Mandatory)][int]$Port)
+
+    $connection = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $connection) {
+        return $null
+    }
+
+    $ownerProcessId = $connection.OwningProcess
+    $process        = Get-DeltaProcessById -ProcessId $ownerProcessId
+
+    $executablePath = $null
+    if ($process) {
+        try { $executablePath = $process.Path } catch { $executablePath = $null }
+    }
+
+    $serviceName = $null
+    try {
+        $service = Get-CimInstance -ClassName Win32_Service -Filter "ProcessId = $ownerProcessId" -ErrorAction Stop | Select-Object -First 1
+        if ($service) { $serviceName = $service.Name }
+    }
+    catch {
+        $serviceName = $null
+    }
+
+    return [PSCustomObject]@{
+        Port           = $Port
+        ProcessId      = $ownerProcessId
+        ProcessName    = if ($process) { $process.ProcessName } else { $null }
+        ExecutablePath = $executablePath
+        ServiceName    = $serviceName
+    }
+}
+
+function Test-RequiredPortAvailability {
+    <#
+      Reports whether $Port is safe to proceed with for this run - a
+      [PSCustomObject] with Port, Available, and Owner (the
+      Get-ListeningTcpPortOwner result, $null when the port is genuinely
+      free - diagnostic only, never itself consulted below beyond the
+      executable-path comparison). Available is $true when the port is
+      free OR already owned by THIS installer's own managed NGINX
+      instance - matched by exact executable path against
+      $Script:NginxExePath, the same standard Test-DeltaManagedNginx and
+      Get-DeltaNginxManagedProcesses already hold throughout the Runtime
+      state section, never a process-name-only check. Anything else
+      owning the port is a genuine conflict.
+    #>
+    param([Parameter(Mandatory)][int]$Port)
+
+    $owner = Get-ListeningTcpPortOwner -Port $Port
+    if (-not $owner) {
+        return [PSCustomObject]@{ Port = $Port; Available = $true; Owner = $null }
+    }
+
+    if ($owner.ExecutablePath -and ($owner.ExecutablePath -eq $Script:NginxExePath)) {
+        return [PSCustomObject]@{ Port = $Port; Available = $true; Owner = $owner }
+    }
+
+    return [PSCustomObject]@{ Port = $Port; Available = $false; Owner = $owner }
+}
+
+function Show-DeltaNginxPortConflictNotice {
+    <#
+      Conflict Handling (docs\todo\...) - the entire response to a
+      required port already being owned by something other than this
+      installer's own managed NGINX instance. A genuine prerequisite
+      FAILURE, not the "administrator declined"/"nothing to do" shape
+      every other clean-exit notice in this script uses (those all exit
+      0) - this exits 1, while still using its own dedicated, calm notice
+      here rather than the generic red try/catch failure banner, exactly
+      matching this feature's own specified output. Reached before
+      installation confirmation, before anything is downloaded,
+      extracted, or configured, and before the existing-installation
+      management menu ever runs either - "No changes have been made." is
+      always accurate here.
+    #>
+    param([Parameter(Mandatory)]$PortCheck)
+
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+    Write-Host ''
+    Write-Host 'Prerequisite Check'
+    Write-Host ''
+    Write-Host 'Port'
+    Write-Host ''
+    Write-Detail "$($PortCheck.Port)"
+    Write-Host ''
+    Write-Host 'Status'
+    Write-Host ''
+    Write-Detail 'In Use'
+    Write-Host ''
+    Write-Host 'Process'
+    Write-Host ''
+    Write-Detail $(if ($PortCheck.Owner.ProcessName) { $PortCheck.Owner.ProcessName } else { 'Unknown' })
+    Write-Host ''
+    Write-Host 'PID'
+    Write-Host ''
+    Write-Detail "$($PortCheck.Owner.ProcessId)"
+    Write-Host ''
+    Write-Host 'Executable'
+    Write-Host ''
+    Write-Detail $(if ($PortCheck.Owner.ExecutablePath) { $PortCheck.Owner.ExecutablePath } else { 'Unknown' })
+    if ($PortCheck.Owner.ServiceName) {
+        Write-Host ''
+        Write-Host 'Service'
+        Write-Host ''
+        Write-Detail $PortCheck.Owner.ServiceName
+    }
+    Write-Host ''
+    Write-Host 'NGINX requires exclusive access to this port.'
+    Write-Host ''
+    Write-Host 'Stop the application using this port and rerun setup-nginx.ps1.'
+    Write-Host ''
+    Write-Host 'No changes have been made.'
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+    Write-Host ''
+}
+
+function Show-DeltaNginxPortsAvailableNotice {
+    <#
+      Available Ports (docs\todo\...) - the happy-path banner, shown only
+      on the fresh-install side of Test-DeltaNginxPortPrerequisites (see
+      that function's own header for why): an already-existing managed
+      installation continues silently into Show-DeltaNginxManagementMenu
+      exactly as before, since that screen already conveys its own
+      Status and this feature is not meant to add noise ahead of it.
+    #>
+    param([Parameter(Mandatory)][array]$RequiredPorts)
+
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+    Write-Host ''
+    Write-Host 'Prerequisite Check'
+    Write-Host ''
+    foreach ($port in $RequiredPorts) {
+        Write-Host "Port $port"
+        Write-Host ''
+        Write-Detail 'Available'
+        Write-Host ''
+    }
+    Write-Host ('-' * $Script:BannerWidth)
+}
+
+function Test-DeltaNginxPortPrerequisites {
+    <#
+      The orchestrator for this whole section - see the section header
+      above for the full placement rationale. Determines the required
+      ports (Get-DeltaNginxRequiredPorts), checks each one
+      (Test-RequiredPortAvailability), and:
+
+        - Exits (1) immediately on the first genuine conflict found
+          (Show-DeltaNginxPortConflictNotice) - before installation
+          confirmation, before anything is downloaded, extracted, or
+          configured, and before the existing-installation management
+          menu ever runs.
+        - Otherwise, prints the "Available" success banner
+          (Show-DeltaNginxPortsAvailableNotice) ONLY when nginx.exe does
+          not yet exist (the fresh-install path) - an existing managed
+          installation proceeds straight into
+          Show-DeltaNginxManagementMenu without it, unchanged from the
+          prior UX pass.
+    #>
+
+    Write-Step 'Checking required NGINX ports...'
+
+    $requiredPorts = Get-DeltaNginxRequiredPorts
+    $results       = @(foreach ($port in $requiredPorts) { Test-RequiredPortAvailability -Port $port })
+
+    $conflict = $results | Where-Object { -not $_.Available } | Select-Object -First 1
+    if ($conflict) {
+        Show-DeltaNginxPortConflictNotice -PortCheck $conflict
+        exit 1
+    }
+
+    if (-not (Test-Path -LiteralPath $Script:NginxExePath)) {
+        Show-DeltaNginxPortsAvailableNotice -RequiredPorts $requiredPorts
+    }
+}
+
+# ---------------------------------------------------------------------------
+# DELTA backend port detection
+# ---------------------------------------------------------------------------
+
+function Test-ValidTcpPort {
+    <#
+      Reports whether $Value is a valid TCP port number (1-65535) - not
+      just "parses as an integer", since -1 and 70000 both parse fine but
+      are exactly the invalid examples this phase's own requirements call
+      out by name. [int]::TryParse rather than a regex first: it already
+      rejects non-numeric input (PORT=abc) without this needing its own
+      digits-only pattern, and this only needs the range check on top of
+      that.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+
+    $parsedPort = 0
+    if (-not [int]::TryParse($Value, [ref]$parsedPort)) {
+        return $false
+    }
+    return ($parsedPort -ge 1 -and $parsedPort -le 65535)
+}
+
+function Resolve-DeltaBackendPort {
+    <#
+      Phase 4 (docs\todo\TODO-setup-nginx-enhancements.md, "Automatic
+      DELTA Backend Port Detection"). Reads PORT from the resolved DELTA
+      installation's own .env file ($Script:DeltaEnvPath - built in
+      Resolve-DeltaInstallation from Get-DeltaInstallPath, never a
+      hardcoded C:\DELTA assumption of this script's own) via the shared
+      Get-EnvFileValue helper (lib\DeltaInstaller.Common.ps1), rather than
+      a second, DELTA-nginx-specific .env parser.
+
+      Three outcomes, matching this phase's own requirements exactly:
+        - PORT absent entirely -> $Script:DefaultDeltaBackendPort (3000).
+        - PORT present and a valid TCP port (Test-ValidTcpPort) -> that
+          value, used as-is.
+        - PORT present but NOT a valid TCP port (PORT=abc, PORT=-1,
+          PORT=70000) -> Stop-Setup. Never silently falls back to the
+          default in this case - an administrator who explicitly
+          configured an invalid value needs to fix it themselves, not
+          have this script quietly paper over it and generate a reverse
+          proxy pointed at the wrong port.
+
+      Sets $Script:DeltaBackendPort (consumed by New-DeltaNginxConfiguration
+      and Show-DeltaNginxSummary) - the one place in this script that
+      decides what the backend port actually is.
+    #>
+
+    Write-PhaseBanner 'DELTA Backend Port Detection'
+    Write-Step "Reading PORT from $($Script:DeltaEnvPath)..."
+
+    $rawPort = Get-EnvFileValue -Path $Script:DeltaEnvPath -Key 'PORT'
+
+    if ([string]::IsNullOrWhiteSpace($rawPort)) {
+        $Script:DeltaBackendPort = $Script:DefaultDeltaBackendPort
+        Write-Detail "PORT is not set - using the default DELTA backend port ($($Script:DeltaBackendPort))."
+    }
+    else {
+        if (-not (Test-ValidTcpPort -Value $rawPort)) {
+            Stop-Setup @"
+Invalid PORT value in $($Script:DeltaEnvPath): '$rawPort'
+
+PORT must be a valid TCP port number (1-65535).
+
+Correct the PORT value in the DELTA .env file, then re-run setup-nginx.ps1.
+"@
+        }
+
+        $Script:DeltaBackendPort = [int]$rawPort
+        Write-Success "    Backend port detected: $($Script:DeltaBackendPort)"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Native command output helper
 # ---------------------------------------------------------------------------
 
@@ -225,6 +621,63 @@ function ConvertTo-NativeCommandOutputText {
 
     $lines = @($Output | ForEach-Object { $_.ToString() })
     return ($lines -join [Environment]::NewLine).Trim()
+}
+
+# ---------------------------------------------------------------------------
+# Installation confirmation
+# ---------------------------------------------------------------------------
+
+function Read-DeltaNginxInstallConfirmation {
+    <#
+      Installation Confirmation - the gate before Install-Nginx ever
+      runs for a brand-new install (the existing-NGINX check in the
+      orchestration block, which runs before this, has already
+      confirmed nothing is installed at $Script:NginxExePath yet).
+      Bare Enter (or anything other than Y/y) defaults to No, the same
+      "blank means the safe choice" convention as uninstall.ps1's own
+      "(y/N)" data-directory-deletion prompt - an administrator who
+      presses Enter without reading closely should land on the option
+      that installs nothing, not the one that does.
+    #>
+
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+    Write-Host ''
+    Write-Host "NGINX $($Script:NginxVersion) will be installed."
+    Write-Host ''
+    Write-Host 'Installation Directory'
+    Write-Host ''
+    Write-Detail $Script:NginxHome
+    Write-Host ''
+    Write-Host 'Continue?'
+    Write-Host ''
+    $choice = Read-Host -Prompt '[y/N]'
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+
+    return ($choice.Trim() -in @('Y', 'y'))
+}
+
+function Show-DeltaNginxInstallCancelledNotice {
+    <#
+      The entire response to Read-DeltaNginxInstallConfirmation
+      returning $false - mirrors Show-SslCertificateCancelledNotice's
+      own philosophy of spelling out that nothing was touched, rather
+      than leaving the administrator to wonder whether the script did
+      nothing or just failed silently. Always accurate: reached before
+      Install-Nginx ever runs, so no file has been written and nothing
+      exists at $Script:NginxHome that wasn't already there.
+    #>
+
+    Write-Host ''
+    Write-Host ('=' * $Script:BannerWidth) -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host 'Setup canceled.'
+    Write-Host ''
+    Write-Host 'No changes have been made.'
+    Write-Host ''
+    Write-Host ('=' * $Script:BannerWidth) -ForegroundColor Yellow
+    Write-Host ''
 }
 
 # ---------------------------------------------------------------------------
@@ -345,10 +798,14 @@ function Install-Nginx {
       do either, since there is nothing to reconcile: the pinned
       $Script:NginxVersion is the only version this ever installs.
 
-      Also ensures conf\conf.d\ exists once extraction finishes - the
-      official ZIP distribution does not ship that directory itself, and
+      Also ensures conf\conf.d\ and logs\ exist once extraction finishes -
+      the official ZIP distribution does not ship conf\conf.d\ itself, and
       conf\nginx.conf's `include conf.d/*.conf;` (see
-      templates\nginx\nginx.conf) depends on it being there.
+      templates\nginx\nginx.conf) depends on it being there; logs\ is where
+      that same template's explicit `pid logs/nginx.pid;` directive writes
+      the pid file Get-DeltaNginxRuntimeState depends on, so a missing
+      logs\ directory should be caught here as a clear, immediate error
+      rather than surfacing later as a confusing Startup Validation failure.
     #>
 
     Write-PhaseBanner 'NGINX Installation'
@@ -367,12 +824,14 @@ function Install-Nginx {
     }
 
     Write-Step 'Ensuring required directories exist...'
-    if (-not (Test-Path -LiteralPath $Script:NginxConfDDirectory)) {
-        New-Item -Path $Script:NginxConfDDirectory -ItemType Directory -Force | Out-Null
-        Write-Detail "Created: $($Script:NginxConfDDirectory)"
-    }
-    else {
-        Write-Detail "Already exists: $($Script:NginxConfDDirectory)"
+    foreach ($requiredDirectory in @($Script:NginxConfDDirectory, $Script:NginxLogsDirectory)) {
+        if (-not (Test-Path -LiteralPath $requiredDirectory)) {
+            New-Item -Path $requiredDirectory -ItemType Directory -Force | Out-Null
+            Write-Detail "Created: $requiredDirectory"
+        }
+        else {
+            Write-Detail "Already exists: $requiredDirectory"
+        }
     }
 
     Write-Host ''
@@ -477,47 +936,131 @@ function Test-DeltaSslFileExtension {
     return $AllowedExtensions -contains $extension.ToLowerInvariant()
 }
 
-function Install-DeltaSslCertificate {
+function Test-DeltaSslCertificateFilesExist {
     <#
-      Phase 2 of the enhancements roadmap - docs\todo\
-      TODO-setup-nginx-enhancements.md, "SSL Certificate Wizard". Asks the
-      administrator whether an SSL certificate already exists
-      (Read-SslCertificateChoice) and, if so, walks them through selecting
-      it and its private key via standard Windows file selection dialogs
-      (Select-DeltaSslFile), validates both thoroughly, and copies them
-      into $Script:NginxCertsDirectory as delta.crt/delta.key -
-      $Script:NginxCertificatePath/$Script:NginxCertificateKeyPath, NGINX's
-      own dedicated certs directory, never the original file locations the
-      administrator selected them from.
+      Phase 6 (docs\todo\TODO-setup-nginx-enhancements.md, "Existing
+      Certificate Handling"). Reports whether a certificate is already
+      installed at $Script:NginxCertificatePath/$Script:NginxCertificateKeyPath
+      - and ONLY when BOTH files are present, per this phase's own
+      requirement: a certificate with no matching key (or vice versa)
+      isn't something this installer could actually serve HTTPS with
+      anyway, so a half-present pair is treated exactly like "nothing
+      existing" rather than as a third, special case Install-DeltaSslCertificate
+      would otherwise have to handle.
+    #>
+    return (Test-Path -LiteralPath $Script:NginxCertificatePath) -and (Test-Path -LiteralPath $Script:NginxCertificateKeyPath)
+}
 
-      Answering "No" is a complete no-op: nothing is prompted for, created,
-      or copied, and every script-scoped path variable above stays defined
-      but unused.
+function Read-ExistingSslCertificateChoice {
+    <#
+      Phase 6. Presents the three actions available once
+      Test-DeltaSslCertificateFilesExist has already confirmed a
+      certificate is sitting at the fixed installed location - Replace,
+      Keep, or Cancel. No bare-Enter default (unlike
+      Read-SslCertificateChoice's "[2]") - a decision this consequential
+      (silently keeping vs. silently discarding a possibly-production
+      certificate) is deliberately never made by a stray Enter keypress.
+    #>
 
-      Deliberately narrow in scope - explicitly NOT this phase's job (see
-      the TODO file's later, not-yet-implemented phases):
-        - Choosing between an HTTP or HTTPS NGINX configuration template.
-          New-DeltaNginxConfiguration always writes the plain HTTP
-          template regardless of whether this function just installed a
-          certificate.
-        - Reading the DELTA backend port from .env.
-        - Prompting before overwriting an already-existing delta.crt/
-          delta.key - this always copies over whatever, if anything, is
-          already there.
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+    Write-Host ''
+    Write-Host 'Existing SSL certificate detected.'
+    Write-Host ''
+    Write-Host 'Certificate'
+    Write-Host ''
+    Write-Detail $Script:NginxCertificatePath
+    Write-Host ''
+    Write-Host 'Private Key'
+    Write-Host ''
+    Write-Detail $Script:NginxCertificateKeyPath
+    Write-Host ''
+    Write-Host 'Choose an option:'
+    Write-Host ''
+    Write-Host '1) Replace existing certificate'
+    Write-Host '2) Keep existing certificate'
+    Write-Host '3) Cancel setup'
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+    Write-Host ''
+
+    while ($true) {
+        $choice = Read-Host -Prompt 'Selection'
+
+        switch ($choice.Trim()) {
+            '1' { return 'Replace' }
+            '2' { return 'Keep' }
+            '3' { return 'Cancel' }
+        }
+        Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
+    }
+}
+
+function Show-SslCertificateCancelledNotice {
+    <#
+      Phase 6. The entire response to the operator choosing "Cancel
+      setup" from Read-ExistingSslCertificateChoice - mirrors
+      Show-ExistingNginxNotice's own philosophy of spelling out that this
+      is intentional, expected behavior (not an error this installer
+      stumbled into), so the operator walks away confident nothing was
+      touched rather than wondering whether something went wrong.
+
+      Note this can only be reached after Install-Nginx has already
+      extracted a fresh NGINX to $Script:NginxHome (see the orchestration
+      block below - the top-level existing-NGINX check already refused to
+      proceed at all if that wasn't true) - "no files were modified" here
+      refers to the certificate files and NGINX configuration this phase
+      itself is responsible for, not to undoing that already-completed,
+      unrelated installation step.
+    #>
+
+    Write-Host ''
+    Write-Host ('=' * $Script:BannerWidth) -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host 'Setup canceled.'
+    Write-Host ''
+    Write-Host 'An existing SSL certificate was found and no changes were made to it.'
+    Write-Host ''
+    Write-Host 'Certificate'
+    Write-Host ''
+    Write-Detail $Script:NginxCertificatePath
+    Write-Host ''
+    Write-Host 'Private Key'
+    Write-Host ''
+    Write-Detail $Script:NginxCertificateKeyPath
+    Write-Host ''
+    Write-Host 'NGINX configuration was not written, and NGINX was not started or reloaded.'
+    Write-Host ''
+    Write-Host ('=' * $Script:BannerWidth) -ForegroundColor Yellow
+    Write-Host ''
+}
+
+function Install-DeltaSslCertificateFiles {
+    <#
+      The actual "select a certificate and key, validate both, copy them
+      into place" implementation - Phase 2's original SSL Certificate
+      Wizard body, factored out into its own function so Phase 6's own
+      "Replace existing certificate" choice can invoke the IDENTICAL
+      workflow rather than growing a second, divergent copy of it. Per
+      Phase 6's own requirement ("Reuse the existing helper functions...
+      Avoid duplicating Phase 2 logic... This phase should only determine
+      whether that workflow needs to run"), this is deliberately the ONLY
+      place in this script that selects, validates, or copies SSL
+      certificate files - both Install-DeltaSslCertificate's "Yes, I have
+      a certificate" path (no existing certificate found) and its
+      "Replace existing certificate" path (Phase 6) call straight through
+      here, unconditionally overwriting whatever, if anything, is already
+      at $Script:NginxCertificatePath/$Script:NginxCertificateKeyPath.
+
+      Sets $Script:SslCertificateConfigured = $true and
+      $Script:SslCertificateSource = 'New' on success - Show-DeltaNginxSummary
+      reads both to report "Newly installed" rather than "Existing
+      certificate retained" for whatever this function just did.
 
       Validation failures (missing selection, missing file, unsupported
       extension) all stop the installer outright (Stop-Setup) with a clear
       message, per this feature's own requirement - never a silent skip.
     #>
-
-    Write-PhaseBanner 'SSL Certificate'
-
-    $choice = Read-SslCertificateChoice
-    if ($choice -eq 'No') {
-        Write-Host ''
-        Write-Detail 'No SSL certificate will be configured at this time.'
-        return
-    }
 
     Write-Step 'Selecting the SSL certificate file...'
     $certificatePath = Select-DeltaSslFile -Title 'Select the SSL certificate file' `
@@ -552,6 +1095,7 @@ function Install-DeltaSslCertificate {
     Copy-Item -LiteralPath $privateKeyPath -Destination $Script:NginxCertificateKeyPath -Force
 
     $Script:SslCertificateConfigured = $true
+    $Script:SslCertificateSource     = 'New'
 
     Write-Success '    SSL certificate installed.'
     Write-Host ''
@@ -562,13 +1106,93 @@ function Install-DeltaSslCertificate {
     Write-Detail $Script:NginxCertificateKeyPath
 }
 
+function Install-DeltaSslCertificate {
+    <#
+      SSL Certificate phase - now covers both Phase 2 ("SSL Certificate
+      Wizard") and Phase 6 ("Existing Certificate Handling") from
+      docs\todo\TODO-setup-nginx-enhancements.md. First checks whether a
+      certificate is already sitting at the fixed installed location
+      (Test-DeltaSslCertificateFilesExist) and, if so, branches into the
+      Phase 6 Replace/Keep/Cancel prompt (Read-ExistingSslCertificateChoice)
+      instead of the original Phase 2 "do you already have one?" Yes/No
+      prompt - the answer to "does one already exist" is already known at
+      that point, so there's nothing to ask.
+
+      No existing certificate found: behavior is completely unchanged
+      from Phase 2 - Read-SslCertificateChoice, and "Yes" hands off to
+      Install-DeltaSslCertificateFiles for the actual selection/
+      validation/copy work. Answering "No" is a complete no-op: nothing
+      is prompted for, created, or copied.
+
+      Existing certificate found:
+        - Replace: hands off to the SAME Install-DeltaSslCertificateFiles
+          used by the no-existing-certificate path - see that function's
+          own header for why this is deliberately the only place file
+          selection/validation/copying happens at all.
+        - Keep: no file picker, no overwrite. Sets
+          $Script:SslCertificateConfigured = $true and
+          $Script:SslCertificateSource = 'Existing' directly (the existing
+          files themselves are left completely untouched) so
+          New-DeltaNginxConfiguration still picks the HTTPS template and
+          Show-DeltaNginxSummary reports "Existing certificate retained".
+        - Cancel: Show-SslCertificateCancelledNotice followed by `exit 0`
+          right here, not a return - confirmed directly that `exit` from
+          a nested function call bypasses the orchestration block's own
+          try/catch entirely (the same mechanism the top-level existing-
+          NGINX check already relies on for its own Show-ExistingNginxNotice
+          + exit 0), so this exits cleanly with no failure banner and
+          none of New-DeltaNginxConfiguration/Test-DeltaNginxConfiguration/
+          Start-DeltaNginx/Show-DeltaNginxSummary ever run.
+    #>
+
+    Write-PhaseBanner 'SSL Certificate'
+
+    if (Test-DeltaSslCertificateFilesExist) {
+        $existingChoice = Read-ExistingSslCertificateChoice
+
+        switch ($existingChoice) {
+            'Replace' {
+                Install-DeltaSslCertificateFiles
+                return
+            }
+            'Keep' {
+                $Script:SslCertificateConfigured = $true
+                $Script:SslCertificateSource     = 'Existing'
+
+                Write-Host ''
+                Write-Success '    Existing SSL certificate retained.'
+                Write-Host ''
+                Write-Host 'Certificate:'
+                Write-Detail $Script:NginxCertificatePath
+                Write-Host ''
+                Write-Host 'Private key:'
+                Write-Detail $Script:NginxCertificateKeyPath
+                return
+            }
+            'Cancel' {
+                Show-SslCertificateCancelledNotice
+                exit 0
+            }
+        }
+    }
+
+    $choice = Read-SslCertificateChoice
+    if ($choice -eq 'No') {
+        Write-Host ''
+        Write-Detail 'No SSL certificate will be configured at this time.'
+        return
+    }
+
+    Install-DeltaSslCertificateFiles
+}
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 function Install-NginxConfigFile {
     <#
-      Copies $TemplatePath to $DestinationPath, unconditionally - no
+      Writes $TemplatePath to $DestinationPath, unconditionally - no
       diffing against, or backing up, whatever might already be there. That
       is deliberate, not an oversight: this only ever runs immediately
       after Install-Nginx has just extracted a brand-new NGINX (see the
@@ -579,11 +1203,33 @@ function Install-NginxConfigFile {
       own freshly-extracted stock nginx.conf sample. Backing up a file that
       was never anything but this script's own install artifact would add
       complexity without protecting anything real.
+
+      $Replacements (optional) is an ordered set of literal token ->
+      value substitutions applied to the template's text before it's
+      written out - used by New-DeltaNginxConfiguration to bake the
+      detected backend port (Phase 4) and configured website domain
+      (Phase 5) into the DELTA vhost template's
+      __DELTA_BACKEND_PORT__/__DELTA_ENV_PATH__/__DELTA_SERVER_NAME__
+      placeholders. Omitted (or
+      empty) for templates that need no substitution at all (the main
+      nginx.conf template), in which case this still just copies the file
+      byte-for-byte exactly as before.
+
+      Deliberately NOT Set-Content -Encoding utf8 for the substituted
+      case: confirmed directly that Windows PowerShell 5.1's "utf8"
+      encoding always prepends a UTF-8 byte-order mark, and nginx does
+      not skip it - a BOM-prefixed conf.d\delta.conf fails `nginx -t`
+      outright with "unknown directive" pointing at the file's own first
+      line. [System.IO.File]::WriteAllText with an explicit
+      UTF8Encoding($false) writes the same bytes back out with no BOM at
+      all, which is what every other template here (copied verbatim via
+      Copy-Item, and therefore already BOM-free) also produces.
     #>
     param(
         [Parameter(Mandatory)][string]$TemplatePath,
         [Parameter(Mandatory)][string]$DestinationPath,
-        [Parameter(Mandatory)][string]$Description
+        [Parameter(Mandatory)][string]$Description,
+        [System.Collections.IDictionary]$Replacements
     )
 
     $destinationDirectory = Split-Path -Path $DestinationPath -Parent
@@ -591,24 +1237,62 @@ function Install-NginxConfigFile {
         New-Item -Path $destinationDirectory -ItemType Directory -Force | Out-Null
     }
 
-    Copy-Item -LiteralPath $TemplatePath -Destination $DestinationPath -Force
+    if ($Replacements -and $Replacements.Count -gt 0) {
+        $content = Get-Content -LiteralPath $TemplatePath -Raw
+        foreach ($token in $Replacements.Keys) {
+            $content = $content.Replace($token, [string]$Replacements[$token])
+        }
+        $noBomUtf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($DestinationPath, $content, $noBomUtf8)
+    }
+    else {
+        Copy-Item -LiteralPath $TemplatePath -Destination $DestinationPath -Force
+    }
+
     Write-Success "    $Description written: $DestinationPath"
 }
 
 function New-DeltaNginxConfiguration {
     <#
-      Phase 2. Writes both canonical configuration files from the templates
-      under templates\nginx\ (this repository) - never generated inline as
-      PowerShell string concatenation, so they stay readable and
-      version-controlled on their own. See this script's own header for why
-      conf\nginx.conf itself is replaced outright rather than left as
-      NGINX's own heavily-commented sample file, and why no backup step is
-      needed here (Install-NginxConfigFile).
+      Phase 3 (docs\todo\TODO-setup-nginx-enhancements.md, "Separate HTTP
+      and HTTPS Templates"). Writes both canonical configuration files from
+      the templates under templates\nginx\ (this repository) - never
+      generated inline as PowerShell string concatenation, so they stay
+      readable and version-controlled on their own. See this script's own
+      header for why conf\nginx.conf itself is replaced outright rather
+      than left as NGINX's own heavily-commented sample file, and why no
+      backup step is needed here (Install-NginxConfigFile).
+
+      Automatically picks the DELTA virtual host template based on
+      $Script:SslCertificateConfigured (set by Install-DeltaSslCertificate,
+      which always runs before this) - $Script:DeltaHttpsVHostConfigTemplate
+      if a certificate was actually installed, $Script:DeltaHttpVHostConfigTemplate
+      otherwise. The administrator never chooses a template manually: this
+      is the one place that decision gets made, driven entirely by whether
+      Phase 2 actually installed a certificate. Both templates write to the
+      exact same destination, $Script:DeltaVHostConfigPath - nothing
+      downstream (Test-DeltaNginxConfiguration, Start-DeltaNginx) needs to
+      know or care which one produced it.
+
+      Bakes the Phase 4 backend port detection (Resolve-DeltaBackendPort)
+      and the Phase 5 website domain (Resolve-DeltaWebsiteDomain,
+      lib\DeltaInstaller.Common.ps1) - both of which must already have set
+      $Script:DeltaBackendPort/$Script:DeltaWebsiteDomain by the time this
+      runs - into the vhost template via $vHostReplacements. The
+      template's own __DELTA_BACKEND_PORT__/__DELTA_ENV_PATH__/
+      __DELTA_SERVER_NAME__ tokens are the only things that differ between
+      two runs against the same template, so nothing else here needs to
+      change to keep proxy_pass and server_name in sync with the DELTA
+      installation's actual runtime configuration and the administrator's
+      chosen public hostname.
     #>
 
     Write-PhaseBanner 'NGINX Configuration'
 
-    foreach ($template in @($Script:NginxMainConfigTemplate, $Script:DeltaVHostConfigTemplate)) {
+    $deltaVHostTemplate = if ($Script:SslCertificateConfigured) { $Script:DeltaHttpsVHostConfigTemplate } else { $Script:DeltaHttpVHostConfigTemplate }
+    $deltaVHostMode     = if ($Script:SslCertificateConfigured) { 'HTTPS' } else { 'HTTP' }
+
+    foreach ($template in @($Script:NginxMainConfigTemplate, $deltaVHostTemplate)) {
         if (-not (Test-Path -LiteralPath $template)) {
             Stop-Setup "Required configuration template not found: $template"
         }
@@ -617,8 +1301,14 @@ function New-DeltaNginxConfiguration {
     Write-Step 'Writing main NGINX configuration...'
     Install-NginxConfigFile -TemplatePath $Script:NginxMainConfigTemplate -DestinationPath $Script:NginxMainConfigPath -Description 'Main configuration'
 
-    Write-Step 'Writing DELTA reverse proxy configuration...'
-    Install-NginxConfigFile -TemplatePath $Script:DeltaVHostConfigTemplate -DestinationPath $Script:DeltaVHostConfigPath -Description 'DELTA virtual host configuration'
+    $vHostReplacements = @{
+        '__DELTA_BACKEND_PORT__' = $Script:DeltaBackendPort
+        '__DELTA_ENV_PATH__'     = $Script:DeltaEnvPath
+        '__DELTA_SERVER_NAME__'  = $Script:DeltaWebsiteDomain
+    }
+
+    Write-Step "Writing DELTA reverse proxy configuration ($deltaVHostMode)..."
+    Install-NginxConfigFile -TemplatePath $deltaVHostTemplate -DestinationPath $Script:DeltaVHostConfigPath -Description "DELTA virtual host configuration ($deltaVHostMode)" -Replacements $vHostReplacements
 }
 
 # ---------------------------------------------------------------------------
@@ -634,10 +1324,34 @@ function Test-DeltaNginxConfiguration {
       invoked from. A non-zero exit stops the script immediately, before
       Start-DeltaNginx ever runs - an already-running NGINX is deliberately
       never touched by a configuration that fails to validate.
+
+      Confirmed directly against a real installation while building the
+      Managed Runtime State redesign: on this Windows build, `nginx -t`
+      creates an empty pid file as a side effect whenever no managed
+      process is currently running - even though it only ever tests the
+      configuration and never actually becomes a running master. Left in
+      place, that stray file would make Get-DeltaNginxRuntimeState report
+      a false 'Broken' verdict immediately after a routine validation this
+      call itself just confirmed was fine - on the fresh-install path,
+      every single install (New-DeltaNginxConfiguration always runs this
+      right before Start-DeltaNginx) and on the "Validate configuration"
+      management menu action alike. Snapshotting the runtime state before
+      the `nginx -t` call and cleaning up ONLY the exact side effect this
+      call itself just caused (never a pid file/process inconsistency that
+      already existed beforehand - that is left for the administrator, per
+      this redesign's own "never silently repair" principle) is what
+      keeps this call side-effect-free from Get-DeltaNginxRuntimeState's
+      point of view. Confirmed separately that an ALREADY-running
+      instance's own valid pid file is untouched by this - nginx -t does
+      not overwrite a pid file already held by a live master, so the
+      cleanup guard below (requiring zero managed processes) never
+      triggers in that case regardless.
     #>
 
     Write-PhaseBanner 'NGINX Configuration Validation'
     Write-Step 'Validating configuration (nginx -t)...'
+
+    $stateBeforeTest = Get-DeltaNginxRuntimeState
 
     $previousEap = $ErrorActionPreference
     try {
@@ -654,6 +1368,13 @@ function Test-DeltaNginxConfiguration {
         $ErrorActionPreference = $previousEap
     }
 
+    if ($stateBeforeTest.State -eq 'Stopped') {
+        $stateAfterTest = Get-DeltaNginxRuntimeState
+        if ($stateAfterTest.State -eq 'Broken' -and $stateAfterTest.ManagedProcesses.Count -eq 0) {
+            Remove-Item -LiteralPath (Get-DeltaNginxPidFilePath) -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     $outputText = ConvertTo-NativeCommandOutputText -Output $output
 
     if ($exitCode -ne 0) {
@@ -666,40 +1387,405 @@ function Test-DeltaNginxConfiguration {
     Write-Success '    Configuration is valid.'
 }
 
+function Read-DeltaNginxStartConfirmation {
+    <#
+      Configuration Validation Before Startup - only ever reached after
+      Test-DeltaNginxConfiguration has already succeeded: a validation
+      failure calls Stop-Setup, which throws out to the orchestration
+      block's own try/catch before this function is ever called, so
+      there is no path where NGINX fails validation and this still asks
+      whether to start it. Bare Enter (or anything other than Y/y)
+      defaults to No, the same convention as
+      Read-DeltaNginxInstallConfirmation.
+    #>
+
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+    Write-Host ''
+    Write-Host 'NGINX configuration validation succeeded.'
+    Write-Host ''
+    Write-Host 'Start NGINX now?'
+    Write-Host ''
+    $choice = Read-Host -Prompt '[y/N]'
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+
+    return ($choice.Trim() -in @('Y', 'y'))
+}
+
+# ---------------------------------------------------------------------------
+# Runtime state
+# ---------------------------------------------------------------------------
+#
+# Phase 7 (docs\todo\TODO-setup-nginx-enhancements.md, "Managed Runtime
+# State"). A prior investigation into a "Status: Running, but Stop fails
+# with CreateFile() nginx.pid failed" report found the root cause: this
+# script used to treat "a process named nginx.exe exists at this path" as
+# proof of a healthy, controllable instance, while nginx.exe's own `-s
+# <signal>` mechanism on Windows has no relationship to Get-Process
+# whatsoever - it locates its target exclusively by reading the pid file.
+# Those are two independent facts that can disagree (an externally deleted
+# pid file, an incomplete prior shutdown, an instance started outside this
+# script's control, etc.), and the old code had no way to notice.
+#
+# This section makes the pid file the primary source of truth, exactly
+# the way nginx itself decides who its master process is - process
+# enumeration (Get-DeltaNginxManagedProcesses) is used only to (a) tell a
+# genuinely clean Stopped state apart from a stale pid file with nothing
+# actually running, and (b) supply the Force Stop recovery action's
+# target. It is never used, by itself, to decide "Running".
+
+function Get-DeltaNginxPidFilePath {
+    <#
+      The one place this script computes the expected pid file location -
+      $Script:NginxPidFilePath, matching the explicit `pid logs/nginx.pid;`
+      directive Phase 7 pinned into templates\nginx\nginx.conf (see that
+      template's own header) rather than nginx's undocumented compiled-in
+      default.
+    #>
+    return $Script:NginxPidFilePath
+}
+
+function Read-DeltaNginxPid {
+    <#
+      Reads and parses the pid file, returning the parsed process ID as
+      an [int], or $null if the file is missing, unreadable, or its
+      content isn't a valid integer - never throws, since
+      Get-DeltaNginxRuntimeState needs to treat every one of those as
+      just another data point toward a Broken verdict, not a terminating
+      error.
+    #>
+    $pidFilePath = Get-DeltaNginxPidFilePath
+    if (-not (Test-Path -LiteralPath $pidFilePath)) {
+        return $null
+    }
+
+    try {
+        $rawPid = (Get-Content -LiteralPath $pidFilePath -Raw -ErrorAction Stop).Trim()
+    }
+    catch {
+        return $null
+    }
+
+    $parsedPid = 0
+    if (-not [int]::TryParse($rawPid, [ref]$parsedPid)) {
+        return $null
+    }
+
+    return $parsedPid
+}
+
+function Get-DeltaProcessById {
+    <#
+      A safe Get-Process -Id wrapper that returns $null instead of
+      throwing for any invalid, negative, or nonexistent ID - needed
+      because every PID handled in this section ultimately comes from a
+      pid file this script does not control the contents of. A corrupted
+      file could contain anything, including a negative number, which
+      Get-Process's own parameter validation rejects as a terminating
+      error regardless of -ErrorAction - exactly the kind of crash this
+      redesign's own "never silently repair, but never crash on a
+      corrupt/inconsistent state either" goal rules out.
+    #>
+    param([Parameter(Mandatory)][int]$ProcessId)
+
+    try {
+        return Get-Process -Id $ProcessId -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-DeltaManagedNginx {
+    <#
+      Validates that $ProcessId is a live process whose executable path
+      is $Script:NginxExePath - never a process-name-only check. A PID
+      can be silently reused by a completely unrelated program once the
+      original process exits, so "some process with this ID exists" is
+      not the same claim as "NGINX's own managed process is still
+      alive" - this is the one check that turns a pid file's mere
+      existence into an actual, verified claim about a specific live
+      process.
+    #>
+    param([Parameter(Mandatory)][int]$ProcessId)
+
+    $process = Get-DeltaProcessById -ProcessId $ProcessId
+    if (-not $process) {
+        return $false
+    }
+
+    try {
+        return [bool]($process.Path -and ($process.Path -eq $Script:NginxExePath))
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-DeltaNginxManagedProcesses {
+    <#
+      Raw enumeration only - every nginx.exe process actually running
+      FROM $Script:NginxExePath, matched by executable path, never by
+      process name alone (a machine can easily run a separate, unrelated
+      NGINX instance from a different directory, and a name-only match
+      would falsely attribute it to this installation). Returns ALL
+      matches (master AND every worker share this same path on Windows),
+      not just one - Invoke-DeltaNginxForceStop needs the complete set to
+      terminate, and Get-DeltaNginxRuntimeState needs it to tell a clean
+      Stopped state apart from a Broken one.
+
+      Deliberately never used by itself to decide "is NGINX running" -
+      that is the pid file's job. This is strictly a validation/
+      enumeration primitive: process enumeration only ever validates or
+      recovers here, it never originates the runtime state verdict.
+    #>
+    # The leading comma is load-bearing, not decorative - PowerShell
+    # unwraps a 0- or 1-element array crossing a `return` boundary back
+    # into $null/a bare scalar regardless of the @() wrapper, and every
+    # caller here depends on always getting a real array back (an empty
+    # match set must stay a genuine empty array, never $null, or a
+    # caller's own ".Count" throws under Set-StrictMode).
+    return ,@(Get-Process -Name 'nginx' -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.Path -and ($_.Path -eq $Script:NginxExePath) } catch { $false }
+    })
+}
+
+function Get-DeltaNginxRuntimeState {
+    <#
+      The one function everything else in this script (the management
+      menu, Start-DeltaNginx, Invoke-DeltaNginxReload/Stop/Restart) calls
+      to decide what state NGINX is actually in. Returns a
+      [PSCustomObject]:
+
+        State             - 'NotInstalled' | 'Stopped' | 'Running' | 'Broken'
+        Reason            - a specific, human-readable explanation, set
+                             only when State is 'Broken'
+        ProcessId         - the PID read from the pid file, if any
+                             (whether or not it turned out to be valid)
+        ManagedProcesses  - every nginx.exe process actually running from
+                             $Script:NginxExePath (Get-DeltaNginxManagedProcesses)
+                             - may be empty
+
+      NotInstalled: nginx.exe itself does not exist.
+
+      Stopped: nginx.exe exists, there is no pid file, AND no managed
+      process is running - a genuinely clean state, not merely "no
+      process right now" (see Broken below for why that distinction
+      matters).
+
+      Running: the pid file exists, parses to a real process ID, and
+      Test-DeltaManagedNginx confirms that ID is a live process whose
+      executable path matches $Script:NginxExePath. This is the ONLY
+      path to "Running" - a process existing is never sufficient by
+      itself.
+
+      Broken: everything else - a stale pid file left behind with
+      nothing actually running, a process running with no pid file at
+      all (the exact bug this phase was written to catch), a pid file
+      whose PID has been silently reused by an unrelated program, etc.
+      Never silently normalized to Stopped or Running - always reported
+      with a specific Reason instead.
+    #>
+
+    if (-not (Test-Path -LiteralPath $Script:NginxExePath)) {
+        return [PSCustomObject]@{
+            State            = 'NotInstalled'
+            Reason           = $null
+            ProcessId        = $null
+            ManagedProcesses = @()
+        }
+    }
+
+    $managedProcesses = Get-DeltaNginxManagedProcesses
+    $pidFilePath      = Get-DeltaNginxPidFilePath
+    $pidFileExists    = Test-Path -LiteralPath $pidFilePath
+    $parsedPid        = if ($pidFileExists) { Read-DeltaNginxPid } else { $null }
+
+    if (-not $pidFileExists -and $managedProcesses.Count -eq 0) {
+        return [PSCustomObject]@{
+            State            = 'Stopped'
+            Reason           = $null
+            ProcessId        = $null
+            ManagedProcesses = @()
+        }
+    }
+
+    if ($pidFileExists -and $parsedPid -and (Test-DeltaManagedNginx -ProcessId $parsedPid)) {
+        return [PSCustomObject]@{
+            State            = 'Running'
+            Reason           = $null
+            ProcessId        = $parsedPid
+            ManagedProcesses = $managedProcesses
+        }
+    }
+
+    $reason =
+        if (-not $pidFileExists) {
+            "The PID file ($pidFilePath) is missing, but $($managedProcesses.Count) NGINX process(es) are still running from $($Script:NginxExePath)."
+        }
+        elseif (-not $parsedPid) {
+            "The PID file ($pidFilePath) exists but does not contain a valid process ID."
+        }
+        elseif (-not (Get-DeltaProcessById -ProcessId $parsedPid)) {
+            "The PID file ($pidFilePath) references process ID $parsedPid, which is not running."
+        }
+        else {
+            "The PID file ($pidFilePath) references process ID $parsedPid, which belongs to a different executable, not $($Script:NginxExePath)."
+        }
+
+    return [PSCustomObject]@{
+        State            = 'Broken'
+        Reason           = $reason
+        ProcessId        = $parsedPid
+        ManagedProcesses = $managedProcesses
+    }
+}
+
+function Get-DeltaNginxExpectedPorts {
+    <#
+      The TCP ports this configuration's generated vhost should be
+      listening on once NGINX is actually running - port 80 always (the
+      HTTP template's only listener, and the HTTPS template's own
+      redirect-to-443 listener), plus 443 as well whenever a certificate
+      was configured (delta-https.conf's "listen 443 ssl" server block).
+      Read by Test-DeltaNginxStartupHealth's Startup Validation check
+      (docs\todo\TODO-setup-nginx-enhancements.md, Phase 7) - so a start
+      that merely spawns a process without ever successfully binding its
+      configured port(s) is never reported as a success.
+    #>
+    # ,@(...) rather than @(...) - see Get-DeltaNginxManagedProcesses's own
+    # header for why: the single-port HTTP case would otherwise unwrap to
+    # a bare [int] on return, and while every current caller only ever
+    # foreach's this result (which tolerates a bare scalar fine), pinning
+    # the same safe pattern here removes the foot-gun for any future
+    # caller that expects a real array.
+    if ($Script:SslCertificateConfigured) {
+        return ,@(80, 443)
+    }
+    return ,@(80)
+}
+
+function Test-DeltaNginxPortListening {
+    <#
+      Reports whether $Port has a socket in the LISTEN state anywhere on
+      this machine - Get-NetTCPConnection (the NetTCPIP module, present
+      on every Windows Server version this installer targets) rather
+      than a raw TCP connect attempt, since a successful connect from
+      localhost would not by itself confirm NGINX's own bind succeeded -
+      it could just as easily hit an unrelated listener already using
+      that port.
+    #>
+    param([Parameter(Mandatory)][int]$Port)
+
+    return [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+}
+
+function Test-DeltaNginxStartupHealth {
+    <#
+      Startup Validation (docs\todo\TODO-setup-nginx-enhancements.md,
+      Phase 7). After Start-DeltaNginx's fresh-start Start-Process call,
+      ALL of the following must hold before this script is willing to
+      report a successful start: a live process at the managed path, a
+      pid file that exists, that pid file's own PID actually matching
+      that live process (not just "some process is running" - the exact
+      gap the runtime-state redesign closes), and the ports this
+      configuration is actually supposed to be listening on -
+      Get-DeltaNginxRuntimeState's own 'Running' verdict already covers
+      the first three; this adds the fourth.
+
+      Returns every failing check at once (an array of human-readable
+      reasons, empty when everything holds) rather than stopping at the
+      first failure, so a failed start can be explained completely
+      rather than with just its first symptom.
+    #>
+
+    $failures = [System.Collections.Generic.List[string]]::new()
+
+    $state = Get-DeltaNginxRuntimeState
+    if ($state.State -eq 'Broken') {
+        $failures.Add($state.Reason)
+    }
+    elseif ($state.State -ne 'Running') {
+        $failures.Add("No nginx.exe process is running from $($Script:NginxExePath).")
+    }
+
+    foreach ($port in (Get-DeltaNginxExpectedPorts)) {
+        if (-not (Test-DeltaNginxPortListening -Port $port)) {
+            $failures.Add("Port $port is not listening.")
+        }
+    }
+
+    # ,$failures.ToArray() - see Get-DeltaNginxManagedProcesses's own
+    # header for why this matters here specifically: the zero-failure
+    # (successful) case is exactly a 0-element array, and without the
+    # leading comma it would unwrap to $null on return - breaking
+    # Start-DeltaNginx's own "(Test-DeltaNginxStartupHealth).Count -eq 0"
+    # check on precisely the success path this function exists to confirm.
+    return ,$failures.ToArray()
+}
+
 # ---------------------------------------------------------------------------
 # Start / reload
 # ---------------------------------------------------------------------------
 
-function Get-RunningDeltaNginxProcess {
+function Invoke-DeltaNginxSignal {
     <#
-      Finds an nginx.exe process actually running FROM $Script:NginxHome -
-      matched by its executable path, never by process name alone.
-      Get-Process -Name 'nginx' matches every nginx.exe on the machine
-      regardless of which installation it belongs to - confirmed directly
-      to be a real, not theoretical, distinction: a machine can easily run
-      a separate, unrelated NGINX instance from a different directory, and
-      a name-only match against that instance would falsely report this
-      script's own target as "already running" (and then send it a reload
-      signal, or treat a failed start as successful, based on someone
-      else's process). Mirrors Get-RunningDeltaProcesses in setup.ps1,
-      which matches its own node.exe target the same specific way rather
-      than a generic name sweep.
+      Sends an `-s <Signal>` control signal (reload/quit/...) to the
+      NGINX instance at $Script:NginxHome - factored out of
+      Start-DeltaNginx's own reload branch so the Existing Installation
+      management menu's Reload/Stop/Restart actions (below) call the
+      IDENTICAL code path instead of growing a second copy of it, per
+      this script's own "reuse existing helper functions... do not
+      duplicate code" convention.
+
+      Requires Administrator privileges, the same as Start-DeltaNginx's
+      own fresh-start path - both ultimately act on a process bound to
+      port 80, so the same guard applies regardless of which specific
+      action is being performed.
     #>
-    return Get-Process -Name 'nginx' -ErrorAction SilentlyContinue | Where-Object {
-        try { $_.Path -and ($_.Path -eq $Script:NginxExePath) } catch { $false }
-    } | Select-Object -First 1
+    param([Parameter(Mandatory)][string]$Signal)
+
+    if (-not (Test-IsAdministrator)) {
+        Stop-Setup 'Administrator privileges are required to control NGINX. Re-run this script from an elevated PowerShell session.'
+    }
+
+    $previousEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & $Script:NginxExePath '-s' $Signal '-p' $Script:NginxHome '-c' 'conf\nginx.conf' 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousEap
+    }
+
+    if ($exitCode -ne 0) {
+        Stop-Setup "Failed to send '$Signal' to NGINX: $(ConvertTo-NativeCommandOutputText -Output $output)"
+    }
 }
 
 function Start-DeltaNginx {
     <#
-      Phase 4. Starts NGINX. Given the existing-installation check in the
-      orchestration block below, this always takes the fresh-start path in
-      practice - Install-Nginx has just extracted a brand-new NGINX that
-      cannot already be running. The reload branch (`nginx -s reload`,
-      matched via Get-RunningDeltaNginxProcess rather than a name-only
-      Get-Process check - see that function's own header for why) is kept
-      as a defensive fallback rather than removed: harmless if unreachable
-      in the normal flow, and correct if it is ever reached.
+      Phase 7. Starts NGINX, gated on Get-DeltaNginxRuntimeState rather
+      than raw process detection - see this file's own "Runtime state"
+      section header for why that distinction matters. Given the
+      existing-installation check in the orchestration block below, this
+      always takes the fresh-start path in practice on that call -
+      Install-Nginx has just extracted a brand-new NGINX with nothing
+      running and no pid file, i.e. a clean 'Stopped' state. The reload
+      branch (`nginx -s reload`) is kept as a defensive fallback rather
+      than removed: harmless if unreachable in the normal install flow,
+      and correct if it is ever reached - it is also exactly what the
+      Existing Installation management menu's own "Restart NGINX" action
+      falls through to once the process it just stopped is confirmed
+      gone (Invoke-DeltaNginxRestart, below).
+
+      Refuses outright (Stop-Setup) if the runtime state is already
+      'Broken' - starting on top of an inconsistent state (e.g. a stale
+      pid file, or a process running under a mismatched PID) would only
+      compound the confusion; the administrator needs to resolve that via
+      the management menu's Force Stop action first.
 
       Binding to port 80 (this configuration's default) requires
       Administrator privileges on Windows, so that's checked here
@@ -712,37 +1798,43 @@ function Start-DeltaNginx {
         Stop-Setup 'Administrator privileges are required to start or reload NGINX (binding port 80 requires it). Re-run this script from an elevated PowerShell session.'
     }
 
-    $running = Get-RunningDeltaNginxProcess
-    if ($running) {
+    $state = Get-DeltaNginxRuntimeState
+
+    if ($state.State -eq 'Running') {
         Write-Step 'Reloading NGINX configuration...'
-        $previousEap = $ErrorActionPreference
-        try {
-            $ErrorActionPreference = 'Continue'
-            $output = & $Script:NginxExePath '-s' 'reload' '-p' $Script:NginxHome '-c' 'conf\nginx.conf' 2>&1
-            $exitCode = $LASTEXITCODE
-        }
-        finally {
-            $ErrorActionPreference = $previousEap
-        }
-
-        if ($exitCode -ne 0) {
-            Stop-Setup "Failed to reload NGINX: $(ConvertTo-NativeCommandOutputText -Output $output)"
-        }
-
+        Invoke-DeltaNginxSignal -Signal 'reload'
         Write-Success '    NGINX reloaded.'
         return
+    }
+
+    if ($state.State -eq 'Broken') {
+        Stop-Setup @"
+NGINX is in an inconsistent runtime state and cannot be started safely.
+
+$($state.Reason)
+
+Resolve this from the existing-installation management menu (Force Stop Managed Process) before starting NGINX again.
+"@
     }
 
     Write-Step 'Starting NGINX...'
     Start-Process -FilePath $Script:NginxExePath -ArgumentList @('-p', $Script:NginxHome, '-c', 'conf\nginx.conf') `
         -WorkingDirectory $Script:NginxHome -WindowStyle Hidden | Out-Null
 
-    $started = Wait-Until -Condition { Get-RunningDeltaNginxProcess } -TimeoutSeconds 10
-    if (-not $started) {
-        Stop-Setup 'NGINX did not appear to start within 10 seconds.'
+    # Startup Validation (docs\todo\TODO-setup-nginx-enhancements.md, Phase
+    # 7) - a running process alone is never reported as success; all four
+    # checks in Test-DeltaNginxStartupHealth must hold first.
+    $healthy = Wait-Until -Condition { (Test-DeltaNginxStartupHealth).Count -eq 0 } -TimeoutSeconds 10
+    if (-not $healthy) {
+        $failures = Test-DeltaNginxStartupHealth
+        Stop-Setup @"
+NGINX did not start successfully within 10 seconds.
+
+$($failures -join [Environment]::NewLine)
+"@
     }
 
-    Write-Success '    NGINX started.'
+    Write-Success '    NGINX started successfully.'
 }
 
 # ---------------------------------------------------------------------------
@@ -766,12 +1858,17 @@ function Show-DeltaNginxSummary {
 
     Write-Success "    [OK] NGINX $($Script:NginxVersion) installed"
 
-    Write-PhaseBanner 'DELTA Installation'
-    Write-Host 'Location:'
+    Write-PhaseBanner 'Detected DELTA Backend'
+    Write-Host 'Installation:'
     Write-Detail $Script:DeltaInstallPath
     Write-Host ''
-    Write-Host 'Environment File:'
+    Write-Host 'Environment:'
     Write-Detail $Script:DeltaEnvPath
+    Write-Host ''
+    Write-Host 'Backend Port:'
+    Write-Detail "$($Script:DeltaBackendPort)"
+
+    $deltaVHostMode = if ($Script:SslCertificateConfigured) { 'HTTPS' } else { 'HTTP' }
 
     Write-PhaseBanner 'Configuration'
     Write-Host 'NGINX Home:'
@@ -780,28 +1877,17 @@ function Show-DeltaNginxSummary {
     Write-Host 'Main Configuration:'
     Write-Detail $Script:NginxMainConfigPath
     Write-Host ''
-    Write-Host 'DELTA Virtual Host:'
+    Write-Host "DELTA Virtual Host ($deltaVHostMode):"
     Write-Detail $Script:DeltaVHostConfigPath
 
-    if ($Script:SslCertificateConfigured) {
-        Write-PhaseBanner 'SSL Certificate'
-        Write-Host 'Certificate:'
-        Write-Detail $Script:NginxCertificatePath
-        Write-Host ''
-        Write-Host 'Private Key:'
-        Write-Detail $Script:NginxCertificateKeyPath
-        Write-Host ''
-        Write-Host 'Note: HTTPS is not yet wired into the generated NGINX'
-        Write-Host 'configuration - this certificate has only been installed'
-        Write-Host 'for a later step to use.'
-    }
+    Write-PhaseBanner 'Generated NGINX Proxy'
+    Write-Detail "proxy_pass http://localhost:$($Script:DeltaBackendPort);"
 
-    Write-PhaseBanner 'Backend'
-    Write-Host 'DELTA:'
-    Write-Detail $Script:DeltaBackendUrl
+    Write-PhaseBanner 'Public Website'
+    Write-Detail $Script:DeltaWebsiteDomain
 
     Write-PhaseBanner 'Frontend'
-    Write-Detail $Script:DeltaFrontendUrl
+    Write-Detail $(if ($Script:SslCertificateConfigured) { "https://$($Script:DeltaWebsiteDomain)" } else { "http://$($Script:DeltaWebsiteDomain)" })
 
     Write-PhaseBanner 'Useful Commands'
     Write-Detail "(run from $($Script:NginxHome))"
@@ -815,77 +1901,392 @@ function Show-DeltaNginxSummary {
     Write-Host 'nginx -s quit'
     Write-Detail 'Stop NGINX'
 
+    if ($Script:SslCertificateConfigured) {
+        # Phase 6 - clear audit information on whether this run copied a
+        # new certificate into place or reused one already sitting at the
+        # fixed installed location untouched.
+        Write-PhaseBanner 'SSL Certificate'
+        Write-Detail $(if ($Script:SslCertificateSource -eq 'Existing') { 'Existing certificate retained' } else { 'Newly installed' })
+        Write-Host ''
+        Write-Host 'Certificate:'
+        Write-Detail $Script:NginxCertificatePath
+        Write-Host ''
+        Write-Host 'Private Key:'
+        Write-Detail $Script:NginxCertificateKeyPath
+    }
+
     Write-PhaseBanner 'HTTPS'
-    Write-Host 'HTTPS is not enabled by default.'
-    Write-Host ''
-    Write-Host 'A fully documented HTTPS configuration template has been included'
-    Write-Host "inside $(Split-Path -Path $Script:DeltaVHostConfigPath -Leaf)."
+    if ($Script:SslCertificateConfigured) {
+        Write-Host 'HTTPS is enabled.'
+        Write-Host ''
+        Write-Host 'Plain HTTP requests on port 80 are redirected to HTTPS.'
+    }
+    else {
+        Write-Host 'HTTPS is not enabled.'
+        Write-Host ''
+        Write-Host 'No SSL certificate was installed for this deployment.'
+    }
 
     Write-Host ''
     Write-Host ('=' * $Script:BannerWidth)
     Write-Host ''
 }
 
-function Show-ExistingNginxNotice {
+function Get-DeltaNginxVHostSummary {
     <#
-      The entire response to finding NGINX already installed
-      ($Script:NginxExePath already exists) - shown BEFORE Install-Nginx,
-      New-DeltaNginxConfiguration, Test-DeltaNginxConfiguration, or
-      Start-DeltaNginx ever run, so nothing is touched: no file is written,
-      no backup is made, no signal is sent to whatever may already be
-      running there. Per this script's own design philosophy (see its
-      header): installing a fresh copy of NGINX is safe to automate;
-      reconciling configuration on an existing one is not - an
-      already-installed, potentially hand-configured (and possibly live)
-      reverse proxy at this exact default path is a realistic thing to find
-      on a real machine, not just a theoretical caution.
-
-      Deliberately spells out that this is intentional, expected behavior
-      (not an error this installer stumbled into) - an administrator seeing
-      this needs to walk away confident the script did exactly what it was
-      designed to do, not wonder whether something went wrong. Also points
-      at $Script:DeltaVHostConfigTemplate (this repository's own canonical
-      DELTA reverse proxy template - never generated or copied anywhere by
-      this code path) so the administrator has a concrete starting point
-      for adapting their existing configuration, rather than just being
-      told a merge is needed with nothing to merge from.
+      Best-effort read of the already-generated DELTA virtual host
+      ($Script:DeltaVHostConfigPath) for the Existing Installation
+      management menu below - never re-prompts for the website domain
+      or backend port the way a fresh install's own
+      Resolve-DeltaWebsiteDomain/Resolve-DeltaBackendPort do, since an
+      existing installation's configuration is exactly what should be
+      displayed as-is, not re-derived or re-asked for. Returns $null
+      ServerName/BackendUrl when delta.conf is missing or doesn't match
+      either template's expected shape (e.g. an NGINX installation this
+      script never generated a vhost for) rather than throwing - this
+      menu is read-only and must degrade gracefully, not block the
+      administrator from reaching Validate/Reload/Restart/Stop/Exit.
     #>
 
+    $result = [PSCustomObject]@{
+        ServerName = $null
+        BackendUrl = $null
+        IsHttps    = $false
+    }
+
+    if (-not (Test-Path -LiteralPath $Script:DeltaVHostConfigPath)) {
+        return $result
+    }
+
+    $content = Get-Content -LiteralPath $Script:DeltaVHostConfigPath -Raw
+
+    $serverNameMatch = [regex]::Match($content, 'server_name\s+([^\s;]+);')
+    if ($serverNameMatch.Success) {
+        $result.ServerName = $serverNameMatch.Groups[1].Value
+    }
+
+    $portMatch = [regex]::Match($content, 'proxy_pass\s+http://localhost:(\d+);')
+    if ($portMatch.Success) {
+        $result.BackendUrl = "http://localhost:$($portMatch.Groups[1].Value)"
+    }
+
+    $result.IsHttps = [bool]([regex]::Match($content, 'listen\s+443\s+ssl').Success)
+
+    return $result
+}
+
+function Invoke-DeltaNginxReload {
+    <#
+      Existing Installation management menu action 2 ("Reload
+      configuration") - calls straight through to the same
+      Invoke-DeltaNginxSignal helper Start-DeltaNginx's own reload
+      branch uses, rather than a second implementation. Re-checks
+      Get-DeltaNginxRuntimeState itself rather than trusting a
+      snapshot the menu took a moment earlier (state could have
+      changed between the menu displaying it and the administrator's
+      keystroke); reloading anything other than a confirmed-Running
+      instance is meaningless, so this reports that plainly instead of
+      attempting the signal and surfacing nginx.exe's own confusing
+      failure text.
+    #>
+
+    $state = Get-DeltaNginxRuntimeState
+    if ($state.State -ne 'Running') {
+        Write-Host ''
+        Write-Detail 'NGINX is not running - nothing to reload.'
+        return
+    }
+
+    Write-Step 'Reloading NGINX configuration...'
+    Invoke-DeltaNginxSignal -Signal 'reload'
+    Write-Success '    NGINX reloaded.'
+}
+
+function Invoke-DeltaNginxStop {
+    <#
+      Existing Installation management menu action 4 ("Stop NGINX").
+      Sends a graceful `-s quit` (matching the "Stop NGINX" command
+      Show-DeltaNginxSummary's own Useful Commands section already
+      documents) via the shared Invoke-DeltaNginxSignal helper, then
+      polls (Wait-Until) until Get-DeltaNginxRuntimeState confirms a
+      genuinely clean 'Stopped' state - not merely "no process", which
+      would also be true of the exact Broken state (a process gone but
+      the pid file left behind) the runtime-state redesign exists to
+      catch. A timeout that lands on 'Broken' instead of 'Stopped' is
+      reported as exactly that inconsistency, not a generic timeout.
+      A no-op, reported plainly rather than attempting the signal, if
+      nothing is running to begin with.
+    #>
+
+    $state = Get-DeltaNginxRuntimeState
+    if ($state.State -ne 'Running') {
+        Write-Host ''
+        Write-Detail 'NGINX is not running - nothing to stop.'
+        return
+    }
+
+    Write-Step 'Stopping NGINX...'
+    Invoke-DeltaNginxSignal -Signal 'quit'
+
+    $stopped = Wait-Until -Condition { (Get-DeltaNginxRuntimeState).State -eq 'Stopped' } -TimeoutSeconds 10
+    if (-not $stopped) {
+        $finalState = Get-DeltaNginxRuntimeState
+        if ($finalState.State -eq 'Broken') {
+            Stop-Setup "NGINX did not stop cleanly within 10 seconds: $($finalState.Reason)"
+        }
+        Stop-Setup 'NGINX did not stop within 10 seconds.'
+    }
+
+    Write-Success '    NGINX stopped.'
+}
+
+function Invoke-DeltaNginxRestart {
+    <#
+      Existing Installation management menu action 3 ("Restart
+      NGINX"). NGINX has no single built-in "restart" signal, so this
+      composes the other two actions already defined here: stop it if
+      it's currently running (Invoke-DeltaNginxStop, waiting until the
+      runtime state is confirmed 'Stopped'), then hand off to
+      Start-DeltaNginx - which, finding a clean 'Stopped' state at that
+      point, always takes its own fresh-start path rather than this
+      needing to duplicate that Start-Process/Wait-Until logic itself.
+      If NGINX was already stopped, this is simply equivalent to
+      starting it.
+    #>
+
+    if ((Get-DeltaNginxRuntimeState).State -eq 'Running') {
+        Invoke-DeltaNginxStop
+    }
+
+    Start-DeltaNginx
+}
+
+function Read-DeltaNginxForceStopConfirmation {
+    <#
+      The explicit confirmation gate for the Broken-state management
+      menu's "Force Stop Managed Process" recovery action - Force Stop
+      terminates a process without giving NGINX any chance to shut down
+      gracefully, so per this feature's own requirement ("do not
+      silently perform this action"), it is never run without the
+      administrator explicitly confirming it first. Bare Enter (or
+      anything other than Y/y) defaults to No, the same convention as
+      every other confirmation in this script.
+    #>
+    param([Parameter(Mandatory)][array]$Targets)
+
     Write-Host ''
-    Write-Host ('=' * $Script:BannerWidth)
+    Write-Host ('-' * $Script:BannerWidth)
     Write-Host ''
-    Write-Host 'Existing NGINX installation detected.'
+    Write-Host 'The following managed NGINX process(es) will be forcefully terminated:'
     Write-Host ''
-    Write-Host 'setup-nginx.ps1 only installs new NGINX instances.'
-    Write-Host 'Existing installations are intentionally left untouched.'
+    foreach ($targetProcess in $Targets) {
+        Write-Detail "PID $($targetProcess.Id)"
+    }
     Write-Host ''
-    Write-Host 'No changes have been made.'
+    Write-Host 'This is not a graceful shutdown and may drop active connections.' -ForegroundColor Yellow
     Write-Host ''
-    Write-Host 'NGINX Home'
+    Write-Host 'Continue?'
     Write-Host ''
-    Write-Detail $Script:NginxHome
+    $choice = Read-Host -Prompt '[y/N]'
     Write-Host ''
-    Write-Host 'Main Configuration'
-    Write-Host ''
-    Write-Detail $Script:NginxMainConfigPath
-    Write-Host ''
-    Write-Host 'Virtual Hosts'
-    Write-Host ''
-    Write-Detail "$($Script:NginxConfDDirectory)\"
-    Write-Host ''
-    Write-Host 'DELTA Template'
-    Write-Host ''
-    Write-Detail $Script:DeltaVHostConfigTemplate
-    Write-Host ''
-    Write-Host 'Review your existing NGINX configuration and adapt the provided'
-    Write-Host 'DELTA reverse proxy template to your environment.'
-    Write-Host ''
-    Write-Host 'If you intended to install a new NGINX instance,'
-    Write-Host 'run setup-nginx.ps1 on a clean server or after'
-    Write-Host 'removing the existing NGINX installation.'
-    Write-Host ''
-    Write-Host ('=' * $Script:BannerWidth)
-    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+
+    return ($choice.Trim() -in @('Y', 'y'))
+}
+
+function Invoke-DeltaNginxForceStop {
+    <#
+      The Broken-state management menu's "Force Stop Managed Process"
+      recovery action. Terminates ONLY $RuntimeState.ManagedProcesses -
+      every nginx.exe process matched by exact executable path
+      (Get-DeltaNginxManagedProcesses, captured at the moment the
+      Broken verdict was diagnosed) - never a name-only match, and
+      never anything else running on the machine. Deliberately does
+      NOT touch the pid file itself: per this redesign's own "do not
+      silently repair anything" principle, this action's job is exactly
+      what its name says (terminate the process), not to paper over
+      whatever inconsistency caused the Broken verdict in the first
+      place. If that verdict was a stale pid file with nothing actually
+      running (ManagedProcesses empty), there is nothing to terminate,
+      and this reports that rather than pretending to act.
+    #>
+    param([Parameter(Mandatory)]$RuntimeState)
+
+    $targets = @($RuntimeState.ManagedProcesses)
+    if ($targets.Count -eq 0) {
+        Write-Host ''
+        Write-Detail 'No managed NGINX process was found to stop.'
+        return
+    }
+
+    if (-not (Test-IsAdministrator)) {
+        Stop-Setup 'Administrator privileges are required to force-stop NGINX. Re-run this script from an elevated PowerShell session.'
+    }
+
+    if (-not (Read-DeltaNginxForceStopConfirmation -Targets $targets)) {
+        Write-Host ''
+        Write-Detail 'Force stop canceled. No process was terminated.'
+        return
+    }
+
+    Write-Step 'Force-stopping the managed NGINX process(es)...'
+    foreach ($targetProcess in $targets) {
+        Stop-Process -Id $targetProcess.Id -Force -ErrorAction SilentlyContinue
+    }
+
+    $stopped = Wait-Until -Condition { (Get-DeltaNginxManagedProcesses).Count -eq 0 } -TimeoutSeconds 10
+    if (-not $stopped) {
+        Stop-Setup 'NGINX did not stop within 10 seconds after a forced termination attempt.'
+    }
+
+    Write-Success '    Managed NGINX process(es) terminated.'
+}
+
+function Show-DeltaNginxManagementMenu {
+    <#
+      Replaces the old informational-only notice shown when
+      $Script:NginxExePath already exists with an interactive menu
+      driven entirely by Get-DeltaNginxRuntimeState - per this script's
+      own design philosophy (see its header, and the "Runtime state"
+      section above), an existing NGINX installation is still never
+      reconfigured automatically: nothing here writes nginx.conf/
+      delta.conf, installs anything, or runs unless the administrator
+      explicitly selects it, and every action reuses an existing helper
+      rather than duplicating it.
+
+      The options offered change with the runtime state instead of
+      always showing the same five:
+        Running - the full Validate/Reload/Restart/Stop/Exit menu.
+        Stopped - just Start NGINX / Exit; there is nothing to
+                  reload/restart/stop.
+        Broken  - an explanation of exactly what is inconsistent
+                  (Get-DeltaNginxRuntimeState's own Reason) plus Force
+                  Stop Managed Process / Exit - no Start/Reload/Restart
+                  is offered here, since acting on an already-
+                  inconsistent state would only compound the confusion.
+        NotInstalled - a defensive fallback only (nginx.exe cannot
+                  vanish mid-loop in any normal scenario reachable from
+                  the orchestration block, which only calls this
+                  function once it has already confirmed nginx.exe
+                  exists); reports it and exits the menu rather than
+                  looping forever on an impossible state.
+
+      Loops until the administrator chooses Exit (bare Enter also
+      exits - the same "blank means the safe choice" default used
+      everywhere else in this script), re-reading
+      Get-DeltaNginxRuntimeState/Get-DeltaNginxVHostSummary at the top
+      of every iteration so the displayed Status/Public Website/Backend
+      reflect whatever the just-run action actually changed, rather
+      than a stale snapshot from before the menu was first shown.
+
+      A configuration validation failure (the Running menu's option 1)
+      still calls Stop-Setup exactly like the fresh-install path's own
+      Test-DeltaNginxConfiguration does - it throws out to the
+      orchestration block's own top-level try/catch, which is the same
+      error-handling convention this script uses everywhere else.
+    #>
+
+    while ($true) {
+        $state = Get-DeltaNginxRuntimeState
+        $vhost = Get-DeltaNginxVHostSummary
+
+        Write-Host ''
+        Write-Host ('=' * $Script:BannerWidth)
+        Write-Host ''
+        Write-Host 'Existing NGINX installation detected.'
+        Write-Host ''
+        Write-Host 'NGINX Home'
+        Write-Host ''
+        Write-Detail $Script:NginxHome
+        Write-Host ''
+        Write-Host 'Configuration'
+        Write-Host ''
+        Write-Detail $Script:NginxConfDirectory
+        Write-Host ''
+        Write-Host 'Public Website'
+        Write-Host ''
+        if ($vhost.ServerName) {
+            Write-Detail "$(if ($vhost.IsHttps) { 'https' } else { 'http' })://$($vhost.ServerName)"
+        }
+        else {
+            Write-Detail 'Unknown (no DELTA virtual host configuration found)'
+        }
+        Write-Host ''
+        Write-Host 'Backend'
+        Write-Host ''
+        Write-Detail $(if ($vhost.BackendUrl) { $vhost.BackendUrl } else { 'Unknown' })
+        Write-Host ''
+        Write-Host 'Status'
+        Write-Host ''
+        Write-Detail $state.State
+        Write-Host ''
+
+        if ($state.State -eq 'NotInstalled') {
+            Write-Detail 'NGINX no longer appears to be installed at this location.'
+            return
+        }
+
+        if ($state.State -eq 'Broken') {
+            Write-Host 'NGINX appears to be in an inconsistent runtime state.' -ForegroundColor Yellow
+            Write-Host ''
+            Write-Detail $state.Reason
+            Write-Host ''
+        }
+
+        Write-Host ('-' * $Script:BannerWidth)
+        Write-Host ''
+
+        switch ($state.State) {
+            'Running' {
+                Write-Host '1) Validate configuration'
+                Write-Host '2) Reload configuration'
+                Write-Host '3) Restart NGINX'
+                Write-Host '4) Stop NGINX'
+                Write-Host '5) Exit'
+                Write-Host ''
+
+                $choice = Read-Host -Prompt 'Choose an option [5]'
+                if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '5' }
+
+                switch ($choice.Trim()) {
+                    '1' { Test-DeltaNginxConfiguration }
+                    '2' { Invoke-DeltaNginxReload }
+                    '3' { Invoke-DeltaNginxRestart }
+                    '4' { Invoke-DeltaNginxStop }
+                    '5' { return }
+                    default { Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow }
+                }
+            }
+            'Stopped' {
+                Write-Host '1) Start NGINX'
+                Write-Host '2) Exit'
+                Write-Host ''
+
+                $choice = Read-Host -Prompt 'Choose an option [2]'
+                if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '2' }
+
+                switch ($choice.Trim()) {
+                    '1' { Start-DeltaNginx }
+                    '2' { return }
+                    default { Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow }
+                }
+            }
+            'Broken' {
+                Write-Host '1) Force Stop Managed Process'
+                Write-Host '2) Exit'
+                Write-Host ''
+
+                $choice = Read-Host -Prompt 'Choose an option [2]'
+                if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '2' }
+
+                switch ($choice.Trim()) {
+                    '1' { Invoke-DeltaNginxForceStop -RuntimeState $state }
+                    '2' { return }
+                    default { Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow }
+                }
+            }
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -900,19 +2301,61 @@ try {
     # point has touched the filesystem.
     Resolve-DeltaInstallation
 
+    # Operational safety enhancement - see this function's own section
+    # header for why this runs here specifically: before the existing-vs-
+    # fresh-install branch immediately below, not only on the fresh-install
+    # side of it, so a required port already owned by something other than
+    # this installer's own managed NGINX is caught regardless of which of
+    # the two workflows is about to run. Exits (1) immediately on a genuine
+    # conflict - nothing below this point is reachable in that case either.
+    Test-DeltaNginxPortPrerequisites
+
     # The next check that must happen before any NGINX-specific action -
-    # see this script's own header and Show-ExistingNginxNotice. Nothing
-    # below this point is reachable if NGINX is already installed.
+    # see this script's own header and Show-DeltaNginxManagementMenu.
+    # Nothing below this point is reachable if NGINX is already installed.
     if (Test-Path -LiteralPath $Script:NginxExePath) {
-        Show-ExistingNginxNotice
+        Show-DeltaNginxManagementMenu
+        exit 0
+    }
+
+    # Installation Confirmation - the last chance to back out before
+    # anything is written to disk. Nothing above this point has touched
+    # the filesystem (Resolve-DeltaInstallation only reads the registry/
+    # legacy .env, and the existing-NGINX check above is a Test-Path).
+    if (-not (Read-DeltaNginxInstallConfirmation)) {
+        Show-DeltaNginxInstallCancelledNotice
         exit 0
     }
 
     Install-Nginx
     Install-DeltaSslCertificate
+
+    # Phase 4 - must run before New-DeltaNginxConfiguration, which needs
+    # $Script:DeltaBackendPort to already be set.
+    Resolve-DeltaBackendPort
+
+    # Phase 5 - must run before New-DeltaNginxConfiguration, which needs
+    # $Script:DeltaWebsiteDomain to already be set. Resolve-DeltaWebsiteDomain
+    # itself lives in lib\DeltaInstaller.Common.ps1, not this script - see
+    # its own header for why.
+    Write-PhaseBanner 'Public Website Domain'
+    $Script:DeltaWebsiteDomain = Resolve-DeltaWebsiteDomain
+    Write-Success "    Website domain: $($Script:DeltaWebsiteDomain)"
+
     New-DeltaNginxConfiguration
     Test-DeltaNginxConfiguration
-    Start-DeltaNginx
+
+    # Test-DeltaNginxConfiguration above already stopped the script
+    # (Stop-Setup) before this point if validation failed - reaching
+    # here means it succeeded, which is the only time this should ask.
+    if (Read-DeltaNginxStartConfirmation) {
+        Start-DeltaNginx
+    }
+    else {
+        Write-Host ''
+        Write-Detail 'NGINX was not started.'
+    }
+
     Show-DeltaNginxSummary
 
     exit 0

@@ -517,6 +517,69 @@ function Get-DeltaInstallPath {
 }
 
 # ---------------------------------------------------------------------------
+# .env file reading
+# ---------------------------------------------------------------------------
+
+function Get-EnvFileValue {
+    <#
+      Reads a single KEY=value out of a .env-style file - blank lines and
+      full-line "#" comments are ignored, matched keys are looked up
+      case-insensitively (PowerShell's default -eq already does this), and
+      a value wrapped in matching single or double quotes has those quotes
+      stripped, matching the quoting Update-ManagedEnvironmentLines
+      (setup.ps1) itself writes (KEY="value"). Returns $null - never
+      throws - both when $Path doesn't exist and when $Key isn't set in
+      it, since "absent" is a normal, expected outcome every caller here
+      needs to tell apart from "present but invalid" for itself (see
+      Resolve-DeltaBackendPort in setup-nginx.ps1, the first caller: a
+      missing PORT falls back to a default, but a PORT that's present and
+      invalid stops the installer outright - two very different
+      responses to what would otherwise look like the same $null).
+
+      Deliberately generic - not "Get-DeltaBackendPort" or similar -
+      since it reads exactly one key from exactly one file with no
+      DELTA-specific knowledge at all, so any future .env value this
+      project needs (across any script that dot-sources this file) can
+      reuse it rather than growing its own copy.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Key
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        $trimmedLine = $line.Trim()
+        if (-not $trimmedLine -or $trimmedLine.StartsWith('#')) {
+            continue
+        }
+
+        $separatorIndex = $trimmedLine.IndexOf('=')
+        if ($separatorIndex -lt 0) {
+            continue
+        }
+
+        $lineKey = $trimmedLine.Substring(0, $separatorIndex).Trim()
+        if ($lineKey -ne $Key) {
+            continue
+        }
+
+        $value = $trimmedLine.Substring($separatorIndex + 1).Trim()
+        $isDoubleQuoted = $value.Length -ge 2 -and $value.StartsWith('"') -and $value.EndsWith('"')
+        $isSingleQuoted = $value.Length -ge 2 -and $value.StartsWith("'") -and $value.EndsWith("'")
+        if ($isDoubleQuoted -or $isSingleQuoted) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        return $value
+    }
+
+    return $null
+}
+
+# ---------------------------------------------------------------------------
 # Session PATH refresh
 # ---------------------------------------------------------------------------
 
@@ -693,6 +756,134 @@ function Read-DeltaAppRoot {
         }
 
         return $candidate
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Website domain configuration
+# ---------------------------------------------------------------------------
+
+# The bare-Enter default Resolve-DeltaWebsiteDomain offers - a public
+# hostname is never assumed the way $Script:DefaultDeltaRuntimeRoot is a
+# concrete default filesystem path; "localhost" is simply the safest thing
+# to serve a virtual host as until an administrator supplies a real one.
+$Script:DefaultDeltaWebsiteDomain = 'localhost'
+
+function Test-DeltaWebsiteDomain {
+    <#
+      Validates a candidate public website domain (the value
+      Resolve-DeltaWebsiteDomain below prompts for) against this feature's
+      own requirements (docs\todo\TODO-setup-nginx-enhancements.md, "Website
+      Domain Configuration") - accepts "localhost" and valid DNS hostnames,
+      rejects a scheme (http://, https://, ftp://), a port, a path or
+      trailing slash, spaces, and wildcard (*) entries.
+
+      Returns a PSCustomObject with Valid (bool) and Reason (a specific,
+      human-readable explanation of what's wrong, or $null when Valid is
+      $true) - the same "structured result, not just a bool" shape as
+      Test-PostgresCredentials, so a caller can show the operator exactly
+      which rule tripped (e.g. "the domain name cannot include a port")
+      rather than one generic "invalid domain" message that leaves them
+      guessing which part of what they typed was the problem.
+
+      Checked in a deliberate order: each of the explicitly-called-out
+      rejections (scheme, spaces, wildcard, path, port) is checked before
+      falling through to the generic DNS hostname shape check, since a
+      string that trips one of those (e.g. "https://delta.example.org")
+      would otherwise just fail the generic hostname regex too, but with a
+      far less specific and less actionable message.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Domain)
+
+    if ($Domain -match '^[a-zA-Z][a-zA-Z0-9+.-]*://') {
+        return [PSCustomObject]@{ Valid = $false; Reason = 'Do not include a protocol (e.g. http:// or https://) - enter only the hostname.' }
+    }
+    if ($Domain -match '\s') {
+        return [PSCustomObject]@{ Valid = $false; Reason = 'The domain name cannot contain spaces.' }
+    }
+    if ($Domain.Contains('*')) {
+        return [PSCustomObject]@{ Valid = $false; Reason = 'Wildcard domain names (*) are not supported.' }
+    }
+    if ($Domain.Contains('/')) {
+        return [PSCustomObject]@{ Valid = $false; Reason = 'The domain name cannot include a path or trailing slash - enter only the hostname.' }
+    }
+    if ($Domain.Contains(':')) {
+        return [PSCustomObject]@{ Valid = $false; Reason = 'The domain name cannot include a port - enter only the hostname.' }
+    }
+
+    if ($Domain -eq 'localhost') {
+        return [PSCustomObject]@{ Valid = $true; Reason = $null }
+    }
+
+    # Standard DNS hostname shape: dot-separated labels, each 1-63
+    # characters, alphanumeric with interior hyphens only (never leading
+    # or trailing one), at least two labels - a bare single-label name
+    # other than "localhost" itself (already handled above) isn't a real
+    # public domain. The overall 253-character ceiling is RFC 1035's own.
+    $hostnamePattern = '^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$'
+    if ($Domain.Length -gt 253 -or $Domain -notmatch $hostnamePattern) {
+        return [PSCustomObject]@{ Valid = $false; Reason = "'$Domain' is not a valid DNS hostname (e.g. delta.example.org)." }
+    }
+
+    return [PSCustomObject]@{ Valid = $true; Reason = $null }
+}
+
+function Resolve-DeltaWebsiteDomain {
+    <#
+      Phase 5 (docs\todo\TODO-setup-nginx-enhancements.md, "Website Domain
+      Configuration"). Prompts for the public hostname the generated
+      virtual host should answer to - server_name in setup-nginx.ps1's own
+      NGINX templates today, and whatever the equivalent binding is for a
+      future setup-iis.ps1 - defaulting to $Script:DefaultDeltaWebsiteDomain
+      ("localhost") on a bare Enter, the same bare-Enter-picks-a-default
+      shape as Read-DeltaAppRoot above.
+
+      Deliberately placed in this shared file, not setup-nginx.ps1: it has
+      no NGINX-specific knowledge at all, so a future setup-iis.ps1 needing
+      the identical prompt and validation rules (this phase's own
+      requirements say as much) can call this directly instead of growing
+      a second copy of the accepted/rejected examples to keep in sync.
+
+      Re-prompts (never silently corrects) on anything Test-DeltaWebsiteDomain
+      rejects, showing that function's own specific Reason - matches this
+      feature's own requirement to display a clear validation error rather
+      than silently modifying or falling back on invalid input. A blank
+      entry is the one case NOT re-prompted: it's this function's own
+      documented default, not an invalid answer.
+    #>
+
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+    Write-Host ''
+    Write-Host 'Public Website Domain'
+    Write-Host ''
+    Write-Host 'This is the hostname users will use to access DELTA.'
+    Write-Host ''
+    Write-Host 'Examples:'
+    Write-Host ''
+    Write-Host '    delta.example.org'
+    Write-Host '    delta.ncscm.gov.jo'
+    Write-Host ''
+    Write-Host "Leave blank to use $Script:DefaultDeltaWebsiteDomain."
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+    Write-Host ''
+
+    while ($true) {
+        $entered = Read-Host -Prompt "Domain [$Script:DefaultDeltaWebsiteDomain]"
+
+        if ([string]::IsNullOrWhiteSpace($entered)) {
+            return $Script:DefaultDeltaWebsiteDomain
+        }
+
+        $domain = $entered.Trim()
+        $validation = Test-DeltaWebsiteDomain -Domain $domain
+        if ($validation.Valid) {
+            return $domain
+        }
+
+        Write-Host $validation.Reason -ForegroundColor Yellow
+        Write-Host ''
     }
 }
 
