@@ -2664,56 +2664,6 @@ function Invoke-DeltaDatabaseUpgrade {
     }
 }
 
-function Test-DeltaDatabaseExists {
-    <#
-      Checks whether $DatabaseName already exists on the reused
-      PostgreSQL instance, via a pg_database lookup against the
-      instance's default "postgres" database - the only reliable,
-      OS-agnostic way to answer this without assuming anything about
-      what else lives on the server. $DatabaseName is operator-typed
-      (Read-DeltaDatabaseName), so single quotes are escaped before it's
-      interpolated into the SQL literal, the same defensive standard
-      applied anywhere else in this project a value is built into a
-      command string rather than passed as a driver parameter.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$DatabaseName,
-        [Parameter(Mandatory)][SecureString]$SuperuserPassword
-    )
-
-    $bin = Get-PostgresBinDirectory
-    $psqlExe = Join-Path -Path $bin -ChildPath 'psql.exe'
-
-    $escapedName = $DatabaseName.Replace("'", "''")
-    $plainPassword = ConvertTo-PlainText -SecureString $SuperuserPassword
-    $previousPgPassword = $env:PGPASSWORD
-    $previousEap = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $env:PGPASSWORD = $plainPassword
-        $output = & $psqlExe -h $Script:PostgresHost -p $Script:PostgresPort -U $Script:PostgresSuperuser -d 'postgres' `
-            --set ON_ERROR_STOP=on --tuples-only --no-align `
-            -c "SELECT 1 FROM pg_database WHERE datname = '$escapedName';" 2>&1
-        $exitCode = $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $previousEap
-        if ($null -eq $previousPgPassword) {
-            Remove-Item -Path Env:\PGPASSWORD -ErrorAction SilentlyContinue
-        }
-        else {
-            $env:PGPASSWORD = $previousPgPassword
-        }
-        $plainPassword = $null
-    }
-
-    if ($exitCode -ne 0) {
-        Stop-Setup "Failed to check whether database '$DatabaseName' exists: $(($output | Out-String).Trim())"
-    }
-
-    return (($output | Out-String).Trim() -eq '1')
-}
-
 function Complete-DatabaseSetupForExistingPostgres {
     <#
       The reuse-aware counterpart to Complete-DatabaseSetup's original
@@ -2747,7 +2697,8 @@ function Complete-DatabaseSetupForExistingPostgres {
     )
 
     Write-Step "Checking whether database '$DatabaseName' already exists..."
-    $exists = Test-DeltaDatabaseExists -DatabaseName $DatabaseName -SuperuserPassword $SuperuserPassword
+    $exists = Test-DeltaDatabaseExists -PostgresHost $Script:PostgresHost -Port $Script:PostgresPort `
+        -Username $Script:PostgresSuperuser -DatabaseName $DatabaseName -SuperuserPassword $SuperuserPassword
 
     if (-not $exists) {
         Write-Detail "Database '$DatabaseName' does not exist yet on this PostgreSQL instance."
@@ -2764,6 +2715,115 @@ function Complete-DatabaseSetupForExistingPostgres {
     New-DeltaEnvironmentFile -DatabaseUrl $databaseUrl -ForceRegenerateFromTemplate:($Script:DeltaDeploymentLifecycle -eq 'Recreate')
 }
 
+function Read-DeltaExistingDatabaseChoice {
+    <#
+      Shown only from Complete-DatabaseSetup's non-reuse branch, when the
+      database name the operator just entered/accepted for what they
+      believed was a new install turns out to already exist. Unlike
+      Complete-DatabaseSetupForExistingPostgres's own silent,
+      unconditional-Upgrade handling of an existing database (correct
+      there because the operator was already told up front an existing
+      PostgreSQL instance was being reused), an operator here was never
+      told a database might already exist - so this makes the discovery
+      explicit and asks what to do about it, rather than picking a
+      behavior on their behalf.
+    #>
+    param([Parameter(Mandatory)][string]$DatabaseName)
+
+    Write-Host ''
+    Write-Host "The database '$DatabaseName' already exists on this PostgreSQL instance."
+    Write-Host ''
+    Write-Host 'Choose an option:'
+    Write-Host ''
+    Write-Host '1) Upgrade the existing database (recommended)'
+    Write-Host '2) Recreate the database (destructive - all existing data will be lost)'
+    Write-Host '3) Keep the existing database unchanged'
+    Write-Host '4) Cancel setup'
+    Write-Host ''
+
+    while ($true) {
+        $choice = Read-Host -Prompt 'Choose an option [1]'
+        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '1' }
+
+        switch ($choice.Trim()) {
+            '1' { return 'Upgrade' }
+            '2' { return 'Recreate' }
+            '3' { return 'Keep' }
+            '4' { return 'Cancel' }
+        }
+        Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
+    }
+}
+
+function Confirm-DeltaDatabaseRecreate {
+    <#
+      The explicit confirmation gate for the "Recreate the database"
+      choice above - the same typed-YES bar as Confirm-DeltaFreshInstallation,
+      since this is exactly as destructive: unlike
+      Backup-ExistingDeltaDeployment's rename-not-delete guarantee for
+      the application directory, there is no equivalent safety net here
+      - the database is dropped, not backed up first.
+    #>
+    param([Parameter(Mandatory)][string]$DatabaseName)
+
+    Show-Warning -Message @(
+        "You are about to permanently delete the existing database '$DatabaseName' and all its data."
+        'This cannot be undone.'
+    )
+    Write-Host 'Type YES to continue:'
+    Write-Host ''
+    $confirmation = Read-Host -Prompt '>'
+
+    return ($confirmation -ceq 'YES')
+}
+
+function Remove-DeltaDatabase {
+    <#
+      Drops $DatabaseName via dropdb.exe - the only action "Recreate"
+      performs on its own. It deliberately has no pipeline of its own
+      beyond this: once the drop succeeds, Complete-DatabaseSetup falls
+      straight back through into the exact same Init-then-Upgrade calls
+      already used for a genuinely new database, rather than a second,
+      parallel "recreate" implementation that could drift from it over
+      time.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$DatabaseName,
+        [Parameter(Mandatory)][SecureString]$SuperuserPassword
+    )
+
+    Write-Step "Dropping database '$DatabaseName'..."
+
+    $bin = Get-PostgresBinDirectory
+    $dropdbExe = Join-Path -Path $bin -ChildPath 'dropdb.exe'
+
+    $plainPassword = ConvertTo-PlainText -SecureString $SuperuserPassword
+    $previousPgPassword = $env:PGPASSWORD
+    $previousEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $env:PGPASSWORD = $plainPassword
+        $output = & $dropdbExe -h $Script:PostgresHost -p $Script:PostgresPort -U $Script:PostgresSuperuser $DatabaseName 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousEap
+        if ($null -eq $previousPgPassword) {
+            Remove-Item -Path Env:\PGPASSWORD -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:PGPASSWORD = $previousPgPassword
+        }
+        $plainPassword = $null
+    }
+
+    if ($exitCode -ne 0) {
+        Stop-Setup "Failed to drop database '$DatabaseName': $(($output | Out-String).Trim())"
+    }
+
+    Write-Success "    Database '$DatabaseName' dropped."
+}
+
 function Complete-DatabaseSetup {
     <#
       The "ask for DELTA database name -> generate .env -> invoke
@@ -2775,14 +2835,21 @@ function Complete-DatabaseSetup {
       name is the only new value asked for.
 
       Branches on $Script:PostgresReuseMode (set by Install-PostgreSql):
-      a fresh PostgreSQL install provably has no DELTA database yet, so
-      the flow below is Init then Upgrade unconditionally, exactly the
-      same "always run the migration check after initialization" shape
-      Complete-DatabaseSetupForExistingPostgres uses for its own
-      no-database-yet branch; a reused instance might already have a
-      DELTA database, which is what Complete-DatabaseSetupForExistingPostgres
-      exists to handle - by running the migration check unconditionally
-      against it, never by prompting whether to recreate it.
+      a reused instance might already have a DELTA database, which is
+      what Complete-DatabaseSetupForExistingPostgres exists to handle -
+      by running the migration check unconditionally against it, never
+      by prompting. The non-reuse branch below used to assume a fresh
+      PostgreSQL install provably has no DELTA database yet and called
+      createdb.exe unconditionally on that assumption - but that
+      assumption doesn't actually hold for every path that can leave
+      $Script:PostgresReuseMode at its default $false (e.g. an operator
+      choosing to install a fresh PostgreSQL instance alongside a
+      same-major-version one already installed, or a partially completed
+      earlier run), so this branch now checks Test-DeltaDatabaseExists
+      itself before ever calling Invoke-DeltaDatabaseInit, and routes to
+      Read-DeltaExistingDatabaseChoice when the database is already
+      there instead of walking straight into createdb.exe's own
+      "database already exists" error.
 
       Upgrade reuse: once Get-DeltaUpgradeDatabaseUrlComponents (Upgrade
       lifecycle only, never Fresh Installation - see that function's own
@@ -2822,12 +2889,48 @@ function Complete-DatabaseSetup {
         return
     }
 
+    Write-Step "Checking whether database '$deltaDatabaseName' already exists..."
+    $exists = Test-DeltaDatabaseExists -PostgresHost $Script:PostgresHost -Port $Script:PostgresPort `
+        -Username $Script:PostgresSuperuser -DatabaseName $deltaDatabaseName -SuperuserPassword $superuserPassword
+
+    $skipInitAndUpgrade = $false
+
+    if ($exists) {
+        $decision = Read-DeltaExistingDatabaseChoice -DatabaseName $deltaDatabaseName
+
+        switch ($decision) {
+            'Upgrade' {
+                Invoke-DeltaDatabaseUpgrade -DatabaseName $deltaDatabaseName -SuperuserPassword $superuserPassword
+                $skipInitAndUpgrade = $true
+            }
+            'Recreate' {
+                if (-not (Confirm-DeltaDatabaseRecreate -DatabaseName $deltaDatabaseName)) {
+                    Stop-Setup 'Database recreation canceled by user.'
+                }
+                Remove-DeltaDatabase -DatabaseName $deltaDatabaseName -SuperuserPassword $superuserPassword
+                # Falls straight through to the same Init-then-Upgrade path
+                # below already used for a genuinely new database - the
+                # database no longer exists at this point, so that path is
+                # correct unchanged, not a separate pipeline of its own.
+            }
+            'Keep' {
+                Write-Detail "Skipping initialization and migration - database '$deltaDatabaseName' left unchanged, as requested."
+                $skipInitAndUpgrade = $true
+            }
+            'Cancel' {
+                Stop-Setup 'Installation canceled by user.'
+            }
+        }
+    }
+
     $databaseUrl = New-DatabaseUrl -PostgresHost $Script:PostgresHost -Port $Script:PostgresPort `
         -Username $Script:PostgresSuperuser -Password $superuserPassword -DatabaseName $deltaDatabaseName
     New-DeltaEnvironmentFile -DatabaseUrl $databaseUrl -ForceRegenerateFromTemplate:($Script:DeltaDeploymentLifecycle -eq 'Recreate')
 
-    Invoke-DeltaDatabaseInit -DatabaseName $deltaDatabaseName -SuperuserPassword $superuserPassword
-    Invoke-DeltaDatabaseUpgrade -DatabaseName $deltaDatabaseName -SuperuserPassword $superuserPassword -FollowingInitialization
+    if (-not $skipInitAndUpgrade) {
+        Invoke-DeltaDatabaseInit -DatabaseName $deltaDatabaseName -SuperuserPassword $superuserPassword
+        Invoke-DeltaDatabaseUpgrade -DatabaseName $deltaDatabaseName -SuperuserPassword $superuserPassword -FollowingInitialization
+    }
 }
 
 # ---------------------------------------------------------------------------

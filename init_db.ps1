@@ -128,6 +128,17 @@ function Initialize-DeltaDatabase {
         Stop-Setup "DELTA schema file not found: $schemaFile"
     }
 
+    # setup.ps1's own Complete-DatabaseSetup already checks this before
+    # ever invoking this script (see its own header) - this is a second,
+    # independent guard for Mode 2 (standalone execution), where nothing
+    # upstream has checked anything yet. Without it, createdb.exe's own
+    # "database already exists" error would surface here raw and
+    # unexplained, with no indication that upgrade_database.ps1 (not
+    # this script) is what an existing database actually needs.
+    if (Test-DeltaDatabaseExists -PostgresHost $PostgresHost -Port $Port -Username $Username -DatabaseName $DatabaseName -SuperuserPassword $Password) {
+        Stop-Setup "Database '$DatabaseName' already exists. init_db.ps1 only creates a brand-new DELTA database - run upgrade_database.ps1 to migrate an existing one, or supply a different database name."
+    }
+
     Write-Detail "Host: $PostgresHost"
     Write-Detail "Port: $Port"
     Write-Detail "Username: $Username"

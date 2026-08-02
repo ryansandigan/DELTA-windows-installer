@@ -1756,6 +1756,46 @@ function Find-PostgresInstallation {
     return $result
 }
 
+function Test-PostgresServerPresent {
+    <#
+      Authoritative "is the PostgreSQL *server* here" check - the Windows
+      service and postgres.exe itself - deliberately independent of
+      Find-PostgresInstallation's Found above, which is gated on
+      psql.exe/PATH first. That's the right question for "can this
+      project run psql against something", but the wrong one for "has
+      the server been uninstalled": confirmed directly on a real machine
+      that EDB's own uninstaller can log "Command Line Tools
+      uninstallation completed" while genuinely leaving psql.exe (a
+      client tool, not the server) - plus the 2-3 runtime DLLs it loads -
+      behind in bin\, even though postgres.exe, the service, and every
+      other bin\ executable were all correctly removed in the same run.
+      Treating that leftover client binary as "still installed" fails a
+      genuinely successful server uninstall (see Uninstall-PostgreSql,
+      uninstall.ps1, which uses this instead of Find-PostgresInstallation
+      for exactly that reason).
+
+      $InstallDir is optional - the install directory a prior
+      Find-PostgresInstallation call already resolved, if any - and is
+      only used to check for postgres.exe; without it, the service check
+      alone still runs.
+    #>
+    param([string]$InstallDir)
+
+    $service = Get-Service -Name 'postgresql*' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($service) {
+        return $true
+    }
+
+    if ($InstallDir) {
+        $postgresExe = Join-Path -Path $InstallDir -ChildPath 'bin\postgres.exe'
+        if (Test-Path -LiteralPath $postgresExe) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Get-PostgresBinDirectory {
     <#
       Resolves the directory containing psql.exe/createdb.exe/dropdb.exe
@@ -2145,4 +2185,72 @@ function Reset-PostgresSuperuserPassword {
 
     Write-Success '    PostgreSQL superuser password reset successfully.'
     return $newPassword
+}
+
+# ---------------------------------------------------------------------------
+# DELTA database existence check
+# ---------------------------------------------------------------------------
+
+function Test-DeltaDatabaseExists {
+    <#
+      Checks whether $DatabaseName already exists on the target PostgreSQL
+      instance, via a pg_database lookup against the instance's default
+      "postgres" database - the only reliable, OS-agnostic way to answer
+      this without assuming anything about what else lives on the server.
+      $DatabaseName is operator-typed, so single quotes are escaped before
+      it's interpolated into the SQL literal, the same defensive standard
+      applied anywhere else in this project a value is built into a
+      command string rather than passed as a driver parameter.
+
+      Shared by setup.ps1 (Complete-DatabaseSetup/
+      Complete-DatabaseSetupForExistingPostgres - deciding whether to
+      create a database or route to the existing-database workflow) and
+      init_db.ps1 (Initialize-DeltaDatabase's own defensive guard, so
+      createdb.exe is never invoked against a database that already
+      exists even when this script is run standalone, outside setup.ps1's
+      own check). Takes PostgresHost/Port/Username explicitly rather than
+      reading $Script:Postgres* globals - unlike setup.ps1, init_db.ps1
+      has no such globals of its own, only local parameters - matching
+      the same explicit-parameter convention Test-PostgresCredentials
+      above already uses for exactly this reason.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$PostgresHost,
+        [Parameter(Mandatory)][string]$Port,
+        [Parameter(Mandatory)][string]$Username,
+        [Parameter(Mandatory)][string]$DatabaseName,
+        [Parameter(Mandatory)][SecureString]$SuperuserPassword
+    )
+
+    $bin = Get-PostgresBinDirectory
+    $psqlExe = Join-Path -Path $bin -ChildPath 'psql.exe'
+
+    $escapedName = $DatabaseName.Replace("'", "''")
+    $plainPassword = ConvertTo-PlainText -SecureString $SuperuserPassword
+    $previousPgPassword = $env:PGPASSWORD
+    $previousEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $env:PGPASSWORD = $plainPassword
+        $output = & $psqlExe -h $PostgresHost -p $Port -U $Username -d 'postgres' `
+            --set ON_ERROR_STOP=on --tuples-only --no-align `
+            -c "SELECT 1 FROM pg_database WHERE datname = '$escapedName';" 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousEap
+        if ($null -eq $previousPgPassword) {
+            Remove-Item -Path Env:\PGPASSWORD -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:PGPASSWORD = $previousPgPassword
+        }
+        $plainPassword = $null
+    }
+
+    if ($exitCode -ne 0) {
+        Stop-Setup "Failed to check whether database '$DatabaseName' exists: $(($output | Out-String).Trim())"
+    }
+
+    return (($output | Out-String).Trim() -eq '1')
 }

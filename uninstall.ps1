@@ -371,6 +371,41 @@ function Read-DeleteDataDirectoryChoice {
     $Script:DatabaseFilesResult = 'Deleted'
 }
 
+function Read-DeleteLeftoverPostgresClientChoice {
+    <#
+      Confirmed real, not hypothetical: EDB's uninstaller can log
+      "Command Line Tools uninstallation completed" while genuinely
+      leaving psql.exe - plus the 2-3 runtime DLLs it loads
+      (libiconv-2.dll/libintl-9.dll/libcharset-1.dll, confirmed directly
+      on a real machine) - sitting in bin\, orphaned: no server, no
+      service, nothing else on the machine depends on it. Only ever
+      reached from Uninstall-PostgreSql after Test-PostgresServerPresent
+      has already confirmed the server itself is gone, so this is never
+      offered in place of reporting a genuinely failed uninstall.
+
+      Same explicit-opt-in convention as Read-DeleteDataDirectoryChoice
+      above - never deleted without being asked, defaulting to "No" on
+      any answer other than Y/y.
+    #>
+    param([Parameter(Mandatory)][string]$PsqlPath)
+
+    Write-Host ''
+    Write-Host 'PostgreSQL:'
+    Write-Detail "The command-line client (psql.exe) is still present at $PsqlPath. This is a known EDB uninstaller quirk, not a sign the server is still installed - the server itself was already confirmed removed above. It is an orphaned file only; not a running process and not security-relevant."
+    Write-Host '(Default: No)'
+    Write-Host ''
+    $choice = Read-Host -Prompt 'Delete this leftover file? (y/N)'
+
+    if ($choice.Trim() -notin @('Y', 'y')) {
+        Write-Detail 'Leftover psql.exe preserved.'
+        return
+    }
+
+    Write-Step 'Deleting leftover psql.exe...'
+    Remove-Item -LiteralPath $PsqlPath -Force -ErrorAction SilentlyContinue
+    Write-Success "    Deleted: $PsqlPath"
+}
+
 function Uninstall-PostgreSql {
     <#
       Stops the PostgreSQL Windows service before invoking the
@@ -499,33 +534,36 @@ function Uninstall-PostgreSql {
     Write-Success '    Uninstaller reported success (exit code 0).'
 
     Write-Step 'Validating removal...'
-    # Authoritative check: the same functional signal
-    # (Find-PostgresInstallation - psql.exe/postgres.exe locatable, the
-    # Windows service present) every other script in this project already
-    # treats as "is PostgreSQL here", polled rather than checked once in
+    # Authoritative check: the PostgreSQL *server* - the Windows service
+    # and postgres.exe - via Test-PostgresServerPresent
+    # (lib\DeltaInstaller.Common.ps1), not Find-PostgresInstallation's
+    # Found, which is gated on psql.exe/PATH first. Confirmed directly
+    # (see Test-PostgresServerPresent's own header) that EDB's uninstaller
+    # can leave psql.exe - a client tool, not the server - behind even
+    # after the server itself is fully and correctly removed; treating
+    # that leftover as "still installed" would fail a genuinely
+    # successful server uninstall. Polled rather than checked once in
     # case of an ordinary completion lag (see Uninstall-PostGIS's
     # identical Wait-Until usage). Deliberately NOT gated on the Windows
-    # Programs and Features registry entry - confirmed directly (see
-    # this function's own header) that EDB's uninstaller only removes
-    # that entry once its own install directory ends up fully empty,
-    # which never happens in this project's workflow (PostGIS's known
-    # leftover files, and the data\ directory this function deliberately
-    # preserves until the separate prompt below) - so that entry is not
-    # a reliable "still installed" signal here, and checking it as a
-    # pass/fail condition would fail a genuinely successful uninstall
-    # every single time, not just intermittently.
+    # Programs and Features registry entry either - confirmed directly
+    # (see this function's own header) that EDB's uninstaller only
+    # removes that entry once its own install directory ends up fully
+    # empty, which never happens in this project's workflow (PostGIS's
+    # known leftover files, and the data\ directory this function
+    # deliberately preserves until the separate prompt below) - so that
+    # entry is not a reliable "still installed" signal here either.
     $removed = Wait-Until -TimeoutSeconds 10 -Condition {
-        -not (Find-PostgresInstallation).Found
+        -not (Test-PostgresServerPresent -InstallDir $existing.InstallDir)
     }
     if (-not $removed) {
         Write-Host ''
         Write-Host 'PostgreSQL:' -ForegroundColor Red
         Write-Host 'Still detected.' -ForegroundColor Red
-        Stop-Setup 'PostgreSQL uninstall reported success, but psql.exe/postgres.exe can still be located. Remove it manually via Settings > Apps.'
+        Stop-Setup 'PostgreSQL uninstall reported success, but the Windows service and/or postgres.exe can still be located. Remove it manually via Settings > Apps.'
     }
 
     Write-Host ''
-    Write-Success 'PostgreSQL successfully removed.'
+    Write-Success 'PostgreSQL server successfully removed.'
     $Script:PostgresResult = 'Removed'
 
     # Informational, not a failure: see this function's own header for
@@ -534,6 +572,18 @@ function Uninstall-PostgreSql {
     $residualProgramEntry = Get-InstalledProgramInfo -DisplayNamePattern 'PostgreSQL*' | Select-Object -First 1
     if ($residualProgramEntry) {
         Write-Detail "Note: Windows may still list '$($residualProgramEntry.DisplayName)' under installed apps. This is expected here - PostgreSQL's own uninstaller only removes that listing once its install directory is completely empty, and $($existing.InstallDir) still contains the data directory (and possibly other leftover files) at this point. It is not a sign that PostgreSQL itself is still functional."
+    }
+
+    # Also informational, not a failure: re-run Find-PostgresInstallation
+    # (not reused from $existing, which predates the uninstall) purely to
+    # check for the leftover client binary Test-PostgresServerPresent
+    # deliberately ignores above. Reported and offered as an explicit,
+    # opt-in cleanup - never deleted silently - the same convention
+    # Read-DeleteDataDirectoryChoice below already uses for the data
+    # directory.
+    $leftoverClient = Find-PostgresInstallation
+    if ($leftoverClient.Found -and $leftoverClient.PsqlPath) {
+        Read-DeleteLeftoverPostgresClientChoice -PsqlPath $leftoverClient.PsqlPath
     }
 
     Read-DeleteDataDirectoryChoice -Existing $existing
