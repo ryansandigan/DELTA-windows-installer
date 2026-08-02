@@ -650,6 +650,78 @@ No restart was actually required by either real MSI install on this
 machine - the restart-required path itself was validated only via the
 harness, not live, since neither real install triggered it.
 
+### Addendum: `preserveHostHeader` + `allowedServerVariables` (real login-failure investigation)
+
+A confirmed production DELTA login failure (NGINX → IIS → DELTA topology;
+`POST /en/admin/login.data` returning HTTP 400) traced back to two gaps
+in this phase's original implementation - both now fixed:
+
+- **`preserveHostHeader` was never configured.** ARR's own default for
+  `system.webServer/proxy/@preserveHostHeader` is `False`, meaning ARR
+  substitutes `localhost:<port>` for the original inbound Host header
+  before forwarding. DELTA depends on the original Host header
+  surviving the proxy hop (sessions, CSRF, Remix action routing,
+  redirects) - `setup-nginx.ps1`'s own NGINX templates have always sent
+  `proxy_set_header Host $host` (the NGINX equivalent), so this was an
+  IIS-only parity gap. `Confirm-DeltaArrPostInstallState` now sets
+  `enabled` and `preserveHostHeader` INDEPENDENTLY (never a single "is
+  the proxy already configured" early return) - a machine with
+  `enabled=True, preserveHostHeader=False` is correctly treated as not
+  yet configured, which the original single-property early return would
+  have missed entirely.
+- **Changing `system.webServer/proxy` at runtime requires `iisreset`,
+  not app-pool/site recycling.** Confirmed via real testing: this is a
+  MACHINE-WIDE `applicationHost.config` setting, not scoped to any
+  single application pool, and IIS's normal per-app-pool
+  configuration-change recycling does not reliably pick it up. A plain
+  app-pool or website recycle left the change ineffective until a full
+  `iisreset /noforce`. `Restart-DeltaIisForArrConfiguration`
+  (setup-iis.ps1) now runs `iisreset.exe /noforce` via the shared
+  `Start-ProcessWithActivityIndicator` - but ONLY when at least one of
+  the three machine-wide properties below actually needed to change this
+  run, never unconditionally, per this project's own "maintain
+  idempotent installation steps" rule (CLAUDE.md). Post-restart state is
+  re-verified via a FRESH `Get-DeltaArrDetectionResult` call, never
+  trusted from the `Set-`/`Add-WebConfigurationProperty` calls' own lack
+  of a thrown error.
+
+A third, related gap was found while implementing X-Forwarded-Proto/
+Host/Port parity with NGINX (see Phase 6's own addendum below):
+`system.webServer/rewrite/allowedServerVariables` is locked
+(`overrideModeDefault="Deny"`) at the server level by default. A
+site-level `web.config` attempting to declare it there - the original
+design of this addendum - fails EVERY request to the site with HTTP
+500.52 ("URL Rewrite Module Error"), confirmed via a real, throwaway IIS
+site on a machine with URL Rewrite/ARR installed. The fix is the same
+shape as `preserveHostHeader`: the three required names
+(`HTTP_X_FORWARDED_PROTO`/`HOST`/`PORT`) are added machine-wide
+(`MACHINE/WEBROOT/APPHOST`) by `Confirm-DeltaArrPostInstallState`
+instead, and `templates\iis\web.config` never declares
+`allowedServerVariables` at all.
+
+`Get-DeltaArrDetectionResult` (`lib\DeltaDoctor.IIS.ps1`) now also
+reports each component's own installed `Version` (`DisplayVersion` from
+the same `Get-InstalledProgramInfo` registry lookup
+`Test-DeltaArrComponentInstalled` already performed - not a second
+version-detection mechanism), shown in `Show-DeltaArrDetectionSummary`.
+`Get-DeltaDoctorIisPrerequisiteChecks` (the Doctor's own IIS
+prerequisite checklist, shared with `doctor.ps1`) now includes
+Error-severity checks for `preserveHostHeader` and the
+`allowedServerVariables` allow-list alongside the existing `enabled`
+check - `Ready` is `False` if any of the three read wrong, matching this
+addendum's own "not a warning" requirement (a confirmed login-failure
+cause, never merely cosmetic).
+
+Validated live on a real Windows Server IIS installation (URL
+Rewrite/ARR already installed): a simulated `enabled=True,
+preserveHostHeader=False` machine was correctly flagged unhealthy by the
+Doctor and correctly repaired by `Confirm-DeltaArrPostInstallState` with
+exactly one `iisreset`; an already-correct machine triggered zero
+restarts; changing exactly one of the three properties triggered exactly
+one restart; and a temporary IIS site directly confirmed the HTTP
+500.52 failure mode for the rejected site-level `allowedServerVariables`
+design, and its resolution once moved server-wide.
+
 ## Objective
 
 Unlike every role service in Phase 3, **ARR and URL Rewrite are not Windows Features at all** - they are separate, standalone Microsoft redistributables, historically distributed through the Web Platform Installer (WebPI), which Microsoft has since retired. This is the single biggest structural difference from `setup-nginx.ps1`'s own Phase 1 (`Install-Nginx`), and needs to be treated as its own phase for exactly that reason.
@@ -1080,6 +1152,65 @@ New-Website -Name $Script:DeltaIisSiteName -PhysicalPath $Script:DeltaIisSitePat
 ```
 
 A dedicated Application Pool (never the IIS `DefaultAppPool`, the same "never assume/reuse something you don't own" principle applied to app pools) - name, .NET CLR version ("No Managed Code" is correct here, since this pool only ever proxies to the Node.js backend, never runs managed application code itself), and pipeline mode are all decided at this phase and documented for Phase 10's summary.
+
+### Addendum: X-Forwarded-Proto/Host/Port parity with NGINX
+
+`setup-nginx.ps1`'s own NGINX templates (`templates\nginx\delta-http.conf`/
+`delta-https.conf`) have always forwarded `X-Forwarded-For`,
+`X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-Port` to the
+DELTA backend. `templates\iis\web.config` originally forwarded none of
+these - a parity gap found during the same login-failure investigation
+that led to Phase 4's own `preserveHostHeader` addendum (above).
+`X-Forwarded-For` is supplied automatically by ARR once
+`system.webServer/proxy` is enabled, so only the other three needed
+adding.
+
+The `DELTA Reverse Proxy` rule now sets them via URL Rewrite
+`<serverVariables>`, using two `<rewriteMaps>` (`DeltaForwardedProto`,
+`DeltaForwardedPort`) to translate the built-in `{HTTPS}` server
+variable (`"on"`/`"off"`) into the values actually expected
+(`"https"`/`"http"` and `"443"`/`"80"`) - never hardcoded, since the
+site serves both HTTP and HTTPS bindings. `X-Forwarded-Host` is set
+directly from the built-in `{HTTP_HOST}` server variable (the original
+inbound Host header, read-only, no allow-list needed to reference it).
+
+Setting a server variable requires `system.webServer/rewrite/allowedServerVariables`
+to permit it by name - the ORIGINAL design of this addendum declared
+these three names directly in `templates\iis\web.config` itself, which
+a real, throwaway IIS test site (URL Rewrite/ARR already installed)
+proved fails EVERY request with HTTP 500.52 ("URL Rewrite Module
+Error"): `allowedServerVariables` is locked
+(`overrideModeDefault="Deny"`) at the server level by default, so a
+site-level declaration is rejected outright. The fix - and the reason
+this is documented as a Phase 4 addendum too - is that these three names
+are instead added machine-wide (`MACHINE/WEBROOT/APPHOST`) by
+`Confirm-DeltaArrPostInstallState`, the same place `enabled`/
+`preserveHostHeader` already are; `templates\iis\web.config` never
+declares `allowedServerVariables` at all.
+
+`Get-DeltaDoctorWebsiteChecks` (`lib\DeltaDoctor.IIS.ps1`) now includes
+three Error-severity, per-site checks - "X-Forwarded-Proto/Host/Port
+forwarding configured" - each a plain regex match against the live
+`web.config`'s own `<set name="HTTP_X_FORWARDED_*">` line, matching the
+existing "Rewrite rule present" pattern exactly. These check ONLY
+whether THIS site's own rule sets the variable - not also for a matching
+`allowedServerVariables` entry in the same file, since that no longer
+lives there at all (it is the separate, machine-wide fact
+`Test-DeltaIisForwardedServerVariablesAllowed` checks instead, see
+Phase 4's own addendum). A missing or hand-edited-away forwarded-header
+rule now makes the site's own configuration `NeedsRepair = $true`,
+which the existing `Invoke-DeltaIisConfigurationCheckup` Detect →
+Diagnose → Offer Repair → Validate Again cycle already regenerates
+`web.config` wholesale to fix - no separate repair workflow was added.
+
+Validated live: a real, throwaway IIS site (with a correctly rendered
+`web.config`) confirmed all three checks pass on a fresh, correct file;
+manually removing one `<set>` line flipped exactly that one check to
+`FAIL` while the other two remained unaffected, and the site's own live
+HTTP behavior (once `allowedServerVariables` was populated machine-wide)
+correctly reached ARR's own backend-connection attempt (`502.3 Bad
+Gateway` against a deliberately nonexistent backend) rather than any
+configuration-parse error.
 
 ---
 
@@ -1699,6 +1830,22 @@ This is the one phase where directly reusing NGINX's own mechanism (`Get-Listeni
 ## Managed NGINX Exception's IIS analogue
 
 The equivalent of `Test-RequiredPortAvailability`'s "already owned by our own managed instance is not a conflict" rule becomes, for IIS: a binding collision against the DELTA site *itself* (Phase 5's own identity check) is expected and fine - re-running this installer against its own already-existing site should never report a conflict against its own binding. A collision against a *different, unrelated* site's binding is the real failure case this phase exists to catch, mirroring the exact same "distinguish the managed instance from anything else" principle, implemented through binding/host-header comparison instead of executable-path comparison.
+
+## Addendum: implementation had drifted from this phase's own design - now corrected
+
+The design above (`## How this differs once IIS is already installed`) already correctly specified a **binding-level** check, not a socket-level one - but the actual shipped implementation of `Test-DeltaIisRequiredPortAvailability` (`setup-iis.ps1`) never followed it: it special-cased `$owner.ServiceName -eq 'W3SVC'` on the raw `Get-ListeningTcpPortOwner` result instead. Confirmed via real testing against a live IIS installation actually serving the real DELTA site: HTTP.SYS-owned listeners are attributed to PID 4 ("System") by Windows, which resolves to no `Win32_Service` entry at all, so `ServiceName` is empty and the `-eq 'W3SVC'` comparison can never match - `Available` was reported `False` for ports IIS itself legitimately owned. This is now fixed by implementing exactly what this phase's own design already called for:
+
+- `Get-DeltaIisPortBindingOwnership` (`lib\DeltaDoctor.IIS.ps1`) - the binding-level check this phase's design describes, built from the exact same primitives `Get-DeltaIisReverseProxyHandoverPlan` already uses for the reverse direction (a different provider asking whether IIS occupies its ports): `Get-DeltaIisSiteBoundPorts` for the binding scan, `Get-DeltaIisManagedWebsiteResult`/`Test-DeltaIisStockDefaultWebSite` for the same "DELTA-owned or verified stock Default Web Site is safe, anything else is a real conflict" classification already established for the Reverse Proxy Handover Plan. Never a second, independent binding parser.
+- `Test-DeltaIisRequiredPortAvailability` now consults this instead of the raw owner's `ServiceName`: a port with no listener at all is available; a port bound by the DELTA site itself or a verified stock Default Web Site is available (IIS's own normal operation, never a conflict with itself); a port bound by a genuinely different, unrelated IIS website remains a real conflict, now reported by that website's own name (`Show-DeltaIisPortConflictNotice`'s new "IIS Website" field) rather than a useless `PID 4`/`System`; a port held by something outside IIS entirely remains a real conflict, reported exactly as before (process name/PID/executable).
+
+### A second, related bug in the same feature: stale reverse-proxy state and an unconditional NGINX handover plan
+
+Found during the same investigation, in the Manual Reverse Proxy Handover feature this phase's port check hands off to:
+
+- `Show-DeltaIisManagementMenu` accepted a single `Get-DeltaReverseProxyState` snapshot from its caller (computed once, before the menu was ever entered) and reused that same object at both points that actually attempt to bind a port (Start Website, Restart Website) - even though the menu can stay open indefinitely and another provider's own runtime state can genuinely change while it does. It no longer takes a `-ReverseProxyState` parameter at all; Start Website/Restart Website each call `Get-DeltaReverseProxyState` (`lib\DeltaDoctor.ReverseProxy.ps1`) fresh, immediately before `Test-DeltaIisPortPrerequisites` - the same read-only, non-printing detection primitive `Invoke-DeltaReverseProxyDetection` itself already calls internally.
+- Independently of that staleness, `Get-DeltaNginxReverseProxyHandoverPlan` (`lib\DeltaDoctor.NGINX.ps1`) returned `Actions = @('Stop NGINX')` unconditionally whenever NGINX was merely DELTA-managed - never checking whether NGINX was actually running. Since the Handover Plan dispatcher (`Get-DeltaReverseProxyHandoverPlan`, `lib\DeltaDoctor.ReverseProxy.ps1`) deliberately selects a DELTA-managed candidate regardless of its own `Active` classification (by design - an IIS site can still occupy a port while `Stopped`), this meant `Invoke-DeltaReverseProxyHandover`'s own empty-plan fast path could never trigger for NGINX, and a stopped/standby NGINX installation was always presented as "the current active DELTA reverse proxy," prompting to stop it even though there was nothing to stop. Fixed by having `Get-DeltaNginxReverseProxyHandoverPlan` check `Get-DeltaNginxRuntimeState` (the same authoritative runtime-state helper NGINX's own management menu already uses) and only include `Stop NGINX` when NGINX is both actually `Running` and its own required ports (`Get-DeltaNginxRequiredPorts`) overlap the requesting provider's. `Invoke-DeltaReverseProxyHandover`'s own empty-plan fast path (`lib\DeltaInstaller.Common.ps1`) is unchanged - this fix makes the NGINX plan actually produce the empty-`Actions` result that fast path was always designed to receive.
+
+Validated live on a real Windows Server IIS installation already serving the real DELTA site: `Test-DeltaIisRequiredPortAvailability` correctly reported ports 80/443 as available once bound to the DELTA site's own binding (previously `False`); a simulated Stopped-NGINX handover plan produced `Actions = @()` with no prompt; a simulated Running-NGINX handover plan (overlapping ports) produced exactly `Actions = @('Stop NGINX')`.
 
 ---
 

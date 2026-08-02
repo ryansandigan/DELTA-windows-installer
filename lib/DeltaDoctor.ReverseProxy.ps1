@@ -870,13 +870,29 @@ function Get-DeltaReverseProxyHandoverPlan {
         return $null
     }
 
-    $candidateProviderName = ($ReverseProxyState.ProviderStates | Where-Object {
+    # A real, independently-confirmed bug this guards against: when the
+    # Where-Object pipeline below matches nothing (e.g. a genuinely
+    # IIS-only machine where NGINX was never installed at all -
+    # ManagedByDelta is $false, never merely absent from the array;
+    # Get-DeltaReverseProxyState's own provider loop always returns an
+    # entry for every registered provider), Select-Object -First 1
+    # returns $null, and accessing `.Name` directly on that (the
+    # original, one-line form of this lookup) throws "The property
+    # 'Name' cannot be found on this object" under this project's own
+    # Set-StrictMode -Version Latest - silently contradicting this
+    # function's own documented "returns $null only when there is no
+    # DELTA-managed candidate provider to even ask" contract. Checking
+    # the candidate STATE object's own truthiness first, before ever
+    # touching a property on it, is what actually fulfills that contract.
+    $candidateProviderState = $ReverseProxyState.ProviderStates | Where-Object {
         $_.Name -ne $RequestingProviderName -and $_.ManagedByDelta
-    } | Select-Object -First 1).Name
+    } | Select-Object -First 1
 
-    if (-not $candidateProviderName) {
+    if (-not $candidateProviderState) {
         return $null
     }
+
+    $candidateProviderName = $candidateProviderState.Name
 
     $candidateDefinition = $definitions | Where-Object { $_.Name -eq $candidateProviderName } | Select-Object -First 1
     if (-not $candidateDefinition) {

@@ -539,14 +539,57 @@ function Get-DeltaNginxReverseProxyHandoverPlan {
       is supplied by the caller (the REQUESTING provider's own required
       ports - e.g. IIS's own), carried straight through onto the plan
       purely so Invoke-DeltaReverseProxyHandover (lib\DeltaInstaller.Common.ps1)
-      knows what to verify released afterward - never used to decide
-      anything here.
+      knows what to verify released afterward.
+
+      Actions is `@('Stop NGINX')` ONLY when NGINX is both actually
+      Running (Get-DeltaNginxRuntimeState - never inferred from
+      ManagedByDelta/Active alone, since the candidate-selection dispatcher
+      that calls this, Get-DeltaReverseProxyHandoverPlan in
+      lib\DeltaDoctor.ReverseProxy.ps1, deliberately selects a
+      DELTA-managed candidate regardless of its own Active classification)
+      AND its own required ports (Get-DeltaNginxRequiredPorts) actually
+      overlap $RequiredPorts - otherwise `@()`, so
+      Invoke-DeltaReverseProxyHandover's own empty-plan fast path
+      ("Nothing to hand over") applies and the operator is never told a
+      stopped/standby NGINX is "the current active DELTA reverse proxy."
+      A real, confirmed bug this replaces: this previously returned
+      `@('Stop NGINX')` unconditionally whenever NGINX was merely
+      DELTA-managed, regardless of whether it was actually running -
+      Invoke-DeltaReverseProxyHandover's own `$Plan.Actions.Count -eq 0`
+      fast path could then never trigger for NGINX, no matter how fresh
+      the caller's own $ReverseProxyState was.
     #>
     param([Parameter(Mandatory)][int[]]$RequiredPorts)
 
+    $runtimeState = Get-DeltaNginxRuntimeState
+    $isOccupyingRequiredPorts = $false
+    if ($runtimeState.State -eq 'Running') {
+        $nginxOwnPorts = Get-DeltaNginxRequiredPorts
+        $isOccupyingRequiredPorts = @($nginxOwnPorts | Where-Object { $RequiredPorts -contains $_ }).Count -gt 0
+    }
+
+    # $actions is deliberately built via a plain statement-form `if`
+    # assigning into an already-@()-initialized variable, never an
+    # `if {} else {}` used directly AS the assigned expression/value.
+    # Confirmed directly: using the if/else's own result as the value
+    # (e.g. `Actions = if (...) { @('Stop NGINX') } else { @() }`, or
+    # even that whole expression wrapped in `,$(...)`) gets flattened by
+    # PowerShell's pipeline-output semantics - the single-element branch
+    # collapsed to a bare string, and the empty-array branch to a
+    # lone-$null single-element array - Count reported 1 in BOTH cases,
+    # never 0. The statement-form assignment below has no such boundary
+    # to cross, so $actions is guaranteed to already be a real,
+    # correctly-shaped array (empty or not) by the time it's assigned
+    # into the hashtable literal below - a plain `Key =
+    # $alreadyMaterializedVariable` assignment does not re-flatten it.
+    $actions = @()
+    if ($isOccupyingRequiredPorts) {
+        $actions = @('Stop NGINX')
+    }
+
     return [PSCustomObject]@{
         Provider       = 'NGINX'
-        Actions        = @('Stop NGINX')
+        Actions        = $actions
         RequiredPorts  = $RequiredPorts
         ExpectedResult = 'Ports released'
         IsSafe         = $true

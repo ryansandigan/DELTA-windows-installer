@@ -424,6 +424,91 @@ function Test-DeltaIisProxyEnabled {
     }
 }
 
+function Test-DeltaIisPreserveHostHeaderEnabled {
+    <#
+      Whether system.webServer/proxy's own preserveHostHeader is currently
+      enabled machine-wide - same MACHINE/WEBROOT/APPHOST scope and
+      "never throws, reports the safe/negative state" convention
+      Test-DeltaIisProxyEnabled (immediately above) already establishes,
+      just reading a different property of the same configuration
+      section. Required alongside ProxyEnabled, never merged into a
+      single "reverse proxy enabled" boolean: ARR's own default for this
+      property is False, and DELTA depends on the original Host header
+      surviving the proxy hop (sessions, CSRF, Remix action routing) - a
+      real, confirmed cause of a DELTA login failure on a machine where
+      only `enabled` had been set.
+    #>
+    if (-not (Test-DeltaWebAdministrationModuleAvailable)) {
+        return $false
+    }
+
+    try {
+        Import-Module WebAdministration -ErrorAction Stop
+        $property = Get-WebConfigurationProperty -Filter 'system.webServer/proxy' -Name 'preserveHostHeader' -PSPath 'MACHINE/WEBROOT/APPHOST' -ErrorAction Stop
+        return [bool]$property.Value
+    }
+    catch {
+        return $false
+    }
+}
+
+# The three server variables templates\iis\web.config's own DELTA Reverse
+# Proxy rule sets (X-Forwarded-Proto/Host/Port) - the one place this list
+# is defined, consumed both by the machine-wide allow-list check below and
+# by setup-iis.ps1's own Confirm-DeltaArrPostInstallState (which adds
+# whichever of these three are still missing).
+$Script:DeltaIisRequiredForwardedServerVariables = @('HTTP_X_FORWARDED_PROTO', 'HTTP_X_FORWARDED_HOST', 'HTTP_X_FORWARDED_PORT')
+
+function Get-DeltaIisAllowedServerVariableNames {
+    <#
+      The names currently present in system.webServer/rewrite/allowedServerVariables
+      machine-wide (MACHINE/WEBROOT/APPHOST) - always a real array, never
+      $null, matching this project's own established convention (see e.g.
+      Get-DeltaIisMissingFeatures's own header for the return-boundary
+      unwrapping gotcha this guards against). Returns an empty array
+      (never throws) if WebAdministration is unavailable, the section
+      can't be read, or nothing is configured yet.
+    #>
+    if (-not (Test-DeltaWebAdministrationModuleAvailable)) {
+        return ,@()
+    }
+
+    try {
+        Import-Module WebAdministration -ErrorAction Stop
+        $collection = Get-WebConfigurationProperty -Filter 'system.webServer/rewrite/allowedServerVariables' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'Collection' -ErrorAction Stop
+        return ,@($collection | ForEach-Object { $_.name })
+    }
+    catch {
+        return ,@()
+    }
+}
+
+function Test-DeltaIisForwardedServerVariablesAllowed {
+    <#
+      Whether every name in $Script:DeltaIisRequiredForwardedServerVariables
+      is already present in the machine-wide allowedServerVariables
+      collection - required for the DELTA Reverse Proxy rule's own
+      <serverVariables> block to work AT ALL, not merely to be "more
+      correct": confirmed directly (real IIS testing on a default
+      install) that allowedServerVariables is locked
+      (overrideModeDefault="Deny") at the server level by default, so
+      declaring these names in the site's own web.config instead - which
+      an earlier version of this feature did - fails EVERY request to
+      the site with HTTP 500.52 ("URL Rewrite Module Error"), not merely
+      a missing header. This is why these three names are configured
+      machine-wide by setup-iis.ps1's own Phase 4, the same place
+      `enabled`/`preserveHostHeader` already are, rather than living in
+      templates\iis\web.config at all.
+    #>
+    $configured = Get-DeltaIisAllowedServerVariableNames
+    foreach ($name in $Script:DeltaIisRequiredForwardedServerVariables) {
+        if ($configured -notcontains $name) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Get-DeltaArrDetectionResult {
     <#
       The ARR/URL Rewrite detection orchestrator - mirrors
@@ -432,17 +517,28 @@ function Get-DeltaArrDetectionResult {
       summary, confirmation prompt, installer, and post-install
       verification, and doctor.ps1's own checklist, all read from a single
       source of truth.
+
+      Each component's own Version is read from the exact same
+      Get-InstalledProgramInfo registry lookup Test-DeltaArrComponentInstalled
+      already performs for its own AND-check (see that function's own
+      header) - not a second, independent version-detection mechanism,
+      just no longer discarding the DisplayVersion that lookup already
+      returns.
     #>
     $components = @(foreach ($definition in Get-DeltaArrRequiredComponents) {
+        $registryMatch = Get-InstalledProgramInfo -DisplayNamePattern $definition.DisplayNamePattern | Select-Object -First 1
         [PSCustomObject]@{
             Name      = $definition.Name
             Installed = Test-DeltaArrComponentInstalled -Definition $definition
+            Version   = if ($registryMatch) { $registryMatch.DisplayVersion } else { $null }
         }
     })
 
     return [PSCustomObject]@{
-        Components   = $components
-        ProxyEnabled = Test-DeltaIisProxyEnabled
+        Components                      = $components
+        ProxyEnabled                    = Test-DeltaIisProxyEnabled
+        PreserveHostHeaderEnabled       = Test-DeltaIisPreserveHostHeaderEnabled
+        ForwardedServerVariablesAllowed = Test-DeltaIisForwardedServerVariablesAllowed
     }
 }
 
@@ -1140,6 +1236,105 @@ function Test-DeltaIisStockDefaultWebSite {
     return $expandedPhysicalPath -eq $stockPhysicalPath
 }
 
+function Get-DeltaIisPortBindingOwnership {
+    <#
+      For $Port, determines whether an already-Started IIS website's own
+      binding covers it - reusing the exact same primitives
+      Get-DeltaIisReverseProxyHandoverPlan (below) already uses for the
+      opposite direction (a DIFFERENT provider asking whether IIS occupies
+      ITS required ports): Get-DeltaIisSiteBoundPorts for the binding scan,
+      Get-DeltaIisManagedWebsiteResult/Test-DeltaIisStockDefaultWebSite for
+      the same "Delta-owned or verified stock Default Web Site is safe,
+      anything else is not" classification. Never a second, independent
+      binding parser - this is the ONE place setup-iis.ps1's own
+      Test-DeltaIisRequiredPortAvailability now consults for "is this port
+      already IIS's own."
+
+      Deliberately does NOT use the raw TCP-connection owner
+      (Get-ListeningTcpPortOwner, lib\DeltaInstaller.Common.ps1) or its
+      ServiceName field to answer this question - confirmed directly
+      (real IIS testing) that HTTP.sys-owned listeners are always
+      attributed to PID 4 ("System") by Windows, which resolves to no
+      Win32_Service entry at all, so a `ServiceName -eq 'W3SVC'` check can
+      never actually match on a real machine. IIS's own binding
+      configuration (Get-WebBinding, via Get-DeltaIisSiteBoundPorts) is
+      the only authoritative source for "does IIS itself already own this
+      port," regardless of which PID or process name the OS attributes
+      the underlying kernel-mode listener to.
+
+      Returns $null if no Started IIS website has a binding on $Port at
+      all (the caller falls back to the raw TCP-owner signal for a
+      non-IIS occupant). Otherwise returns a [PSCustomObject] naming a
+      site and classifying it exactly the same three ways
+      Get-DeltaIisReverseProxyHandoverPlan already does: 'Delta' (the
+      DELTA-managed site itself), 'DefaultWebSite' (a verified stock
+      Default Web Site), or 'Other' (a real, unrelated IIS website this
+      installer has no business touching or excusing - still a genuine
+      conflict, just one the caller can now name specifically instead of
+      reporting a useless PID 4/"System").
+
+      A port can legitimately have MORE THAN ONE Started site bound to it
+      at once (host-header-based multi-tenancy - two sites sharing port
+      80 with two different host headers is normal, per this project's
+      own docs\todo\TODO-setup-iis-enhancements.md, Phase 9), so this
+      checks EVERY occupying site, never just the first one found -
+      mirroring Get-DeltaIisReverseProxyHandoverPlan's own "IsSafe only
+      when every single occupant is safe" discipline exactly. A real bug
+      this guards against, caught directly on a real machine: taking only
+      `Select-Object -First 1` off the occupant list picked "Default Web
+      Site" over "DELTA" purely because of enumeration order on a port
+      both legitimately share, which happened to still classify as safe
+      here - but the same "just take the first one" approach would have
+      SILENTLY MASKED a genuinely unrelated third site sharing the same
+      port if it enumerated after either safe one, precisely the
+      "silently ignore an unrelated site" failure mode this function
+      exists to prevent. Any single unsafe/unrelated occupant now makes
+      the WHOLE port 'Other', regardless of enumeration order or whether
+      a safe site also happens to share it.
+    #>
+    param([Parameter(Mandatory)][int]$Port)
+
+    $websiteResult = Get-DeltaIisManagedWebsiteResult
+
+    # Get-DeltaIisSiteBoundPorts's own return already crosses its own
+    # comma-protected return boundary correctly shaped (see that
+    # function's own header) - re-wrapping its result in a SECOND @(...)
+    # here does not "double protect" it, it double-WRAPS it: confirmed
+    # directly that doing so nests the already-correct array as the
+    # single element of a new 1-element array (`[ [80, 443] ]`, not
+    # `[80, 443]`), so `-contains $Port` could never match. Called
+    # directly, with no extra @() at this call site.
+    $occupyingSites = @(Get-Website | Where-Object {
+        $_.state -eq 'Started' -and ((Get-DeltaIisSiteBoundPorts -Site $_) -contains $Port)
+    })
+
+    if ($occupyingSites.Count -eq 0) {
+        return $null
+    }
+
+    $isSafeSite = {
+        param($Site)
+        ($websiteResult.ManagedSite -and $Site.name -eq $websiteResult.ManagedSite.name) -or (Test-DeltaIisStockDefaultWebSite -Site $Site)
+    }
+
+    $unsafeSite = $occupyingSites | Where-Object { -not (& $isSafeSite $_) } | Select-Object -First 1
+    if ($unsafeSite) {
+        return [PSCustomObject]@{ SiteName = $unsafeSite.name; Classification = 'Other' }
+    }
+
+    # Every occupant is safe - prefer naming the DELTA site itself when
+    # it's one of them (the more useful diagnostic identity), falling
+    # back to whichever verified stock Default Web Site occupant matched
+    # otherwise.
+    $deltaSite = $occupyingSites | Where-Object { $websiteResult.ManagedSite -and $_.name -eq $websiteResult.ManagedSite.name } | Select-Object -First 1
+    if ($deltaSite) {
+        return [PSCustomObject]@{ SiteName = $deltaSite.name; Classification = 'Delta' }
+    }
+
+    $defaultSite = $occupyingSites | Select-Object -First 1
+    return [PSCustomObject]@{ SiteName = $defaultSite.name; Classification = 'DefaultWebSite' }
+}
+
 function Get-DeltaIisReverseProxyHandoverPlan {
     <#
       Doctor's own IIS-side answer to "what must actually be stopped for
@@ -1378,10 +1573,24 @@ function Get-DeltaDoctorIisPrerequisiteChecks {
         $checks.Add((New-DeltaDoctorCheck -Label "$($component.Name) installed." -Passed $component.Installed))
     }
     $checks.Add((New-DeltaDoctorCheck -Label 'ARR proxy enabled.' -Passed $arrDetection.ProxyEnabled))
+    # Error severity, not Warning - preserveHostHeader=False is a confirmed
+    # cause of a DELTA login failure (the original Host header not
+    # surviving the proxy hop), never merely cosmetic. Ready must not be
+    # true unless both this and ProxyEnabled are true - see
+    # Test-DeltaIisPreserveHostHeaderEnabled's own header.
+    $checks.Add((New-DeltaDoctorCheck -Label 'ARR proxy preserves the original Host header.' -Passed $arrDetection.PreserveHostHeaderEnabled))
+    # Also Error severity - required for the DELTA Reverse Proxy rule's own
+    # X-Forwarded-Proto/Host/Port server variables to work AT ALL, not
+    # merely to be "more correct" - see
+    # Test-DeltaIisForwardedServerVariablesAllowed's own header for the
+    # real, confirmed HTTP 500.52 failure mode this guards against.
+    $checks.Add((New-DeltaDoctorCheck -Label 'Forwarded headers (X-Forwarded-Proto/Host/Port) permitted at the server level.' -Passed $arrDetection.ForwardedServerVariablesAllowed))
 
     $ready = $iisDetection.Installed -and
              (@($arrDetection.Components | Where-Object { -not $_.Installed }).Count -eq 0) -and
-             $arrDetection.ProxyEnabled
+             $arrDetection.ProxyEnabled -and
+             $arrDetection.PreserveHostHeaderEnabled -and
+             $arrDetection.ForwardedServerVariablesAllowed
 
     return [PSCustomObject]@{ Ready = $ready; Checks = $checks }
 }
@@ -1403,7 +1612,8 @@ function Get-DeltaDoctorWebsiteChecks {
       menu action, which now simply calls this same function and displays
       its result - see that function's own header. This function returns
       one row PER FACT (website/app pool/binding/web.config/rewrite
-      rule/backend port), matching the Doctor's own worked report example.
+      rule/backend port/forwarded-header rules), matching the Doctor's own
+      worked report example.
 
       Sets $CanRepair false only for the two situations
       Repair-DeltaIisManagedWebsite genuinely cannot act on safely: the
@@ -1466,17 +1676,40 @@ function Get-DeltaDoctorWebsiteChecks {
     $rewriteRulePresent = $false
     $backendPortMatches = $false
     $configuredPort = $null
+    # X-Forwarded-Proto/Host/Port are per-site web.config facts - whether
+    # THIS site's own rule sets them via <serverVariables> - matched the
+    # same regex-against-live-file way Rewrite rule present already is,
+    # just below. Deliberately NOT also checking for a matching
+    # <allowedServerVariables> entry in this same file: confirmed
+    # directly (real IIS testing) that allowedServerVariables is locked
+    # at the server level by default, so templates\iis\web.config never
+    # declares it here at all - whether these names are actually
+    # PERMITTED is a separate, machine-wide fact
+    # (Test-DeltaIisForwardedServerVariablesAllowed, checked in
+    # Get-DeltaDoctorIisPrerequisiteChecks, the same place
+    # preserveHostHeader already is), not a per-site one.
+    $forwardedProtoConfigured = $false
+    $forwardedHostConfigured  = $false
+    $forwardedPortConfigured  = $false
     if ($webConfigExists) {
         $webConfigContent = Get-Content -LiteralPath $webConfigPath -Raw
         $rewriteRulePresent = $webConfigContent -match '<rule\s+name="DELTA Reverse Proxy"'
         $configuredPort = Get-DeltaIisSiteBackendPort -Site $site
         $backendPortMatches = ($configuredPort -eq $ExpectedBackendPort)
+
+        $forwardedProtoConfigured = $webConfigContent -match '<set\s+name="HTTP_X_FORWARDED_PROTO"'
+        $forwardedHostConfigured  = $webConfigContent -match '<set\s+name="HTTP_X_FORWARDED_HOST"'
+        $forwardedPortConfigured  = $webConfigContent -match '<set\s+name="HTTP_X_FORWARDED_PORT"'
     }
     $checks.Add((New-DeltaDoctorCheck -Label 'Rewrite rule present.' -Passed $rewriteRulePresent))
     $checks.Add((New-DeltaDoctorCheck -Label 'Backend rewrite target matches configured port.' -Passed $backendPortMatches `
         -Detail $(if ($webConfigExists -and -not $backendPortMatches) { "web.config targets $(if ($configuredPort) { $configuredPort } else { 'no recognizable port' }), expected $ExpectedBackendPort." })))
+    $checks.Add((New-DeltaDoctorCheck -Label 'X-Forwarded-Proto forwarding configured.' -Passed $forwardedProtoConfigured))
+    $checks.Add((New-DeltaDoctorCheck -Label 'X-Forwarded-Host forwarding configured.' -Passed $forwardedHostConfigured))
+    $checks.Add((New-DeltaDoctorCheck -Label 'X-Forwarded-Port forwarding configured.' -Passed $forwardedPortConfigured))
 
-    $needsRepair = -not ($appPoolExists -and $httpBinding -and $webConfigExists -and $rewriteRulePresent -and $backendPortMatches)
+    $needsRepair = -not ($appPoolExists -and $httpBinding -and $webConfigExists -and $rewriteRulePresent -and $backendPortMatches `
+        -and $forwardedProtoConfigured -and $forwardedHostConfigured -and $forwardedPortConfigured)
 
     return [PSCustomObject]@{ ManagedSite = $site; CanRepair = $true; NeedsRepair = $needsRepair; Checks = $checks }
 }

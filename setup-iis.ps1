@@ -620,7 +620,15 @@ function Show-DeltaArrDetectionSummary {
       Write-Detail formatting vocabulary rather than introducing a new
       style - mirrors Show-DeltaIisDetectionSummary's own layout
       philosophy (Phase 2) scaled down to this phase's own two components
-      plus the proxy setting.
+      plus the machine-wide proxy settings. Each component's own Version
+      (Get-DeltaArrDetectionResult) is shown when known, purely
+      informational - never part of any Installed/Missing decision.
+
+      Enabled and Preserve Host Header are two separate rows, not one
+      merged "reverse proxy configured" line - the same padded-label
+      layout Show-DeltaIisDetectionSummary/Show-DeltaIisInstallationSummary
+      already use for their own feature tables, reused here rather than
+      inventing a new format.
     #>
     param([Parameter(Mandatory)][PSCustomObject]$Detection)
 
@@ -633,11 +641,18 @@ function Show-DeltaArrDetectionSummary {
         Write-Host $component.Name
         Write-Host ''
         Write-Detail $(if ($component.Installed) { 'Installed' } else { 'Missing' })
+        if ($component.Installed -and $component.Version) {
+            Write-Detail "Version: $($component.Version)"
+        }
         Write-Host ''
     }
     Write-Host 'Reverse Proxy (system.webServer/proxy)'
     Write-Host ''
-    Write-Detail $(if ($Detection.ProxyEnabled) { 'Enabled' } else { 'Disabled' })
+    $reverseProxyLabels = @('Enabled', 'Preserve Host Header', 'Forwarded Headers Allowed')
+    $reverseProxyLabelWidth = (($reverseProxyLabels | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum) + 4
+    Write-Detail ("{0,-$reverseProxyLabelWidth}{1}" -f 'Enabled', $(if ($Detection.ProxyEnabled) { 'Yes' } else { 'No' }))
+    Write-Detail ("{0,-$reverseProxyLabelWidth}{1}" -f 'Preserve Host Header', $(if ($Detection.PreserveHostHeaderEnabled) { 'Yes' } else { 'No' }))
+    Write-Detail ("{0,-$reverseProxyLabelWidth}{1}" -f 'Forwarded Headers Allowed', $(if ($Detection.ForwardedServerVariablesAllowed) { 'Yes' } else { 'No' }))
     Write-Host ''
     Write-Host ('-' * $Script:BannerWidth)
 }
@@ -660,11 +675,11 @@ function Read-DeltaArrInstallConfirmation {
       (lib\DeltaInstaller.Common.ps1) - the same rule/body/prompt/rule
       shape and bare-Enter-means-No default every other confirmation in
       this script already uses, rather than a second Y/N implementation.
-      Lists both kinds of pending change explicitly (missing components
-      to install, and/or the machine-wide proxy setting to enable) since
-      either, both, or - if nothing is missing at all - neither can be
-      true when this is called. $MissingComponents can legitimately be a
-      genuinely empty array (proxy alone needs enabling) -
+      Lists every kind of pending change explicitly (missing components
+      to install, and/or any of the three machine-wide proxy settings to
+      enable) - any combination, or - if nothing is missing at all - none,
+      can be true when this is called. $MissingComponents can legitimately
+      be a genuinely empty array (only a proxy setting needs enabling) -
       [AllowEmptyCollection()] is required here: confirmed directly that
       [Parameter(Mandatory)] alone rejects an empty array with "Cannot
       bind argument... because it is an empty collection" even though an
@@ -672,7 +687,9 @@ function Read-DeltaArrInstallConfirmation {
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][array]$MissingComponents,
-        [Parameter(Mandatory)][bool]$ProxyNeedsEnabling
+        [Parameter(Mandatory)][bool]$ProxyNeedsEnabling,
+        [Parameter(Mandatory)][bool]$PreserveHostHeaderNeedsEnabling,
+        [Parameter(Mandatory)][bool]$ForwardedServerVariablesNeedAllowing
     )
 
     return Read-DeltaYesNoConfirmation -Body {
@@ -686,10 +703,18 @@ function Read-DeltaArrInstallConfirmation {
             }
             Write-Host ''
         }
-        if ($ProxyNeedsEnabling) {
-            Write-Host 'The following configuration change will be made:'
+        if ($ProxyNeedsEnabling -or $PreserveHostHeaderNeedsEnabling -or $ForwardedServerVariablesNeedAllowing) {
+            Write-Host 'The following configuration change(s) will be made:'
             Write-Host ''
-            Write-Detail 'Enable system.webServer/proxy (machine-wide)'
+            if ($ProxyNeedsEnabling) {
+                Write-Detail 'Enable system.webServer/proxy (machine-wide)'
+            }
+            if ($PreserveHostHeaderNeedsEnabling) {
+                Write-Detail 'Enable system.webServer/proxy preserveHostHeader (machine-wide)'
+            }
+            if ($ForwardedServerVariablesNeedAllowing) {
+                Write-Detail 'Permit X-Forwarded-Proto/Host/Port server variables (machine-wide)'
+            }
             Write-Host ''
         }
         Write-Host 'Continue with IIS reverse-proxy setup?'
@@ -789,6 +814,48 @@ function Install-DeltaArrComponent {
     }
 }
 
+function Restart-DeltaIisForArrConfiguration {
+    <#
+      Restarts IIS (`iisreset.exe /noforce`) - only ever called by
+      Confirm-DeltaArrPostInstallState, and only once it has already
+      determined at least one of the three machine-wide settings
+      (`enabled`/`preserveHostHeader`/the allowedServerVariables
+      allow-list) actually needed to change this run. Never called on an
+      idempotent rerun where all three already read back correctly - see
+      this project's own "maintain idempotent installation steps" rule
+      (CLAUDE.md); a machine that's already fully configured must never
+      pay for a restart (and its brief availability blip) on every rerun.
+
+      Required because system.webServer/proxy and
+      system.webServer/rewrite/allowedServerVariables are both
+      MACHINE-WIDE applicationHost.config settings, not scoped to any
+      single application pool - confirmed directly (real IIS testing)
+      that IIS's normal per-app-pool configuration-change recycling does
+      not reliably pick up a change to these properties, unlike a
+      site/app-pool-scoped setting would. `/noforce` (graceful - waits
+      for in-flight requests to drain) rather than a narrower
+      Stop-Service/Start-Service on W3SVC alone: a full iisreset is the
+      one restart actually confirmed, via real testing, to make the
+      change take effect - a narrower service restart was not verified
+      and would be an unproven assumption to bake into an unattended
+      installer.
+
+      Uses the shared Start-ProcessWithActivityIndicator
+      (lib\DeltaInstaller.Common.ps1) - the same activity-indicator/
+      ExitCode-reliability wrapper this phase's own Install-DeltaArrComponent
+      already uses for msiexec - rather than a bare Start-Process call.
+    #>
+
+    Write-Step 'Restarting IIS to apply the reverse-proxy configuration change...'
+    $process = Start-ProcessWithActivityIndicator -FilePath 'iisreset.exe' -ArgumentList '/noforce' -ActivityName 'Restarting IIS'
+
+    if ($process.ExitCode -ne 0) {
+        Stop-Setup "iisreset.exe /noforce returned exit code $($process.ExitCode). No further IIS setup will be attempted."
+    }
+
+    Write-Success '    IIS restarted.'
+}
+
 function Confirm-DeltaArrPostInstallState {
     <#
       Post-installation verification - never trusts msiexec's own exit
@@ -798,13 +865,30 @@ function Confirm-DeltaArrPostInstallState {
       FRESH Get-DeltaArrDetectionResult (the caller's responsibility to
       have taken after installation) rather than re-deriving state itself.
 
+      `enabled`, `preserveHostHeader`, and the allowedServerVariables
+      allow-list are evaluated INDEPENDENTLY, not via a single "is the
+      proxy already configured" early return - a machine with
+      `enabled=True` but `preserveHostHeader=False` (a real, confirmed
+      cause of a DELTA login failure) must not be treated as already
+      configured just because `enabled` already reads True, and the same
+      goes for a machine missing only one of the three required
+      allowedServerVariables entries. Only what actually reads wrong is
+      set this run ($propertiesToSet/$missingServerVariableNames), and
+      Restart-DeltaIisForArrConfiguration (above) is skipped entirely
+      when nothing needed changing - never run unconditionally.
+
       Two independent, separately-worded failures:
         - Any required component still reporting Missing - listed by
           name, never summarized as a count.
-        - system.webServer/proxy still reporting disabled after this
-          function itself just attempted to enable it - stopped rather
-          than silently retried, per this phase's own "do not continue
-          if ARR installation or verification fails" requirement.
+        - `enabled`/`preserveHostHeader`/the allow-list still reporting
+          incorrect after this function itself just attempted to set
+          them AND restarted IIS - stopped rather than silently retried,
+          per this phase's own "do not continue if ARR installation or
+          verification fails" requirement. This re-check is a FRESH
+          Get-DeltaArrDetectionResult taken after the restart, never a
+          re-read of $Detection or a bare trust in
+          Set-WebConfigurationProperty/Add-WebConfigurationProperty's
+          own lack of a thrown error.
     #>
     param([Parameter(Mandatory)][PSCustomObject]$Detection)
 
@@ -822,28 +906,63 @@ No further IIS setup will be attempted. Review any errors above and re-run this 
 "@
     }
 
-    if ($Detection.ProxyEnabled) {
+    $propertiesToSet = [System.Collections.Generic.List[string]]::new()
+    if (-not $Detection.ProxyEnabled) { $propertiesToSet.Add('enabled') }
+    if (-not $Detection.PreserveHostHeaderEnabled) { $propertiesToSet.Add('preserveHostHeader') }
+
+    # Only the specific names still missing from the machine-wide
+    # allowedServerVariables collection - never re-adds a name already
+    # present (Add-WebConfigurationProperty would throw "item already
+    # exists" for a duplicate add).
+    $missingServerVariableNames = @()
+    if (-not $Detection.ForwardedServerVariablesAllowed) {
+        $configuredNames = Get-DeltaIisAllowedServerVariableNames
+        $missingServerVariableNames = @($Script:DeltaIisRequiredForwardedServerVariables | Where-Object { $configuredNames -notcontains $_ })
+    }
+
+    if ($propertiesToSet.Count -eq 0 -and $missingServerVariableNames.Count -eq 0) {
         return
     }
 
-    Write-Step 'Enabling the IIS reverse proxy (system.webServer/proxy)...'
     if (-not (Test-DeltaWebAdministrationModuleAvailable)) {
-        Stop-Setup 'The WebAdministration PowerShell module is unavailable, so system.webServer/proxy cannot be enabled. Re-run Phase 3 (Microsoft IIS Installation) first.'
+        Stop-Setup 'The WebAdministration PowerShell module is unavailable, so system.webServer/proxy cannot be configured. Re-run Phase 3 (Microsoft IIS Installation) first.'
     }
+    Import-Module WebAdministration -ErrorAction Stop
 
+    Write-Step 'Configuring the IIS reverse proxy (system.webServer/proxy)...'
     try {
-        Import-Module WebAdministration -ErrorAction Stop
-        Set-WebConfigurationProperty -Filter 'system.webServer/proxy' -Name 'enabled' -Value 'True' -PSPath 'MACHINE/WEBROOT/APPHOST' -ErrorAction Stop
+        if ($propertiesToSet.Contains('enabled')) {
+            Set-WebConfigurationProperty -Filter 'system.webServer/proxy' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $true -ErrorAction Stop
+            Write-Detail 'enabled -> True'
+        }
+        if ($propertiesToSet.Contains('preserveHostHeader')) {
+            Set-WebConfigurationProperty -Filter 'system.webServer/proxy' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'preserveHostHeader' -Value $true -ErrorAction Stop
+            Write-Detail 'preserveHostHeader -> True'
+        }
+        foreach ($name in $missingServerVariableNames) {
+            # allowedServerVariables, not templates\iis\web.config's own
+            # site-level rewrite rule - confirmed directly (real IIS
+            # testing) that this section is locked (overrideModeDefault=
+            # "Deny") at the server level by default, so a site-level
+            # declaration fails EVERY request with HTTP 500.52 instead of
+            # merely omitting the header. See
+            # Test-DeltaIisForwardedServerVariablesAllowed's own header.
+            Add-WebConfigurationProperty -Filter 'system.webServer/rewrite/allowedServerVariables' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name '.' -Value @{name = $name } -ErrorAction Stop
+            Write-Detail "allowedServerVariables += $name"
+        }
     }
     catch {
-        Stop-Setup "Failed to enable system.webServer/proxy: $($_.Exception.Message)"
+        Stop-Setup "Failed to configure system.webServer/proxy: $($_.Exception.Message)"
     }
 
-    if (-not (Test-DeltaIisProxyEnabled)) {
-        Stop-Setup 'system.webServer/proxy was set, but verification still reports it as disabled. No further IIS setup will be attempted.'
+    Restart-DeltaIisForArrConfiguration
+
+    $postRestartDetection = Get-DeltaArrDetectionResult
+    if (-not $postRestartDetection.ProxyEnabled -or -not $postRestartDetection.PreserveHostHeaderEnabled -or -not $postRestartDetection.ForwardedServerVariablesAllowed) {
+        Stop-Setup 'system.webServer/proxy was configured, but a fresh check after restarting IIS still reports it as incomplete. No further IIS setup will be attempted.'
     }
 
-    Write-Success '    Reverse proxy enabled.'
+    Write-Success '    Reverse proxy configured.'
 }
 
 function Invoke-DeltaArrSetup {
@@ -868,14 +987,16 @@ function Invoke-DeltaArrSetup {
 
     $missingComponents = Get-DeltaArrMissingComponents -Detection $detection
     $proxyNeedsEnabling = -not $detection.ProxyEnabled
+    $preserveHostHeaderNeedsEnabling = -not $detection.PreserveHostHeaderEnabled
+    $forwardedServerVariablesNeedAllowing = -not $detection.ForwardedServerVariablesAllowed
 
-    if ($missingComponents.Count -eq 0 -and -not $proxyNeedsEnabling) {
+    if ($missingComponents.Count -eq 0 -and -not $proxyNeedsEnabling -and -not $preserveHostHeaderNeedsEnabling -and -not $forwardedServerVariablesNeedAllowing) {
         Write-Host ''
         Write-Detail 'Microsoft IIS reverse-proxy prerequisites are already fully configured.'
         return [PSCustomObject]@{ Ready = $true }
     }
 
-    if (-not (Read-DeltaArrInstallConfirmation -MissingComponents $missingComponents -ProxyNeedsEnabling $proxyNeedsEnabling)) {
+    if (-not (Read-DeltaArrInstallConfirmation -MissingComponents $missingComponents -ProxyNeedsEnabling $proxyNeedsEnabling -PreserveHostHeaderNeedsEnabling $preserveHostHeaderNeedsEnabling -ForwardedServerVariablesNeedAllowing $forwardedServerVariablesNeedAllowing)) {
         Show-DeltaIisInstallCancelledNotice
         return [PSCustomObject]@{ Ready = $false }
     }
@@ -1543,16 +1664,20 @@ function Show-DeltaIisDiscoverySummary {
 # refused) is a complete, reported no-op.
 #
 # Only once that's resolved (or never applied at all) does the raw,
-# low-level safety net run - the same Get-ListeningTcpPortOwner
-# (lib\DeltaInstaller.Common.ps1, generic) primitive setup-nginx.ps1's own
-# Test-RequiredPortAvailability already uses, adapted here to IIS's own
-# ownership signal: a port already owned by IIS's own W3SVC service is
-# never a conflict (that's IIS's own normal operation, not something
-# competing with it), matched by ServiceName rather than an executable
-# path the way NGINX's own self-check is (IIS's own listener is
-# kernel-mode http.sys, not a distinguishable nginx.exe-style process).
-# This only ever catches a port Doctor genuinely cannot attribute to a
-# DELTA-managed provider at all.
+# low-level safety net run - Get-ListeningTcpPortOwner
+# (lib\DeltaInstaller.Common.ps1, generic) still supplies the raw
+# TCP-listener signal setup-nginx.ps1's own Test-RequiredPortAvailability
+# uses, but IIS's own "is this port already mine" question is answered by
+# Get-DeltaIisPortBindingOwnership (lib\DeltaDoctor.IIS.ps1) instead, never
+# by the raw owner's ServiceName - confirmed directly (real IIS testing)
+# that HTTP.sys-owned listeners are always attributed to PID 4 ("System")
+# by Windows, which resolves to no Win32_Service entry at all, so a
+# ServiceName-based "is this W3SVC" check can never actually match on a
+# real machine. IIS's own binding configuration is the only authoritative
+# source for "does IIS itself already own this port," regardless of which
+# PID/process the OS attributes the underlying kernel-mode listener to.
+# This only ever catches a port Doctor genuinely cannot attribute to
+# IIS's own bindings or a DELTA-managed provider at all.
 #
 # Deliberately called ONLY on the fresh-install path (this script's own
 # Orchestration section, below) - Invoke-DeltaIisConfigurationCheckup is
@@ -1566,21 +1691,38 @@ function Test-DeltaIisRequiredPortAvailability {
     <#
       The IIS analogue of setup-nginx.ps1's own Test-RequiredPortAvailability -
       see this section's own header for why "available" means free OR
-      already owned by IIS's own W3SVC service here, rather than an exact
-      executable-path match.
+      already owned by an IIS website IIS itself is safe to co-exist with
+      (Get-DeltaIisPortBindingOwnership, lib\DeltaDoctor.IIS.ps1) here,
+      never an exact executable-path match, and never the raw TCP owner's
+      ServiceName (a real, confirmed-broken signal for IIS - see this
+      section's own header).
+
+      Order matters: the raw listener check runs first (a completely free
+      port is trivially available, no need to ask IIS anything), and only
+      once something IS listening does this consult IIS's own binding
+      data - 'Delta' (the DELTA-managed site itself) and 'DefaultWebSite'
+      (a verified stock Default Web Site) are both IIS's own normal
+      operation, never a conflict with itself; 'Other' (a real, unrelated
+      IIS website) and no IIS binding at all (some non-IIS process) both
+      remain genuine conflicts, reported via $Owner exactly as before -
+      $IisSiteName is populated only for the 'Other' case, so
+      Show-DeltaIisPortConflictNotice can name the actual offending IIS
+      website instead of a bare PID 4/"System".
     #>
     param([Parameter(Mandatory)][int]$Port)
 
     $owner = Get-ListeningTcpPortOwner -Port $Port
     if (-not $owner) {
-        return [PSCustomObject]@{ Port = $Port; Available = $true; Owner = $null }
+        return [PSCustomObject]@{ Port = $Port; Available = $true; Owner = $null; IisSiteName = $null }
     }
 
-    if ($owner.ServiceName -eq 'W3SVC') {
-        return [PSCustomObject]@{ Port = $Port; Available = $true; Owner = $owner }
+    $binding = Get-DeltaIisPortBindingOwnership -Port $Port
+    if ($binding -and $binding.Classification -in @('Delta', 'DefaultWebSite')) {
+        return [PSCustomObject]@{ Port = $Port; Available = $true; Owner = $owner; IisSiteName = $null }
     }
 
-    return [PSCustomObject]@{ Port = $Port; Available = $false; Owner = $owner }
+    $iisSiteName = if ($binding -and $binding.Classification -eq 'Other') { $binding.SiteName } else { $null }
+    return [PSCustomObject]@{ Port = $Port; Available = $false; Owner = $owner; IisSiteName = $iisSiteName }
 }
 
 function Show-DeltaIisPortConflictNotice {
@@ -1606,6 +1748,18 @@ function Show-DeltaIisPortConflictNotice {
     Write-Host ''
     Write-Detail 'In Use'
     Write-Host ''
+    if ($PortCheck.IisSiteName) {
+        # A real, unrelated IIS website (Get-DeltaIisPortBindingOwnership's
+        # own 'Other' classification) - named specifically here rather than
+        # left to the raw TCP owner's own PID 4/"System" (HTTP.sys-owned
+        # listeners are always attributed that way, never to a
+        # per-site-identifiable process - see Test-DeltaIisRequiredPortAvailability's
+        # own header).
+        Write-Host 'IIS Website'
+        Write-Host ''
+        Write-Detail $PortCheck.IisSiteName
+        Write-Host ''
+    }
     Write-Host 'Process'
     Write-Host ''
     Write-Detail $(if ($PortCheck.Owner.ProcessName) { $PortCheck.Owner.ProcessName } else { 'Unknown' })
@@ -1626,7 +1780,12 @@ function Show-DeltaIisPortConflictNotice {
     Write-Host ''
     Write-Host 'IIS requires this port to be free to bind the DELTA website.'
     Write-Host ''
-    Write-Host 'Stop the application using this port and rerun setup-iis.ps1.'
+    if ($PortCheck.IisSiteName) {
+        Write-Host "Stop the '$($PortCheck.IisSiteName)' website (or free this port by hand) and rerun setup-iis.ps1."
+    }
+    else {
+        Write-Host 'Stop the application using this port and rerun setup-iis.ps1.'
+    }
 
     Write-Host ''
     Write-Host 'No changes have been made.'
@@ -1844,15 +2003,25 @@ function Show-DeltaIisManagementMenu {
       Status/Binding/Backend/Application Pool reflect whatever the
       just-run action actually changed, rather than a stale snapshot.
 
-      $ReverseProxyState is Doctor's own already-computed
-      Get-DeltaReverseProxyState result (the orchestration block's own -
-      never re-detected here), threaded through to
-      Test-DeltaIisPortPrerequisites at the two points inside this menu
+      Reverse-proxy state gets the exact same "never a stale snapshot"
+      treatment now, not just the site's own facts: a real, confirmed bug
+      had this menu accept a single Get-DeltaReverseProxyState result
+      from its caller (the orchestration block, computed once before the
+      menu was ever entered) and reuse that SAME object at both points
       that actually attempt to bind a port (Start Website, Restart
-      Website) - the Manual Reverse Proxy Handover feature's own IIS
-      side, mirroring setup-nginx.ps1's own Show-DeltaNginxManagementMenu.
+      Website), even though this menu can stay open indefinitely and
+      another provider's own runtime state can genuinely change while it
+      does. Start Website/Restart Website now each call
+      Get-DeltaReverseProxyState (lib\DeltaDoctor.ReverseProxy.ps1) fresh,
+      immediately before Test-DeltaIisPortPrerequisites - the same
+      read-only, non-printing detection primitive Invoke-DeltaReverseProxyDetection
+      itself calls internally, never a second/independent detection of
+      its own. No `-ReverseProxyState` parameter exists on this function
+      anymore for exactly this reason: an initial snapshot threaded in
+      from outside is the shape that caused the bug, so there is
+      deliberately nothing here for a future caller to mistakenly reuse.
     #>
-    param([Parameter(Mandatory)][PSCustomObject]$ReverseProxyState)
+    param()
 
     if (-not (Test-DeltaWebAdministrationModuleAvailable)) {
         Stop-Setup 'The WebAdministration PowerShell module is unavailable, so website management cannot proceed. Re-run Phase 3 (Microsoft IIS Installation) first.'
@@ -1914,13 +2083,15 @@ function Show-DeltaIisManagementMenu {
 
         switch ($choice.Trim()) {
             '1' {
-                Test-DeltaIisPortPrerequisites -ReverseProxyState $ReverseProxyState
+                # Fresh, never the menu-entry snapshot - see this
+                # function's own header for the real bug this fixes.
+                Test-DeltaIisPortPrerequisites -ReverseProxyState (Get-DeltaReverseProxyState)
                 Start-DeltaIisManagedWebsite
                 Show-DeltaIisPostHandoverValidation
             }
             '2' { Stop-DeltaIisManagedWebsite }
             '3' {
-                Test-DeltaIisPortPrerequisites -ReverseProxyState $ReverseProxyState
+                Test-DeltaIisPortPrerequisites -ReverseProxyState (Get-DeltaReverseProxyState)
                 Restart-DeltaIisManagedWebsite
                 Show-DeltaIisPostHandoverValidation
             }
@@ -2053,7 +2224,7 @@ try {
         # attention" posture rather than presenting a menu for a site this
         # script cannot yet vouch for.
         if ($checkup.Healthy) {
-            Show-DeltaIisManagementMenu -ReverseProxyState $reverseProxyState
+            Show-DeltaIisManagementMenu
         }
         exit 0
     }
