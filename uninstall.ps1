@@ -20,6 +20,16 @@
     the PostgreSQL data directory to be removed - see Uninstall-
     PostgreSql/Read-DeleteDataDirectoryChoice.
 
+    Phase 0 (Stop-DeltaRuntimeBeforeUninstall) runs first, before any of
+    that: it stops a currently-running DELTA instance - both the server
+    process and its own launcher - using setup.ps1's own DELTA-runtime
+    detection/stop implementation (promoted to lib\DeltaInstaller.
+    Common.ps1 for this reuse). Without it, uninstalling Node.js while
+    DELTA is still running can kill the server process without killing
+    its launcher (Windows has no parent/child lifetime coupling), leaving
+    an orphaned cmd.exe holding the DELTA runtime's redirected
+    stdout/stderr log handles open indefinitely.
+
     Detection (Show-DetectionSummary) runs once, up front, immediately
     after the operator confirms the destructive-operation warning below,
     and its results ($Script:NodeStatus/$Script:PostgresStatus/
@@ -134,6 +144,74 @@ function Confirm-UninstallIntent {
         Write-Host 'Uninstall canceled. No changes were made.'
         exit 0
     }
+}
+
+# ---------------------------------------------------------------------------
+# Phase 0 - DELTA runtime
+# ---------------------------------------------------------------------------
+
+function Stop-DeltaRuntimeBeforeUninstall {
+    <#
+      Phase 0 - runs before PostGIS/PostgreSQL/Node.js are touched at
+      all. Root-cause finding: uninstalling Node.js while DELTA is still
+      running can terminate the DELTA server process (node.exe) without
+      terminating its own launcher (cmd.exe /c dotenv -e .env -- yarn
+      start, Start-DeltaRuntimeForValidation in setup.ps1) - Windows has
+      no parent/child lifetime coupling, so that launcher can survive
+      indefinitely afterward, still holding the redirected stdout/stderr
+      log file handles open and blocking deletion of the DELTA runtime
+      directory.
+
+      Reuses setup.ps1's own DELTA-runtime detection/stop implementation
+      verbatim (Get-RunningDeltaProcesses, Get-RunningDeltaLauncherProcesses,
+      Stop-RunningDeltaInstance - all promoted to lib\DeltaInstaller.
+      Common.ps1 for exactly this reuse, the same way PostgreSQL/Node.js
+      detection already were) rather than a second, uninstall-specific
+      implementation - the identical, specific, two-signal matching
+      Get-RunningDeltaProcesses already uses for the server process
+      (entry-point suffix + this installation's own runtime root), plus
+      the launcher's own fixed, literal invocation string for the cmd.exe
+      wrapper - never a broad "any node.exe"/"any cmd.exe"/"any process
+      whose command line mentions this path" sweep. Escalating to a
+      forceful kill when graceful shutdown doesn't complete in time, and
+      stopping the whole uninstall outright if even that fails, is
+      Stop-RunningDeltaInstance's own existing behavior, reused unchanged
+      here - see that function's own header.
+
+      A no-op, idempotently, whenever no DELTA installation can be found
+      on this machine at all (Get-DeltaInstallPath) - uninstalling
+      PostGIS/PostgreSQL/Node.js on a machine that never had DELTA
+      deployed, or where the runtime directory is simply gone, has
+      nothing here to detect or stop - and equally when a DELTA
+      installation IS found but nothing matching it is currently
+      running, which is the normal case for a routine uninstall.
+    #>
+    Write-PhaseBanner 'Phase 0 - DELTA Runtime'
+
+    $deltaInstallPath = Get-DeltaInstallPath
+    if (-not $deltaInstallPath) {
+        Write-Detail 'No DELTA installation found on this machine - nothing to stop.'
+        return
+    }
+
+    Write-Step 'Detecting running DELTA instance...'
+    $running = @(Get-RunningDeltaProcesses -DeltaRuntimeRoot $deltaInstallPath) + @(Get-RunningDeltaLauncherProcesses)
+    if ($running.Count -eq 0) {
+        Write-Host ''
+        Write-Host 'No running DELTA instance detected.'
+        return
+    }
+
+    Write-Host ''
+    Write-Host 'DELTA runtime detected.'
+    Write-Host ''
+
+    Write-Step 'Stopping DELTA...'
+    Write-Step 'Waiting for DELTA to exit...'
+    Stop-RunningDeltaInstance -DeltaRuntimeRoot $deltaInstallPath
+
+    Write-Host ''
+    Write-Success 'DELTA runtime stopped successfully.'
 }
 
 # ---------------------------------------------------------------------------
@@ -742,6 +820,7 @@ function Initialize-Uninstall {
 try {
     Confirm-UninstallIntent
     Initialize-Uninstall
+    Stop-DeltaRuntimeBeforeUninstall
     Show-DetectionSummary
     Uninstall-PostGIS
     Uninstall-PostgreSql

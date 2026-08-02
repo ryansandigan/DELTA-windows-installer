@@ -29,6 +29,17 @@
 
 $Script:BannerWidth = 40
 
+# Manual Reverse Proxy Handover (see Invoke-DeltaReverseProxyHandover, further
+# down this file) - set $true only once a handover actually ran and
+# confirmed the other provider's ports released; a caller's own subsequent
+# successful start checks and resets this to trigger the feature's own
+# "run Doctor again" final validation. Initialized here, unconditionally,
+# rather than left for its first read to discover - Set-StrictMode -Version
+# Latest (every entry-point script in this project sets it) throws on a
+# read of a $Script: variable that was never assigned at all, and a run
+# with no handover involved must still be able to check this flag safely.
+$Script:DeltaReverseProxyHandoverOccurred = $false
+
 # The DEFAULT DELTA *runtime* application directory - offered as the
 # bare-Enter default when Read-DeltaAppRoot prompts for where DELTA
 # should actually be deployed. Deliberately separate from
@@ -747,6 +758,302 @@ function Test-DeltaManagedProcessCommandLine {
     return ($hasEntryPoint -and $hasRuntimeRoot)
 }
 
+# The exact, fixed ArgumentList Start-DeltaRuntimeForValidation (setup.ps1)
+# passes to Start-Process when it launches DELTA - defined once, here, so
+# the code that constructs the launcher and the code that has to recognize
+# it again later (Test-DeltaLauncherProcessCommandLine, below - possibly
+# from an entirely different script/run, e.g. uninstall.ps1) can never
+# drift apart into two different literal strings.
+$Script:DeltaLauncherCommandArguments = '/c dotenv -e .env -- yarn start'
+
+function Test-DeltaLauncherProcessCommandLine {
+    <#
+      The launcher-process counterpart to Test-DeltaManagedProcessCommandLine
+      above, for cmd.exe rather than node.exe. Root-cause finding
+      (uninstalling Node.js while DELTA is running can kill node.exe
+      without killing its own launcher, since Windows has no parent/child
+      lifetime coupling): this cmd.exe (Start-DeltaRuntimeForValidation's
+      `cmd.exe /c dotenv -e .env -- yarn start`) sits ABOVE the actual
+      DELTA server process in the real process tree - dotenv-cli -> yarn
+      -> react-router-serve -> node.exe, each hop its own separate
+      process - so, unlike the server's own command line, this cmd.exe's
+      command line never contains the DELTA runtime root or the
+      build/server/index.js entry point; both only ever appear several
+      hops further down. There is no second, independent signal available
+      here the way there is for Test-DeltaManagedProcessCommandLine.
+
+      The strongest signal actually available is therefore an exact match
+      against the complete, fixed argument string this installer itself
+      constructs ($Script:DeltaLauncherCommandArguments) - never a
+      keyword/substring heuristic like "contains dotenv" or "contains
+      yarn", which could also match some unrelated project's own,
+      differently-configured dotenv-cli/yarn invocation elsewhere on the
+      same machine. Whitespace is normalized (collapsed runs of spaces)
+      before comparing, since Win32_Process.CommandLine reflects whatever
+      literal spacing the process was actually created with, and the
+      match is anchored at the end of the (normalized) command line - a
+      real capture is `"C:\WINDOWS\system32\cmd.exe" /c dotenv -e .env --
+      yarn start`, the argument string trailing the resolved cmd.exe path
+      exactly.
+    #>
+    param([AllowNull()][string]$CommandLine)
+
+    if ([string]::IsNullOrEmpty($CommandLine)) {
+        return $false
+    }
+
+    $normalizedCommandLine = ($CommandLine -replace '\s+', ' ').Trim()
+    return $normalizedCommandLine -match ([regex]::Escape($Script:DeltaLauncherCommandArguments) + '$')
+}
+
+# ---------------------------------------------------------------------------
+# DELTA runtime process management
+#
+# Relocated here from setup.ps1 (Get-RunningDeltaProcesses/Wait-
+# ForProcessExit/Invoke-DeltaTaskkill/Stop-RunningDeltaInstance) once
+# uninstall.ps1 needed the exact same "find and stop only THIS
+# installation's own DELTA runtime" behavior setup.ps1 already relies on
+# before starting a fresh instance - the same promotion this file's own
+# functions have already gone through more than once (see e.g. Resolve-
+# DeltaInstallation's own header, promoted from setup-nginx.ps1 once
+# setup-iis.ps1 needed it too). Extended here, not duplicated, to also
+# stop the launcher process (Get-RunningDeltaLauncherProcesses) - see
+# Test-DeltaLauncherProcessCommandLine above for why that needs a
+# different matching strategy than the server process it wraps.
+# ---------------------------------------------------------------------------
+
+function Get-RunningDeltaProcesses {
+    <#
+      Identifies the actual DELTA server process(es) - node.exe running
+      the deployed build\server\index.js entry point from THIS specific
+      runtime directory - rather than every node.exe on the machine.
+      Matching itself is Test-DeltaManagedProcessCommandLine's job above -
+      see that function's own header for the full two-signal algorithm
+      (entry-point suffix + runtime root, both slash/case-normalized) and
+      why a single absolute-path string match was confirmed unreliable
+      and replaced. This function's only job is supplying the live
+      candidate list (CIM) and $DeltaRuntimeRoot to that predicate.
+
+      $DeltaRuntimeRoot is an explicit, mandatory parameter rather than a
+      $Script:DeltaRuntimeRoot read - matching Test-DeltaManagedProcessCommandLine's
+      own convention, and required now that both setup.ps1 and
+      uninstall.ps1 call this: they resolve "where is DELTA" completely
+      differently (Resolve-DeltaAppRoot's interactive prompt vs.
+      Get-DeltaInstallPath's registry/legacy-path lookup), so this
+      function has no business assuming either one, or that a variable of
+      this exact name even exists in the caller's scope.
+
+      Deliberately scoped to the CURRENT, non-service runtime only - see
+      Test-DeltaManagedProcessCommandLine's own header for why a future
+      Windows Service-managed instance (Phase 5) should be identified via
+      the Service Control Manager instead of an extension of this
+      heuristic.
+
+      An ordinary PowerShell function, not array-guaranteed: like any
+      command whose result count varies (0, 1, or many), a caller that
+      needs collection semantics - .Count, a guaranteed-list foreach,
+      indexing - is responsible for wrapping its own call, e.g. @(Get-
+      RunningDeltaProcesses ...), rather than this function trying to
+      force array-ness on every possible caller regardless of what it
+      actually needs. (That would not even be reliably done here:
+      PowerShell's implicit return/Write-Output re-enumerates whatever
+      array it's given, so a bare `return @(...)` collapses right back to
+      $null or a scalar for a 0- or 1-element result by the time a caller
+      sees it - confirmed directly to throw "The property 'Count' cannot
+      be found on this object" under Set-StrictMode -Version Latest, from
+      exactly this shape.) Stop-RunningDeltaInstance is this function's
+      one caller that actually needs array semantics, and wraps at its
+      own call site accordingly; setup.ps1's Resolve-DeltaApplicationPort
+      (piped directly) and Confirm-DeltaRuntimeStarted (boolean context)
+      don't need to, and deliberately don't.
+    #>
+    param([Parameter(Mandatory)][string]$DeltaRuntimeRoot)
+
+    $candidates = Get-CimInstance -ClassName Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue
+    if (-not $candidates) {
+        return @()
+    }
+
+    return @($candidates | Where-Object { Test-DeltaManagedProcessCommandLine -CommandLine $_.CommandLine -DeltaRuntimeRoot $DeltaRuntimeRoot })
+}
+
+function Get-RunningDeltaLauncherProcesses {
+    <#
+      The launcher counterpart to Get-RunningDeltaProcesses above -
+      supplies the live cmd.exe candidate list to
+      Test-DeltaLauncherProcessCommandLine. Takes no $DeltaRuntimeRoot
+      parameter, unlike Get-RunningDeltaProcesses - see that predicate's
+      own header for why the runtime root isn't an available signal on
+      this specific process's command line.
+
+      Same non-array-guaranteed return convention as Get-RunningDeltaProcesses
+      - callers needing collection semantics wrap their own call, e.g.
+      @(Get-RunningDeltaLauncherProcesses).
+    #>
+    $candidates = Get-CimInstance -ClassName Win32_Process -Filter "Name = 'cmd.exe'" -ErrorAction SilentlyContinue
+    if (-not $candidates) {
+        return @()
+    }
+
+    return @($candidates | Where-Object { Test-DeltaLauncherProcessCommandLine -CommandLine $_.CommandLine })
+}
+
+function Wait-ForProcessExit {
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [int]$TimeoutSeconds = 10
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+
+    return -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
+}
+
+function Invoke-DeltaTaskkill {
+    <#
+      Runs taskkill.exe for $ProcessId (plus $ExtraArguments, e.g. '/F'),
+      without ever letting its own stderr reach the console or abort the
+      script - confirmed directly that redirecting a failing native
+      command's stderr through PowerShell (2>, in any form - merged with
+      2>&1, or sent to a file - makes no difference) wraps each line in a
+      terminating NativeCommandError under this project's own
+      Set-StrictMode -Version Latest + $ErrorActionPreference = 'Stop',
+      even though the exact same call with NO stderr redirection at all
+      merely lets taskkill's raw text (e.g. "ERROR: The process with PID
+      nnnn could not be terminated. Reason: This process can only be
+      terminated forcefully...") print straight to the console instead.
+      Neither behavior is acceptable here: that message describes the
+      GRACEFUL attempt not having worked yet, which is a normal,
+      expected, already-handled outcome (Stop-RunningDeltaInstance falls
+      back to /F for exactly this reason) - not a real error, and
+      definitely not something that should be allowed to throw.
+
+      $ErrorActionPreference is relaxed to 'Continue' for only the
+      duration of this one call (restored immediately after, even on a
+      throw, via try/finally) so the redirected stderr can be captured
+      instead of raised - Test-DeltaDatabaseExists uses this exact
+      pattern for the same class of problem, not a new technique
+      introduced here.
+
+      The captured text is never shown on the console - only handed to
+      Write-Verbose, so an operator who wants to see exactly what
+      Windows said can re-run with -Verbose, while the normal
+      install/uninstall output stays clean. This changes nothing about
+      whether or how taskkill is invoked, its arguments, or its
+      timeout/retry behavior - all of that still belongs entirely to
+      Stop-RunningDeltaInstance.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [string[]]$ExtraArguments = @()
+    )
+
+    $argumentList = @('/PID', $ProcessId) + $ExtraArguments
+    $previousEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $captured = & taskkill.exe $argumentList 2>&1
+    }
+    finally {
+        $ErrorActionPreference = $previousEap
+    }
+
+    $capturedText = ($captured | ForEach-Object { $_.ToString() } | Where-Object { $_ }) -join "`n"
+    if ($capturedText) {
+        Write-Verbose "taskkill.exe $($argumentList -join ' '): $capturedText"
+    }
+}
+
+function Stop-RunningDeltaInstance {
+    <#
+      Stops any DELTA runtime already running for this specific
+      installation - both the server process(es) (Get-RunningDeltaProcesses)
+      and, since a normal graceful shutdown of the server does not
+      guarantee its own launcher chain unwinds with it (root-cause
+      finding: Windows has no parent/child lifetime coupling - see
+      Test-DeltaLauncherProcessCommandLine's own header), the launcher
+      process(es) too (Get-RunningDeltaLauncherProcesses). Never touches
+      any other node.exe or cmd.exe process on the machine - both
+      predicates require an exact, specific match, never a generic sweep
+      by process name alone.
+
+      Server processes are stopped first, launcher processes second - not
+      an arbitrary order: array concatenation (@(...) + @(...)) below
+      preserves left-to-right order, and stopping the actual listening
+      server before its launcher avoids ever tearing down the launcher
+      while the server it wraps is still bound to the application port.
+      In the normal case (DELTA was already shutting down cleanly, not
+      recovering from a previous Node.js removal that killed the server
+      out from under an orphaned launcher), the launcher will typically
+      already have exited on its own by the time this function gets to
+      it, making that second stage a normal, harmless no-op.
+
+      Attempts a graceful stop first (`taskkill` without /F, which sends
+      a close request the process can react to) and only escalates to a
+      forceful kill if it hasn't exited within the grace period -
+      Windows has no native SIGTERM, and this project's own findings
+      (docs/06 - Windows Service shutdown behavior) already note that a
+      clean shutdown handshake isn't guaranteed here regardless of
+      method, so this makes a real attempt rather than jumping straight
+      to a forceful kill.
+
+      The console only ever reports what actually happened: a quiet
+      success line when the graceful attempt alone worked, one
+      informational line when it didn't and the (designed, expected)
+      force fallback took over, and an error only in the one case
+      that's genuinely fatal - both attempts failing. Falling back to
+      force is not itself a failure, so it's never reported as one - see
+      Invoke-DeltaTaskkill for why Windows' own "could not be
+      terminated" message specifically must never reach the console
+      either, on top of that.
+    #>
+    param([Parameter(Mandatory)][string]$DeltaRuntimeRoot)
+
+    # @() wraps each call, not just the combined result, so a single
+    # match from either source is never unwrapped to a bare object
+    # before .Count/foreach below treat it as a list - see
+    # Get-RunningDeltaProcesses' own header for why that guarantee
+    # belongs here, at the one call site that needs it, rather than
+    # inside either function itself.
+    $processes = @(Get-RunningDeltaProcesses -DeltaRuntimeRoot $DeltaRuntimeRoot) + @(Get-RunningDeltaLauncherProcesses)
+    if (-not $processes -or $processes.Count -eq 0) {
+        Write-Detail 'No running DELTA instance detected.'
+        return
+    }
+
+    foreach ($proc in $processes) {
+        Write-Step 'Stopping existing DELTA...'
+
+        Invoke-DeltaTaskkill -ProcessId $proc.ProcessId
+        if (-not (Wait-ForProcessExit -ProcessId $proc.ProcessId -TimeoutSeconds 10)) {
+            Write-Host ''
+            Write-Detail 'Graceful shutdown did not complete.'
+            Write-Host ''
+            Write-Step 'Forcing shutdown...'
+            Invoke-DeltaTaskkill -ProcessId $proc.ProcessId -ExtraArguments @('/F')
+
+            if (-not (Wait-ForProcessExit -ProcessId $proc.ProcessId -TimeoutSeconds 10)) {
+                Stop-Setup @"
+Unable to stop the existing DELTA instance.
+
+PID:
+$($proc.ProcessId)
+
+The installer cannot safely continue while the previous DELTA instance is still running.
+"@
+            }
+        }
+
+        Write-Success '    DELTA stopped successfully.'
+    }
+}
+
 # ---------------------------------------------------------------------------
 # .env file reading
 # ---------------------------------------------------------------------------
@@ -1211,6 +1518,272 @@ Correct the PORT value in the DELTA .env file, then re-run this script.
         $Script:DeltaBackendPort = [int]$rawPort
         Write-Success "    Backend port detected: $($Script:DeltaBackendPort)"
     }
+}
+
+function Test-DeltaTcpPortListening {
+    <#
+      Reports whether $Port has a socket in the LISTEN state anywhere on
+      this machine - the same Get-NetTCPConnection check setup-nginx.ps1's
+      own Test-DeltaNginxPortListening already uses, promoted here as a
+      generic, DELTA/NGINX/IIS-agnostic primitive so doctor.ps1 can reuse
+      it for its own "is the backend actually responding" check without
+      growing a second copy of it. A successful connect from localhost
+      would not by itself confirm the DELTA backend's own bind succeeded -
+      it could just as easily hit an unrelated listener already using that
+      port - so this checks LISTEN state directly rather than attempting a
+      raw TCP connection, matching Test-DeltaNginxPortListening's own
+      reasoning.
+    #>
+    param([Parameter(Mandatory)][int]$Port)
+
+    return [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+}
+
+function Get-DeltaProcessById {
+    <#
+      A safe Get-Process -Id wrapper that returns $null instead of
+      throwing for any invalid, negative, or nonexistent ID. Originally
+      lib\DeltaDoctor.NGINX.ps1's own private helper (needed because
+      every PID handled by its Managed Runtime State section ultimately
+      comes from a pid file that file does not control the contents of -
+      see that section's own header) - promoted here, generic and
+      NGINX-agnostic in its own right, once Get-ListeningTcpPortOwner
+      (below) needed the identical "resolve a PID without ever throwing"
+      behavior for a completely different purpose (reverse proxy port
+      conflict detection, not pid-file validation).
+    #>
+    param([Parameter(Mandatory)][int]$ProcessId)
+
+    try {
+        return Get-Process -Id $ProcessId -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-ListeningTcpPortOwner {
+    <#
+      For $Port, returns a [PSCustomObject] describing whoever is bound to
+      it in the LISTEN state - ProcessId, ProcessName, ExecutablePath, and
+      (diagnostic only) ServiceName - or $null if nothing is listening on
+      it at all. Originally setup-nginx.ps1's own private helper behind
+      its port-prerequisite check - promoted here, generic and
+      DELTA/NGINX/IIS-agnostic in its own right (it has no opinion on
+      WHO should own a port, only who currently does), once setup-iis.ps1
+      needed the identical primitive for its own port-prerequisite check
+      (the Manual Reverse Proxy Handover feature - see
+      Invoke-DeltaReverseProxyHandover, below). Get-NetTCPConnection
+      supplies the owning PID; Get-DeltaProcessById resolves the process
+      itself without throwing if it has already exited; the Windows
+      Service Name, if any, is resolved via CIM (Win32_Service) purely
+      for a caller's own diagnosis or ownership heuristic (e.g. IIS's own
+      W3SVC) - never consulted here to decide whether a port is free.
+    #>
+    param([Parameter(Mandatory)][int]$Port)
+
+    $connection = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $connection) {
+        return $null
+    }
+
+    $ownerProcessId = $connection.OwningProcess
+    $process        = Get-DeltaProcessById -ProcessId $ownerProcessId
+
+    $executablePath = $null
+    if ($process) {
+        try { $executablePath = $process.Path } catch { $executablePath = $null }
+    }
+
+    $serviceName = $null
+    try {
+        $service = Get-CimInstance -ClassName Win32_Service -Filter "ProcessId = $ownerProcessId" -ErrorAction Stop | Select-Object -First 1
+        if ($service) { $serviceName = $service.Name }
+    }
+    catch {
+        $serviceName = $null
+    }
+
+    return [PSCustomObject]@{
+        Port           = $Port
+        ProcessId      = $ownerProcessId
+        ProcessName    = if ($process) { $process.ProcessName } else { $null }
+        ExecutablePath = $executablePath
+        ServiceName    = $serviceName
+    }
+}
+
+function Wait-DeltaPortsReleased {
+    <#
+      Polls (Wait-Until) until every port in $Ports reports free
+      (Test-DeltaTcpPortListening), or $TimeoutSeconds elapses - the
+      release-side counterpart to Test-DeltaTcpPortListening itself.
+      Needed by the Manual Reverse Proxy Handover feature
+      (Invoke-DeltaReverseProxyHandover, below) to confirm a just-stopped
+      reverse proxy provider has actually let go of its ports before the
+      other provider attempts to bind them - a stop signal returning is
+      not the same guarantee as the socket actually closing. Returns the
+      [int[]] of ports STILL occupied when it gives up - an empty array
+      on success - so a caller can report exactly what didn't release
+      rather than a bare failure. Generic, DELTA/NGINX/IIS-agnostic.
+    #>
+    param(
+        [Parameter(Mandatory)][int[]]$Ports,
+        [int]$TimeoutSeconds = 10
+    )
+
+    Wait-Until -Condition { @($Ports | Where-Object { Test-DeltaTcpPortListening -Port $_ }).Count -eq 0 } -TimeoutSeconds $TimeoutSeconds | Out-Null
+
+    return ,@($Ports | Where-Object { Test-DeltaTcpPortListening -Port $_ })
+}
+
+# ---------------------------------------------------------------------------
+# Manual Reverse Proxy Handover
+# ---------------------------------------------------------------------------
+#
+# NOT automatic migration - the administrator remains fully in control.
+# Doctor (lib\DeltaDoctor.ReverseProxy.ps1, plus each provider's own
+# lib\DeltaDoctor.<Provider>.ps1) remains the sole source of truth for
+# WHICH provider is active/DELTA-managed AND for what a handover actually
+# requires (its own Handover Plan - Get-DeltaReverseProxyHandoverPlan); this
+# section only ever presents an already-Doctor-built plan as a concise
+# prompt, then executes it exactly as Doctor specified via the plan's own
+# captured Execute reference. Deliberately lives here, not in
+# lib\DeltaDoctor.ReverseProxy.ps1 - Doctor itself must stay completely
+# read-only and never perform a lifecycle operation (see that file's own
+# header); this is generic orchestration infrastructure (a confirmation
+# prompt, a poll, an exit code), with zero provider-specific knowledge of
+# its own, consumed identically by setup-iis.ps1 and setup-nginx.ps1.
+
+function Invoke-DeltaReverseProxyHandover {
+    <#
+      The one shared "show Doctor's own Handover Plan, ask whether to
+      execute it, execute it, and confirm its ports actually let go" flow -
+      consumed identically by setup-iis.ps1 (when NGINX is DELTA's active
+      reverse proxy and IIS is about to bind) and setup-nginx.ps1 (the
+      reverse). $Plan is Doctor's own already-built
+      Get-DeltaReverseProxyHandoverPlan result
+      (lib\DeltaDoctor.ReverseProxy.ps1) - this function performs no
+      ownership detection, port discovery, or "what needs to be stopped"
+      reasoning of its own; it only ever presents and carries out a plan
+      Doctor has already fully decided, per this feature's own "no reverse
+      proxy ownership detection outside Doctor" requirement and its own
+      "Doctor plans, provisioning scripts execute" architecture
+      correction.
+
+      ARCHITECTURE CORRECTION: an earlier version of this function took a
+      single hardcoded $StopAction (e.g. "stop the DELTA website") and
+      trusted that stopping it alone would release the required ports.
+      Confirmed false on a real machine: IIS's own stock "Default Web
+      Site" can independently hold the exact same port, and stopping only
+      DELTA's own site left it fully occupied. $Plan.IsSafe/$Plan.Reason
+      are what let this function refuse automatic handover outright,
+      before ever prompting, when Doctor itself determined stopping
+      everything necessary would not be safe (an unrecognized site/object
+      also occupying the port - see each provider's own GetHandoverPlan
+      for the full safety reasoning) - this function trusts that verdict
+      completely rather than second-guessing it.
+
+      Prompts concisely, per this feature's own explicit UX requirement -
+      "The current active DELTA reverse proxy is: <Name>", the plan's own
+      $Plan.Actions (e.g. "Stop Website: DELTA", "Stop Website: Default
+      Web Site" - exactly what will happen, never hidden behind a vague
+      per-provider label), then "Stop the current active reverse proxy?" -
+      never re-explaining what a reverse proxy is or repeating detail
+      Doctor's own report already showed. Defaults to No
+      (Read-DeltaYesNoConfirmation's own "blank means the safe choice"
+      convention) and, per this feature's own explicit requirement, asks
+      EXACTLY ONCE - answering Yes runs $Plan.Execute immediately (a
+      scriptblock reference to that provider's own
+      Invoke-Delta<Provider>ReverseProxyHandoverPlan, captured by the plan
+      itself when Doctor built it - this function has no per-provider
+      knowledge of how to carry a plan out, only how to ask about and
+      verify one), with no second confirmation.
+
+      Returns [bool] - $true once $Plan.Execute has actually run AND every
+      one of $Plan.RequiredPorts is confirmed released
+      (Wait-DeltaPortsReleased), and marks
+      $Script:DeltaReverseProxyHandoverOccurred so the caller's own
+      subsequent successful start can trigger the "run Doctor again"
+      final validation this feature's own design calls for. Also returns
+      $true, immediately and without prompting, when $Plan.Actions is
+      empty - Get-DeltaReverseProxyHandoverPlan (lib\DeltaDoctor.ReverseProxy.ps1)
+      now consults every DELTA-managed candidate provider regardless of
+      whether Doctor considers it Active, so a genuinely empty plan (that
+      candidate's own real estate simply isn't occupying anything right
+      now) is a legitimate, common result, not an edge case - asking the
+      administrator to confirm an empty action list would be nothing but
+      noise, and $Script:DeltaReverseProxyHandoverOccurred is deliberately
+      left untouched here, since nothing was actually stopped for the
+      "run Doctor again" validation to be worth re-checking. Returns
+      $false both on a declined prompt AND on an unsafe plan (both a
+      complete, reported no-op - nothing this function owns was ever
+      touched) - a caller does not need to distinguish the two, since
+      neither one leaves anything to clean up. If the ports remain
+      occupied after $Plan.Execute completes, this stops the script
+      outright (Stop-Setup) - a plan that ran but didn't actually free the
+      port is not a state either caller should ever silently continue
+      past.
+    #>
+    param([Parameter(Mandatory)][PSCustomObject]$Plan)
+
+    if (-not $Plan.IsSafe) {
+        Write-Host ''
+        Write-Host ('-' * $Script:BannerWidth)
+        Write-Host ''
+        Write-Host 'Automatic handover is not possible.'
+        Write-Host ''
+        Write-Detail $Plan.Reason
+        Write-Host ''
+        Write-Host 'Resolve this by hand, then re-run this script.'
+        Write-Host ''
+        Write-Host ('-' * $Script:BannerWidth)
+        Write-Host ''
+        return $false
+    }
+
+    if ($Plan.Actions.Count -eq 0) {
+        Write-Host ''
+        Write-Detail "Nothing to hand over - $($Plan.Provider) is not occupying any required port."
+        Write-Host ''
+        return $true
+    }
+
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+    Write-Host ''
+    Write-Host 'The current active DELTA reverse proxy is:'
+    Write-Host ''
+    Write-Detail $Plan.Provider
+    Write-Host ''
+    Write-Host 'The following actions will be performed:'
+    Write-Host ''
+    foreach ($action in $Plan.Actions) {
+        Write-Detail $action
+    }
+    Write-Host ''
+
+    $wantsStop = Read-DeltaYesNoConfirmation -Body { Write-Host 'Stop the current active reverse proxy?' }
+
+    if (-not $wantsStop) {
+        Write-Host ''
+        Write-Detail 'No changes have been made.'
+        Write-Host ''
+        return $false
+    }
+
+    & $Plan.Execute -Plan $Plan
+
+    Write-Step 'Verifying required ports were released...'
+    $stillOccupied = Wait-DeltaPortsReleased -Ports $Plan.RequiredPorts
+
+    if ($stillOccupied.Count -gt 0) {
+        Stop-Setup "$($Plan.Provider) handover actions completed, but the following port(s) are still occupied: $($stillOccupied -join ', '). Resolve this before re-running the script."
+    }
+
+    Write-Success '    Ports released.'
+    $Script:DeltaReverseProxyHandoverOccurred = $true
+    return $true
 }
 
 # ---------------------------------------------------------------------------

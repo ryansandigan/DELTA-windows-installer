@@ -21,30 +21,61 @@
     C:\DELTA path itself. No installation found means nothing else in this
     script runs.
 
+    ARCHITECTURE CORRECTION: immediately once DELTA is confirmed, Doctor's
+    own Reverse Proxy Detection (Invoke-DeltaReverseProxyDetection,
+    lib\DeltaDoctor.ReverseProxy.ps1) runs - answering "what is DELTA's
+    current reverse proxy state" (which providers exist, which are
+    actually DELTA-managed, which one is currently active) before this
+    script makes ANY workflow decision of its own. This script never
+    independently re-derives that answer from raw TCP ports/processes -
+    see this file's own Orchestration section header, and
+    lib\DeltaDoctor.ReverseProxy.ps1's own header, for the full principle.
+
+    Low-level checks stay lazy, never a blanket front gate: Doctor's own
+    report is what this script consumes to decide what to do next - it
+    never re-opens a diagnostic sequence Doctor has already run.
+    Test-DeltaNginxPortPrerequisites (Operational safety enhancement,
+    below) does NOT run the moment this script starts - it runs only
+    immediately before an operation that actually needs to bind those
+    ports (a fresh install, or explicitly starting/restarting an existing
+    managed NGINX from the management menu). Simply running this script
+    to inspect an existing installation, or to Validate/Reload one that's
+    already running, never requires port 80 to be free, and no longer
+    fails as though it did.
+
     Conservative by design: installing a FRESH copy of NGINX is something
     this script is willing to automate; modifying an EXISTING one is not.
     Once a DELTA installation has been confirmed, the next thing this
     script does - before installing anything, before writing a single
     configuration file - is check whether C:\nginx\nginx.exe already
-    exists. If it does, the script hands off to an interactive management
-    menu (Show-DeltaNginxManagementMenu) instead of installing or
+    exists. If it does, the script prints a one-line, Doctor-derived
+    summary of NGINX's own role in the current deployment (Active/Standby/
+    neither) and hands off to an interactive management menu
+    (Show-DeltaNginxManagementMenu) instead of installing or
     reconfiguring anything - nothing here ever touches nginx.conf/
     delta.conf or installs anything, and the options offered depend on
-    Get-DeltaNginxRuntimeState (see the "Runtime state" section below):
-    Validate/Reload/Restart/Stop/Exit when actually Running, just Start/
-    Exit when cleanly Stopped, and a specific explanation plus Force Stop/
-    Exit when Broken (an inconsistency between the pid file and the
-    process list - see that section's own header for why this exists and
-    what it protects against). This installer must never assume it owns
-    an existing NGINX installation - a real, hand-configured,
-    already-running reverse proxy at this exact default path is a
-    realistic thing to find on a real machine, not a hypothetical edge
-    case, and overwriting it would be a production incident, not a
-    convenience.
+    Get-DeltaNginxRuntimeState (lib\DeltaDoctor.NGINX.ps1's own Managed
+    Runtime State machine): Validate/Reload/Restart/Stop/Exit when
+    actually Running, just Start/Exit when cleanly Stopped, and a specific
+    explanation plus Force Stop/Exit when Broken (an inconsistency between
+    the pid file and the process list - see that file's own header for
+    why this exists and what it protects against). This installer must
+    never assume it owns an existing NGINX installation - a real,
+    hand-configured, already-running reverse proxy at this exact default
+    path is a realistic thing to find on a real machine, not a
+    hypothetical edge case, and overwriting it would be a production
+    incident, not a convenience.
 
-    Only once that check has passed (no existing installation found) does
-    it ask for one more explicit confirmation - Read-DeltaNginxInstallConfirmation,
-    a Y/N prompt (default No) naming the version to be installed and the
+    If, instead, NGINX does NOT exist yet, Doctor's own reverse proxy
+    state decides what happens next before anything else does: if another
+    provider (IIS) is already DELTA's active reverse proxy, this is
+    recognized as an attempt to configure a SECOND, competing reverse
+    proxy - Read-DeltaNginxSecondReverseProxyConfirmation explains the
+    situation plainly and asks whether to proceed anyway (default No,
+    since this script has no migration capability of its own). Only once
+    that has passed (or didn't apply at all) does the script ask for one
+    more explicit confirmation - Read-DeltaNginxInstallConfirmation, a Y/N
+    prompt (default No) naming the version to be installed and the
     installation directory - before proceeding, in seven phases:
 
       1. Install-Nginx - installs the one pinned version, $Script:NginxVersion
@@ -147,25 +178,23 @@ $ErrorActionPreference = 'Stop'
 $Script:ProjectRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 . (Join-Path -Path $Script:ProjectRoot -ChildPath 'lib\DeltaInstaller.Common.ps1')
 
+# lib\DeltaDoctor.ReverseProxy.ps1 dot-sources lib\DeltaDoctor.NGINX.ps1
+# (which owns NGINX's installation location, the DELTA virtual host's own
+# fixed identity, and its pid-file-based Managed Runtime State machine) AND
+# lib\DeltaDoctor.IIS.ps1 - this script needs both now: NGINX's own
+# functions/constants for the reasons it always has
+# ($Script:NginxHome/$Script:NginxExePath/etc., all defined there, not
+# here), and lib\DeltaDoctor.ReverseProxy.ps1's own
+# Invoke-DeltaReverseProxyDetection/Get-DeltaReverseProxyConflictingProvider
+# so this script's own workflow decisions are driven by Doctor's own
+# cross-provider DELTA-ownership answer, never independently re-derived
+# from raw ports/processes - see that file's own header, and this script's
+# own Orchestration section below, for the full architecture.
+. (Join-Path -Path $Script:ProjectRoot -ChildPath 'lib\DeltaDoctor.ReverseProxy.ps1')
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-
-$Script:NginxHome            = 'C:\nginx'
-$Script:NginxExePath         = Join-Path -Path $Script:NginxHome -ChildPath 'nginx.exe'
-$Script:NginxConfDirectory   = Join-Path -Path $Script:NginxHome -ChildPath 'conf'
-$Script:NginxMainConfigPath  = Join-Path -Path $Script:NginxConfDirectory -ChildPath 'nginx.conf'
-$Script:NginxConfDDirectory  = Join-Path -Path $Script:NginxConfDirectory -ChildPath 'conf.d'
-$Script:DeltaVHostConfigPath = Join-Path -Path $Script:NginxConfDDirectory -ChildPath 'delta.conf'
-
-# Managed Runtime State (docs\todo\TODO-setup-nginx-enhancements.md, Phase 7) -
-# the pid file location this installer owns and asserts, rather than trusting
-# nginx's own undocumented compiled-in default to agree with $Script:NginxHome.
-# templates\nginx\nginx.conf pins an explicit `pid logs/nginx.pid;` directive
-# to match this exactly (see that template's own header) - Get-DeltaNginxPidFilePath
-# is the one place this script computes it, so nothing else re-derives it.
-$Script:NginxLogsDirectory = Join-Path -Path $Script:NginxHome -ChildPath 'logs'
-$Script:NginxPidFilePath   = Join-Path -Path $Script:NginxLogsDirectory -ChildPath 'nginx.pid'
 
 # SSL Certificate Wizard (docs\todo\TODO-setup-nginx-enhancements.md, Phase
 # 2) - NGINX's own dedicated certs directory, never the original file
@@ -245,90 +274,45 @@ $Script:DeltaHttpsVHostConfigTemplate = Join-Path -Path $Script:ProjectRoot -Chi
 # ---------------------------------------------------------------------------
 #
 # Operational safety enhancement (docs\todo\TODO-setup-nginx-enhancements.md,
-# Phase 8). Runs immediately after Resolve-DeltaInstallation and BEFORE the
-# orchestration block's own top-level "does nginx.exe already exist" branch -
-# deliberately in front of BOTH the fresh-install workflow and the existing-
-# installation management menu, not only the former. That placement is what
-# lets this correctly tell "a required port is already owned by THIS
-# installer's own managed NGINX instance" (never a conflict) apart from "a
-# required port is owned by something else entirely" (a genuine, fail-fast
-# prerequisite failure) - a distinction docs\todo's own "Managed NGINX
-# Exception" requirement only matters at all once nginx.exe already exists,
-# which is exactly the branch this section's placement keeps in scope.
+# Phase 8), now Doctor-informed (see the "ARCHITECTURE CORRECTION" this
+# script's own Orchestration section header describes). Deliberately LAZY:
+# this never runs as a blanket gate the moment the script starts, and never
+# runs merely to display the existing-installation management menu - only
+# immediately before an operation that actually needs to bind these ports
+# (Install-Nginx on a fresh install, or Start-DeltaNginx's own fresh-start
+# branch when the operator chooses Start/Restart from the management menu).
+# Doctor's own Reverse Proxy Detection (Invoke-DeltaReverseProxyDetection,
+# lib\DeltaDoctor.ReverseProxy.ps1) and, for a genuinely fresh install, the
+# "am I about to configure a second reverse proxy" gate both still run
+# first - this remains the low-level validation step underneath that
+# higher-level decision, never the primary one.
+#
+# Manual Reverse Proxy Handover: what used to be a hard, unconditional
+# abort the moment a required port turned out to be owned by another
+# DELTA-managed, active provider is now an offer to stop it instead
+# (Invoke-DeltaReverseProxyHandover, lib\DeltaInstaller.Common.ps1) - the
+# administrator remains fully in control (a decline is a clean, reported
+# no-op, never a forced action), and this is NOT automatic migration. See
+# Test-DeltaNginxPortPrerequisites's own header for the exact ordering:
+# Doctor is asked before any raw TCP probe runs at all - Get-DeltaReverseProxyHandoverPlan
+# (lib\DeltaDoctor.ReverseProxy.ps1) consults every DELTA-managed provider by
+# ownership alone, never by whether Doctor considers it Active (see that
+# function's own "SECOND ARCHITECTURE CORRECTION" for why: a DELTA-managed
+# IIS site can be Stopped while its own stock Default Web Site still holds
+# the port). The raw Get-ListeningTcpPortOwner-based check below now only ever fires for
+# a conflict Doctor genuinely cannot attribute to a DELTA-managed provider
+# at all - that case is unchanged, a genuine, fail-fast prerequisite
+# failure (Show-DeltaNginxPortConflictNotice).
 #
 # Nothing about the runtime-state management or the management menu itself
 # (both from the prior phase) is touched here - this is purely an additional
 # gate placed in front of both existing workflows, reusing Get-
-# DeltaNginxVHostSummary/Get-DeltaNginxManagedProcesses/Get-DeltaProcessById
-# rather than a second implementation of any of them.
-
-function Get-DeltaNginxRequiredPorts {
-    <#
-      Determines the ports this run needs to check - deliberately NOT the
-      same thing as Get-DeltaNginxExpectedPorts (Runtime state section,
-      Phase 7's own Startup Validation), which decides based on
-      $Script:SslCertificateConfigured - a flag this run's own SSL wizard
-      sets, and the wizard has not run yet at the point this prerequisite
-      check executes (it runs before installation confirmation, which
-      itself runs before the wizard). Using Get-DeltaNginxVHostSummary
-      instead reflects an EXISTING installation's real, already-generated
-      deployment mode when there is one; a fresh install (no vhost file
-      written yet - the administrator has not even been asked about a
-      certificate) naturally falls back to port 80 alone, the one port
-      required regardless of which mode the not-yet-run SSL wizard ends
-      up choosing. Never assumes HTTPS.
-    #>
-    if ((Get-DeltaNginxVHostSummary).IsHttps) {
-        return ,@(80, 443)
-    }
-    return ,@(80)
-}
-
-function Get-ListeningTcpPortOwner {
-    <#
-      For $Port, returns a [PSCustomObject] describing whoever is bound to
-      it in the LISTEN state - ProcessId, ProcessName, ExecutablePath, and
-      (diagnostic only) ServiceName - or $null if nothing is listening on
-      it at all. Get-NetTCPConnection (the same NetTCPIP-module primitive
-      Test-DeltaNginxPortListening already uses) supplies the owning PID;
-      Get-DeltaProcessById (Runtime state section) resolves the process
-      itself without throwing if it has already exited; the Windows
-      Service Name, if any, is resolved via CIM (Win32_Service) purely for
-      the administrator's own diagnosis - never consulted to decide
-      whether a port is actually free.
-    #>
-    param([Parameter(Mandatory)][int]$Port)
-
-    $connection = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $connection) {
-        return $null
-    }
-
-    $ownerProcessId = $connection.OwningProcess
-    $process        = Get-DeltaProcessById -ProcessId $ownerProcessId
-
-    $executablePath = $null
-    if ($process) {
-        try { $executablePath = $process.Path } catch { $executablePath = $null }
-    }
-
-    $serviceName = $null
-    try {
-        $service = Get-CimInstance -ClassName Win32_Service -Filter "ProcessId = $ownerProcessId" -ErrorAction Stop | Select-Object -First 1
-        if ($service) { $serviceName = $service.Name }
-    }
-    catch {
-        $serviceName = $null
-    }
-
-    return [PSCustomObject]@{
-        Port           = $Port
-        ProcessId      = $ownerProcessId
-        ProcessName    = if ($process) { $process.ProcessName } else { $null }
-        ExecutablePath = $executablePath
-        ServiceName    = $serviceName
-    }
-}
+# DeltaNginxVHostSummary/Get-DeltaNginxManagedProcesses (lib\DeltaDoctor.NGINX.ps1's
+# own) and Get-ListeningTcpPortOwner (lib\DeltaInstaller.Common.ps1's own,
+# generic - promoted out of this file once setup-iis.ps1 needed the
+# identical primitive for its own port-prerequisite check, the Manual
+# Reverse Proxy Handover feature) rather than a second implementation of
+# any of them.
 
 function Test-RequiredPortAvailability {
     <#
@@ -362,16 +346,21 @@ function Show-DeltaNginxPortConflictNotice {
     <#
       Conflict Handling (docs\todo\...) - the entire response to a
       required port already being owned by something other than this
-      installer's own managed NGINX instance. A genuine prerequisite
-      FAILURE, not the "administrator declined"/"nothing to do" shape
-      every other clean-exit notice in this script uses (those all exit
-      0) - this exits 1, while still using its own dedicated, calm notice
-      here rather than the generic red try/catch failure banner, exactly
-      matching this feature's own specified output. Reached before
-      installation confirmation, before anything is downloaded,
-      extracted, or configured, and before the existing-installation
-      management menu ever runs either - "No changes have been made." is
-      always accurate here.
+      installer's own managed NGINX instance, that Doctor ALSO cannot
+      attribute to another DELTA-managed, active provider (a conflict
+      Doctor CAN attribute is no longer reached here at all - see
+      Test-DeltaNginxPortPrerequisites's own header: it is offered a
+      Manual Reverse Proxy Handover instead, via
+      Invoke-DeltaReverseProxyHandover, before this raw safety-net check
+      ever runs). A genuine prerequisite FAILURE, not the "administrator
+      declined"/"nothing to do" shape every other clean-exit notice in
+      this script uses (those all exit 0) - this exits 1, while still
+      using its own dedicated, calm notice here rather than the generic
+      red try/catch failure banner. Reached before installation
+      confirmation, before anything is downloaded, extracted, or
+      configured, and before the existing-installation management menu
+      ever runs either - "No changes have been made." is always accurate
+      here.
     #>
     param([Parameter(Mandatory)]$PortCheck)
 
@@ -409,6 +398,7 @@ function Show-DeltaNginxPortConflictNotice {
     Write-Host 'NGINX requires exclusive access to this port.'
     Write-Host ''
     Write-Host 'Stop the application using this port and rerun setup-nginx.ps1.'
+
     Write-Host ''
     Write-Host 'No changes have been made.'
     Write-Host ''
@@ -418,12 +408,12 @@ function Show-DeltaNginxPortConflictNotice {
 
 function Show-DeltaNginxPortsAvailableNotice {
     <#
-      Available Ports (docs\todo\...) - the happy-path banner, shown only
-      on the fresh-install side of Test-DeltaNginxPortPrerequisites (see
-      that function's own header for why): an already-existing managed
-      installation continues silently into Show-DeltaNginxManagementMenu
-      exactly as before, since that screen already conveys its own
-      Status and this feature is not meant to add noise ahead of it.
+      Available Ports (docs\todo\...) - the happy-path banner. Always
+      printed on success now that Test-DeltaNginxPortPrerequisites itself
+      is only ever called immediately before an operation that actually
+      needs to bind these ports (see that function's own header) - there
+      is no longer a "silent" case to special-case around, since this is
+      never invoked just to display the management menu.
     #>
     param([Parameter(Mandatory)][array]$RequiredPorts)
 
@@ -444,37 +434,69 @@ function Show-DeltaNginxPortsAvailableNotice {
 function Test-DeltaNginxPortPrerequisites {
     <#
       The orchestrator for this whole section - see the section header
-      above for the full placement rationale. Determines the required
-      ports (Get-DeltaNginxRequiredPorts), checks each one
-      (Test-RequiredPortAvailability), and:
+      above for the full placement rationale, in particular why callers
+      only ever reach this function immediately before an operation that
+      actually needs to bind these ports (Install-Nginx on a fresh
+      install; Start-DeltaNginx's own fresh-start branch otherwise) -
+      never as a blanket gate run just to inspect an installation or
+      display the management menu.
 
-        - Exits (1) immediately on the first genuine conflict found
-          (Show-DeltaNginxPortConflictNotice) - before installation
-          confirmation, before anything is downloaded, extracted, or
-          configured, and before the existing-installation management
-          menu ever runs.
-        - Otherwise, prints the "Available" success banner
-          (Show-DeltaNginxPortsAvailableNotice) ONLY when nginx.exe does
-          not yet exist (the fresh-install path) - an existing managed
-          installation proceeds straight into
-          Show-DeltaNginxManagementMenu without it, unchanged from the
-          prior UX pass.
+      Doctor first, per the Manual Reverse Proxy Handover feature's own
+      design principle ("no reverse proxy ownership detection outside
+      Doctor"): $ReverseProxyState (the orchestration block's own
+      already-computed Get-DeltaReverseProxyState result - never
+      re-detected here) is asked, via Get-DeltaReverseProxyHandoverPlan
+      (lib\DeltaDoctor.ReverseProxy.ps1), what would actually need to
+      happen for NGINX to safely take ownership of its required ports -
+      $null when there is no conflict at all. ARCHITECTURE CORRECTION:
+      this no longer assumes stopping IIS's own DELTA-managed website is
+      sufficient by itself (confirmed false on a real machine - IIS's own
+      stock "Default Web Site" can independently hold the same port) -
+      Doctor's own plan already accounts for that, and may refuse
+      automatic handover outright if something it cannot safely stop is
+      in the way. Invoke-DeltaReverseProxyHandover
+      (lib\DeltaInstaller.Common.ps1) presents whatever plan Doctor built
+      and, only on explicit confirmation, executes it - a decline OR an
+      unsafe plan is a complete, reported no-op (`exit 0`, matching every
+      other "administrator declined" clean-exit notice in this script),
+      never a hard failure, since nothing this script owns has been
+      touched either way.
+
+      Only once that's resolved (or never applied at all) does the raw,
+      low-level safety net run - the direct Get-DeltaNginxRequiredPorts/
+      Test-RequiredPortAvailability check this function has always used,
+      which now only ever catches a port Doctor genuinely cannot
+      attribute to a DELTA-managed provider at all (an unrelated
+      application, a different reverse proxy entirely) - still a hard,
+      unexplained conflict, reported via Show-DeltaNginxPortConflictNotice
+      and `exit 1`. A successful handover leaves nothing for this second
+      check to find (Invoke-DeltaReverseProxyHandover itself already
+      confirmed the ports released before returning), so it simply prints
+      the same "Available" success banner
+      (Show-DeltaNginxPortsAvailableNotice) either way.
     #>
+    param([Parameter(Mandatory)][PSCustomObject]$ReverseProxyState)
 
     Write-Step 'Checking required NGINX ports...'
-
     $requiredPorts = Get-DeltaNginxRequiredPorts
-    $results       = @(foreach ($port in $requiredPorts) { Test-RequiredPortAvailability -Port $port })
 
+    $handoverPlan = Get-DeltaReverseProxyHandoverPlan -ReverseProxyState $ReverseProxyState -RequestingProviderName 'NGINX'
+    if ($handoverPlan) {
+        $handedOver = Invoke-DeltaReverseProxyHandover -Plan $handoverPlan
+
+        if (-not $handedOver) {
+            exit 0
+        }
+    }
+
+    $results  = @(foreach ($port in $requiredPorts) { Test-RequiredPortAvailability -Port $port })
     $conflict = $results | Where-Object { -not $_.Available } | Select-Object -First 1
     if ($conflict) {
         Show-DeltaNginxPortConflictNotice -PortCheck $conflict
         exit 1
     }
 
-    if (-not (Test-Path -LiteralPath $Script:NginxExePath)) {
-        Show-DeltaNginxPortsAvailableNotice -RequiredPorts $requiredPorts
-    }
+    Show-DeltaNginxPortsAvailableNotice -RequiredPorts $requiredPorts
 }
 
 # ---------------------------------------------------------------------------
@@ -518,6 +540,42 @@ function ConvertTo-NativeCommandOutputText {
 # ---------------------------------------------------------------------------
 # Installation confirmation
 # ---------------------------------------------------------------------------
+
+function Read-DeltaNginxSecondReverseProxyConfirmation {
+    <#
+      Shown only when Doctor's own Reverse Proxy Detection
+      (lib\DeltaDoctor.ReverseProxy.ps1, Get-DeltaReverseProxyConflictingProvider)
+      reports that another provider is already DELTA's active reverse
+      proxy AND nginx.exe does not exist yet on this machine - i.e. this
+      run would be configuring a SECOND, competing DELTA-managed reverse
+      proxy, not managing or replacing the existing one (an nginx.exe that
+      already exists is always a management scenario, never a "second
+      install" question - see the orchestration block's own placement of
+      this check). setup-nginx.ps1 has no migration capability of its own
+      (that remains a future reverse-proxy.ps1's own job - see
+      lib\DeltaDoctor.ReverseProxy.ps1's own header) - this only ever
+      explains the situation, per this feature's own "ARCHITECTURE
+      CORRECTION" design principle ("offer migration or explain the
+      situation"), and asks whether to proceed anyway. Defaults to No,
+      the same "blank means the safe choice" convention every
+      confirmation in this project follows - an administrator who did not
+      intend to run two reverse proxies at once should land on the option
+      that changes nothing.
+    #>
+    param([Parameter(Mandatory)][string]$ActiveProviderName)
+
+    return Read-DeltaYesNoConfirmation -Body {
+        Write-Host "$ActiveProviderName is currently DELTA's active reverse proxy."
+        Write-Host ''
+        Write-Host 'Installing NGINX now would configure a second, competing reverse'
+        Write-Host 'proxy for the same DELTA deployment, rather than replacing the'
+        Write-Host "existing one - this script has no migration capability; $ActiveProviderName"
+        Write-Host 'would need to be stopped/reconfigured by hand for NGINX to serve'
+        Write-Host 'DELTA traffic instead.'
+        Write-Host ''
+        Write-Host 'Continue installing NGINX anyway?'
+    }
+}
 
 function Read-DeltaNginxInstallConfirmation {
     <#
@@ -1184,233 +1242,16 @@ function Read-DeltaNginxStartConfirmation {
 }
 
 # ---------------------------------------------------------------------------
-# Runtime state
+# Startup Validation
 # ---------------------------------------------------------------------------
 #
-# Phase 7 (docs\todo\TODO-setup-nginx-enhancements.md, "Managed Runtime
-# State"). A prior investigation into a "Status: Running, but Stop fails
-# with CreateFile() nginx.pid failed" report found the root cause: this
-# script used to treat "a process named nginx.exe exists at this path" as
-# proof of a healthy, controllable instance, while nginx.exe's own `-s
-# <signal>` mechanism on Windows has no relationship to Get-Process
-# whatsoever - it locates its target exclusively by reading the pid file.
-# Those are two independent facts that can disagree (an externally deleted
-# pid file, an incomplete prior shutdown, an instance started outside this
-# script's control, etc.), and the old code had no way to notice.
-#
-# This section makes the pid file the primary source of truth, exactly
-# the way nginx itself decides who its master process is - process
-# enumeration (Get-DeltaNginxManagedProcesses) is used only to (a) tell a
-# genuinely clean Stopped state apart from a stale pid file with nothing
-# actually running, and (b) supply the Force Stop recovery action's
-# target. It is never used, by itself, to decide "Running".
-
-function Get-DeltaNginxPidFilePath {
-    <#
-      The one place this script computes the expected pid file location -
-      $Script:NginxPidFilePath, matching the explicit `pid logs/nginx.pid;`
-      directive Phase 7 pinned into templates\nginx\nginx.conf (see that
-      template's own header) rather than nginx's undocumented compiled-in
-      default.
-    #>
-    return $Script:NginxPidFilePath
-}
-
-function Read-DeltaNginxPid {
-    <#
-      Reads and parses the pid file, returning the parsed process ID as
-      an [int], or $null if the file is missing, unreadable, or its
-      content isn't a valid integer - never throws, since
-      Get-DeltaNginxRuntimeState needs to treat every one of those as
-      just another data point toward a Broken verdict, not a terminating
-      error.
-    #>
-    $pidFilePath = Get-DeltaNginxPidFilePath
-    if (-not (Test-Path -LiteralPath $pidFilePath)) {
-        return $null
-    }
-
-    try {
-        $rawPid = (Get-Content -LiteralPath $pidFilePath -Raw -ErrorAction Stop).Trim()
-    }
-    catch {
-        return $null
-    }
-
-    $parsedPid = 0
-    if (-not [int]::TryParse($rawPid, [ref]$parsedPid)) {
-        return $null
-    }
-
-    return $parsedPid
-}
-
-function Get-DeltaProcessById {
-    <#
-      A safe Get-Process -Id wrapper that returns $null instead of
-      throwing for any invalid, negative, or nonexistent ID - needed
-      because every PID handled in this section ultimately comes from a
-      pid file this script does not control the contents of. A corrupted
-      file could contain anything, including a negative number, which
-      Get-Process's own parameter validation rejects as a terminating
-      error regardless of -ErrorAction - exactly the kind of crash this
-      redesign's own "never silently repair, but never crash on a
-      corrupt/inconsistent state either" goal rules out.
-    #>
-    param([Parameter(Mandatory)][int]$ProcessId)
-
-    try {
-        return Get-Process -Id $ProcessId -ErrorAction Stop
-    }
-    catch {
-        return $null
-    }
-}
-
-function Test-DeltaManagedNginx {
-    <#
-      Validates that $ProcessId is a live process whose executable path
-      is $Script:NginxExePath - never a process-name-only check. A PID
-      can be silently reused by a completely unrelated program once the
-      original process exits, so "some process with this ID exists" is
-      not the same claim as "NGINX's own managed process is still
-      alive" - this is the one check that turns a pid file's mere
-      existence into an actual, verified claim about a specific live
-      process.
-    #>
-    param([Parameter(Mandatory)][int]$ProcessId)
-
-    $process = Get-DeltaProcessById -ProcessId $ProcessId
-    if (-not $process) {
-        return $false
-    }
-
-    try {
-        return [bool]($process.Path -and ($process.Path -eq $Script:NginxExePath))
-    }
-    catch {
-        return $false
-    }
-}
-
-function Get-DeltaNginxManagedProcesses {
-    <#
-      Raw enumeration only - every nginx.exe process actually running
-      FROM $Script:NginxExePath, matched by executable path, never by
-      process name alone (a machine can easily run a separate, unrelated
-      NGINX instance from a different directory, and a name-only match
-      would falsely attribute it to this installation). Returns ALL
-      matches (master AND every worker share this same path on Windows),
-      not just one - Invoke-DeltaNginxForceStop needs the complete set to
-      terminate, and Get-DeltaNginxRuntimeState needs it to tell a clean
-      Stopped state apart from a Broken one.
-
-      Deliberately never used by itself to decide "is NGINX running" -
-      that is the pid file's job. This is strictly a validation/
-      enumeration primitive: process enumeration only ever validates or
-      recovers here, it never originates the runtime state verdict.
-    #>
-    # The leading comma is load-bearing, not decorative - PowerShell
-    # unwraps a 0- or 1-element array crossing a `return` boundary back
-    # into $null/a bare scalar regardless of the @() wrapper, and every
-    # caller here depends on always getting a real array back (an empty
-    # match set must stay a genuine empty array, never $null, or a
-    # caller's own ".Count" throws under Set-StrictMode).
-    return ,@(Get-Process -Name 'nginx' -ErrorAction SilentlyContinue | Where-Object {
-        try { $_.Path -and ($_.Path -eq $Script:NginxExePath) } catch { $false }
-    })
-}
-
-function Get-DeltaNginxRuntimeState {
-    <#
-      The one function everything else in this script (the management
-      menu, Start-DeltaNginx, Invoke-DeltaNginxReload/Stop/Restart) calls
-      to decide what state NGINX is actually in. Returns a
-      [PSCustomObject]:
-
-        State             - 'NotInstalled' | 'Stopped' | 'Running' | 'Broken'
-        Reason            - a specific, human-readable explanation, set
-                             only when State is 'Broken'
-        ProcessId         - the PID read from the pid file, if any
-                             (whether or not it turned out to be valid)
-        ManagedProcesses  - every nginx.exe process actually running from
-                             $Script:NginxExePath (Get-DeltaNginxManagedProcesses)
-                             - may be empty
-
-      NotInstalled: nginx.exe itself does not exist.
-
-      Stopped: nginx.exe exists, there is no pid file, AND no managed
-      process is running - a genuinely clean state, not merely "no
-      process right now" (see Broken below for why that distinction
-      matters).
-
-      Running: the pid file exists, parses to a real process ID, and
-      Test-DeltaManagedNginx confirms that ID is a live process whose
-      executable path matches $Script:NginxExePath. This is the ONLY
-      path to "Running" - a process existing is never sufficient by
-      itself.
-
-      Broken: everything else - a stale pid file left behind with
-      nothing actually running, a process running with no pid file at
-      all (the exact bug this phase was written to catch), a pid file
-      whose PID has been silently reused by an unrelated program, etc.
-      Never silently normalized to Stopped or Running - always reported
-      with a specific Reason instead.
-    #>
-
-    if (-not (Test-Path -LiteralPath $Script:NginxExePath)) {
-        return [PSCustomObject]@{
-            State            = 'NotInstalled'
-            Reason           = $null
-            ProcessId        = $null
-            ManagedProcesses = @()
-        }
-    }
-
-    $managedProcesses = Get-DeltaNginxManagedProcesses
-    $pidFilePath      = Get-DeltaNginxPidFilePath
-    $pidFileExists    = Test-Path -LiteralPath $pidFilePath
-    $parsedPid        = if ($pidFileExists) { Read-DeltaNginxPid } else { $null }
-
-    if (-not $pidFileExists -and $managedProcesses.Count -eq 0) {
-        return [PSCustomObject]@{
-            State            = 'Stopped'
-            Reason           = $null
-            ProcessId        = $null
-            ManagedProcesses = @()
-        }
-    }
-
-    if ($pidFileExists -and $parsedPid -and (Test-DeltaManagedNginx -ProcessId $parsedPid)) {
-        return [PSCustomObject]@{
-            State            = 'Running'
-            Reason           = $null
-            ProcessId        = $parsedPid
-            ManagedProcesses = $managedProcesses
-        }
-    }
-
-    $reason =
-        if (-not $pidFileExists) {
-            "The PID file ($pidFilePath) is missing, but $($managedProcesses.Count) NGINX process(es) are still running from $($Script:NginxExePath)."
-        }
-        elseif (-not $parsedPid) {
-            "The PID file ($pidFilePath) exists but does not contain a valid process ID."
-        }
-        elseif (-not (Get-DeltaProcessById -ProcessId $parsedPid)) {
-            "The PID file ($pidFilePath) references process ID $parsedPid, which is not running."
-        }
-        else {
-            "The PID file ($pidFilePath) references process ID $parsedPid, which belongs to a different executable, not $($Script:NginxExePath)."
-        }
-
-    return [PSCustomObject]@{
-        State            = 'Broken'
-        Reason           = $reason
-        ProcessId        = $parsedPid
-        ManagedProcesses = $managedProcesses
-    }
-}
+# The pid-file-based Managed Runtime State machine itself
+# (Get-DeltaNginxRuntimeState and everything it depends on) now lives in
+# lib\DeltaDoctor.NGINX.ps1 - see that file's own header. What remains here
+# is specific to THIS script's own fresh-start flow: which ports a just-
+# written configuration should be listening on, and confirming a process
+# Start-DeltaNginx just launched is genuinely healthy before reporting
+# success.
 
 function Get-DeltaNginxExpectedPorts {
     <#
@@ -1434,21 +1275,6 @@ function Get-DeltaNginxExpectedPorts {
         return ,@(80, 443)
     }
     return ,@(80)
-}
-
-function Test-DeltaNginxPortListening {
-    <#
-      Reports whether $Port has a socket in the LISTEN state anywhere on
-      this machine - Get-NetTCPConnection (the NetTCPIP module, present
-      on every Windows Server version this installer targets) rather
-      than a raw TCP connect attempt, since a successful connect from
-      localhost would not by itself confirm NGINX's own bind succeeded -
-      it could just as easily hit an unrelated listener already using
-      that port.
-    #>
-    param([Parameter(Mandatory)][int]$Port)
-
-    return [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
 }
 
 function Test-DeltaNginxStartupHealth {
@@ -1481,7 +1307,7 @@ function Test-DeltaNginxStartupHealth {
     }
 
     foreach ($port in (Get-DeltaNginxExpectedPorts)) {
-        if (-not (Test-DeltaNginxPortListening -Port $port)) {
+        if (-not (Test-DeltaTcpPortListening -Port $port)) {
             $failures.Add("Port $port is not listening.")
         }
     }
@@ -1499,41 +1325,11 @@ function Test-DeltaNginxStartupHealth {
 # Start / reload
 # ---------------------------------------------------------------------------
 
-function Invoke-DeltaNginxSignal {
-    <#
-      Sends an `-s <Signal>` control signal (reload/quit/...) to the
-      NGINX instance at $Script:NginxHome - factored out of
-      Start-DeltaNginx's own reload branch so the Existing Installation
-      management menu's Reload/Stop/Restart actions (below) call the
-      IDENTICAL code path instead of growing a second copy of it, per
-      this script's own "reuse existing helper functions... do not
-      duplicate code" convention.
-
-      Requires Administrator privileges, the same as Start-DeltaNginx's
-      own fresh-start path - both ultimately act on a process bound to
-      port 80, so the same guard applies regardless of which specific
-      action is being performed.
-    #>
-    param([Parameter(Mandatory)][string]$Signal)
-
-    if (-not (Test-IsAdministrator)) {
-        Stop-Setup 'Administrator privileges are required to control NGINX. Re-run this script from an elevated PowerShell session.'
-    }
-
-    $previousEap = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $output = & $Script:NginxExePath '-s' $Signal '-p' $Script:NginxHome '-c' 'conf\nginx.conf' 2>&1
-        $exitCode = $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $previousEap
-    }
-
-    if ($exitCode -ne 0) {
-        Stop-Setup "Failed to send '$Signal' to NGINX: $(ConvertTo-NativeCommandOutputText -Output $output)"
-    }
-}
+# Send-DeltaNginxSignal (the `-s <Signal>` control-signal sender every
+# action below builds on) now lives in lib\DeltaDoctor.NGINX.ps1, promoted
+# there alongside Stop-DeltaManagedNginx once setup-iis.ps1 needed the
+# identical NGINX stop action for its own side of the Manual Reverse Proxy
+# Handover feature - see that file's own header.
 
 function Start-DeltaNginx {
     <#
@@ -1560,6 +1356,20 @@ function Start-DeltaNginx {
       Binding to port 80 (this configuration's default) requires
       Administrator privileges on Windows, so that's checked here
       specifically rather than relying solely on Install-Nginx's own check.
+
+      Manual Reverse Proxy Handover - AFTER START: once NGINX is
+      confirmed healthy, if $Script:DeltaReverseProxyHandoverOccurred is
+      set (Invoke-DeltaReverseProxyHandover, lib\DeltaInstaller.Common.ps1,
+      already marked it earlier in this same run - see
+      Test-DeltaNginxPortPrerequisites), this runs Doctor's own Reverse
+      Proxy Detection one more time and prints it, per this feature's own
+      explicit "run Doctor again" final-validation requirement - the
+      administrator sees NGINX confirmed Active/Healthy from the same
+      authoritative source that reported IIS active a moment earlier,
+      not just this script's own "started successfully" claim. Skipped
+      entirely on an ordinary start/reload with no handover involved, to
+      avoid adding a second report where nothing changed that Doctor
+      needs to re-explain.
     #>
 
     Write-PhaseBanner 'NGINX Start / Reload'
@@ -1572,7 +1382,7 @@ function Start-DeltaNginx {
 
     if ($state.State -eq 'Running') {
         Write-Step 'Reloading NGINX configuration...'
-        Invoke-DeltaNginxSignal -Signal 'reload'
+        Send-DeltaNginxSignal -Signal 'reload'
         Write-Success '    NGINX reloaded.'
         return
     }
@@ -1605,6 +1415,13 @@ $($failures -join [Environment]::NewLine)
     }
 
     Write-Success '    NGINX started successfully.'
+
+    if ($Script:DeltaReverseProxyHandoverOccurred) {
+        $Script:DeltaReverseProxyHandoverOccurred = $false
+        Write-Host ''
+        Write-PhaseBanner 'Deployment Validation'
+        Invoke-DeltaReverseProxyDetection | Out-Null
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1702,62 +1519,19 @@ function Show-DeltaNginxSummary {
     Write-Host ''
 }
 
-function Get-DeltaNginxVHostSummary {
-    <#
-      Best-effort read of the already-generated DELTA virtual host
-      ($Script:DeltaVHostConfigPath) for the Existing Installation
-      management menu below - never re-prompts for the website domain
-      or backend port the way a fresh install's own
-      Resolve-DeltaWebsiteDomain/Resolve-DeltaBackendPort do, since an
-      existing installation's configuration is exactly what should be
-      displayed as-is, not re-derived or re-asked for. Returns $null
-      ServerName/BackendUrl when delta.conf is missing or doesn't match
-      either template's expected shape (e.g. an NGINX installation this
-      script never generated a vhost for) rather than throwing - this
-      menu is read-only and must degrade gracefully, not block the
-      administrator from reaching Validate/Reload/Restart/Stop/Exit.
-    #>
-
-    $result = [PSCustomObject]@{
-        ServerName = $null
-        BackendUrl = $null
-        IsHttps    = $false
-    }
-
-    if (-not (Test-Path -LiteralPath $Script:DeltaVHostConfigPath)) {
-        return $result
-    }
-
-    $content = Get-Content -LiteralPath $Script:DeltaVHostConfigPath -Raw
-
-    $serverNameMatch = [regex]::Match($content, 'server_name\s+([^\s;]+);')
-    if ($serverNameMatch.Success) {
-        $result.ServerName = $serverNameMatch.Groups[1].Value
-    }
-
-    $portMatch = [regex]::Match($content, 'proxy_pass\s+http://localhost:(\d+);')
-    if ($portMatch.Success) {
-        $result.BackendUrl = "http://localhost:$($portMatch.Groups[1].Value)"
-    }
-
-    $result.IsHttps = [bool]([regex]::Match($content, 'listen\s+443\s+ssl').Success)
-
-    return $result
-}
-
 function Invoke-DeltaNginxReload {
     <#
       Existing Installation management menu action 2 ("Reload
-      configuration") - calls straight through to the same
-      Invoke-DeltaNginxSignal helper Start-DeltaNginx's own reload
-      branch uses, rather than a second implementation. Re-checks
-      Get-DeltaNginxRuntimeState itself rather than trusting a
-      snapshot the menu took a moment earlier (state could have
-      changed between the menu displaying it and the administrator's
-      keystroke); reloading anything other than a confirmed-Running
-      instance is meaningless, so this reports that plainly instead of
-      attempting the signal and surfacing nginx.exe's own confusing
-      failure text.
+      configuration") - calls straight through to the same shared
+      Send-DeltaNginxSignal helper (lib\DeltaDoctor.NGINX.ps1)
+      Start-DeltaNginx's own reload branch uses, rather than a second
+      implementation. Re-checks Get-DeltaNginxRuntimeState itself rather
+      than trusting a snapshot the menu took a moment earlier (state
+      could have changed between the menu displaying it and the
+      administrator's keystroke); reloading anything other than a
+      confirmed-Running instance is meaningless, so this reports that
+      plainly instead of attempting the signal and surfacing nginx.exe's
+      own confusing failure text.
     #>
 
     $state = Get-DeltaNginxRuntimeState
@@ -1768,66 +1542,44 @@ function Invoke-DeltaNginxReload {
     }
 
     Write-Step 'Reloading NGINX configuration...'
-    Invoke-DeltaNginxSignal -Signal 'reload'
+    Send-DeltaNginxSignal -Signal 'reload'
     Write-Success '    NGINX reloaded.'
 }
 
-function Invoke-DeltaNginxStop {
-    <#
-      Existing Installation management menu action 4 ("Stop NGINX").
-      Sends a graceful `-s quit` (matching the "Stop NGINX" command
-      Show-DeltaNginxSummary's own Useful Commands section already
-      documents) via the shared Invoke-DeltaNginxSignal helper, then
-      polls (Wait-Until) until Get-DeltaNginxRuntimeState confirms a
-      genuinely clean 'Stopped' state - not merely "no process", which
-      would also be true of the exact Broken state (a process gone but
-      the pid file left behind) the runtime-state redesign exists to
-      catch. A timeout that lands on 'Broken' instead of 'Stopped' is
-      reported as exactly that inconsistency, not a generic timeout.
-      A no-op, reported plainly rather than attempting the signal, if
-      nothing is running to begin with.
-    #>
-
-    $state = Get-DeltaNginxRuntimeState
-    if ($state.State -ne 'Running') {
-        Write-Host ''
-        Write-Detail 'NGINX is not running - nothing to stop.'
-        return
-    }
-
-    Write-Step 'Stopping NGINX...'
-    Invoke-DeltaNginxSignal -Signal 'quit'
-
-    $stopped = Wait-Until -Condition { (Get-DeltaNginxRuntimeState).State -eq 'Stopped' } -TimeoutSeconds 10
-    if (-not $stopped) {
-        $finalState = Get-DeltaNginxRuntimeState
-        if ($finalState.State -eq 'Broken') {
-            Stop-Setup "NGINX did not stop cleanly within 10 seconds: $($finalState.Reason)"
-        }
-        Stop-Setup 'NGINX did not stop within 10 seconds.'
-    }
-
-    Write-Success '    NGINX stopped.'
-}
+# Invoke-DeltaNginxStop (management menu action 4, "Stop NGINX") is now
+# Stop-DeltaManagedNginx, lib\DeltaDoctor.NGINX.ps1 - promoted there once
+# setup-iis.ps1 needed the identical action for its own side of the Manual
+# Reverse Proxy Handover feature (stopping NGINX so IIS can bind the port
+# instead), rather than this menu carrying its own copy of the exact same
+# stop-and-wait sequence. See that function's own header.
 
 function Invoke-DeltaNginxRestart {
     <#
       Existing Installation management menu action 3 ("Restart
       NGINX"). NGINX has no single built-in "restart" signal, so this
-      composes the other two actions already defined here: stop it if
-      it's currently running (Invoke-DeltaNginxStop, waiting until the
-      runtime state is confirmed 'Stopped'), then hand off to
-      Start-DeltaNginx - which, finding a clean 'Stopped' state at that
-      point, always takes its own fresh-start path rather than this
+      composes Stop-DeltaManagedNginx (lib\DeltaDoctor.NGINX.ps1) with
+      Start-DeltaNginx, below - which, finding a clean 'Stopped' state at
+      that point, always takes its own fresh-start path rather than this
       needing to duplicate that Start-Process/Wait-Until logic itself.
       If NGINX was already stopped, this is simply equivalent to
       starting it.
+
+      Re-checks the port prerequisite (Test-DeltaNginxPortPrerequisites)
+      immediately before that fresh start - the one point in this whole
+      action that actually needs port 80 free again, per this file's own
+      "port checks only run right before an operation that needs to bind
+      them" principle (see that function's own section header). Stopping
+      NGINX itself just freed the port; this re-check exists purely to
+      catch the unlikely case something else grabbed it in the interim,
+      rather than trusting that gap blindly.
     #>
+    param([Parameter(Mandatory)][PSCustomObject]$ReverseProxyState)
 
     if ((Get-DeltaNginxRuntimeState).State -eq 'Running') {
-        Invoke-DeltaNginxStop
+        Stop-DeltaManagedNginx
     }
 
+    Test-DeltaNginxPortPrerequisites -ReverseProxyState $ReverseProxyState
     Start-DeltaNginx
 }
 
@@ -1948,7 +1700,30 @@ function Show-DeltaNginxManagementMenu {
       Test-DeltaNginxConfiguration does - it throws out to the
       orchestration block's own top-level try/catch, which is the same
       error-handling convention this script uses everywhere else.
+
+      $ReverseProxyState is Doctor's own already-computed
+      Get-DeltaReverseProxyState result (the orchestration block's own -
+      never re-detected here) - consumed for two things, per this file's
+      own "consume Doctor before low-level checks, never re-derive what
+      it already answered" principle (see the file header's ARCHITECTURE
+      CORRECTION): a one-line, Doctor-derived summary of NGINX's own
+      ownership printed once, before the loop starts (never recomputed
+      per iteration - it's a fact about configuration ownership, not
+      runtime status, so it can't change while this menu is open), and
+      threaded through to Test-DeltaNginxPortPrerequisites at the two
+      points inside this menu that actually attempt to bind a port
+      (Start NGINX, Restart NGINX) - see that function's own section
+      header for why the check itself belongs there and nowhere earlier.
     #>
+    param([Parameter(Mandatory)][PSCustomObject]$ReverseProxyState)
+
+    $nginxProviderState = $ReverseProxyState.ProviderStates | Where-Object { $_.Name -eq 'NGINX' } | Select-Object -First 1
+    if ($nginxProviderState -and $nginxProviderState.ManagedByDelta) {
+        Write-Detail 'A DELTA-managed NGINX deployment already exists. No provisioning is required.'
+    }
+    else {
+        Write-Detail 'An NGINX installation exists at this location, but it is not managed by DELTA.'
+    }
 
     while ($true) {
         $state = Get-DeltaNginxRuntimeState
@@ -2015,8 +1790,8 @@ function Show-DeltaNginxManagementMenu {
                 switch ($choice.Trim()) {
                     '1' { Test-DeltaNginxConfiguration }
                     '2' { Invoke-DeltaNginxReload }
-                    '3' { Invoke-DeltaNginxRestart }
-                    '4' { Invoke-DeltaNginxStop }
+                    '3' { Invoke-DeltaNginxRestart -ReverseProxyState $ReverseProxyState }
+                    '4' { Stop-DeltaManagedNginx }
                     '5' { return }
                     default { Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow }
                 }
@@ -2030,7 +1805,7 @@ function Show-DeltaNginxManagementMenu {
                 if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '2' }
 
                 switch ($choice.Trim()) {
-                    '1' { Start-DeltaNginx }
+                    '1' { Test-DeltaNginxPortPrerequisites -ReverseProxyState $ReverseProxyState; Start-DeltaNginx }
                     '2' { return }
                     default { Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow }
                 }
@@ -2056,40 +1831,86 @@ function Show-DeltaNginxManagementMenu {
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
+#
+# ARCHITECTURE CORRECTION: this script no longer opens by independently
+# re-deriving system state from raw TCP ports. Doctor's own Reverse Proxy
+# Detection (Invoke-DeltaReverseProxyDetection, lib\DeltaDoctor.ReverseProxy.ps1)
+# is the first thing that runs after DELTA installation discovery - it
+# answers "what is the current DELTA reverse proxy state" (which providers
+# exist, which are DELTA-managed, which one is active); this script only
+# ever answers "what should I do next" from that already-computed answer,
+# and consumes it directly rather than re-opening an independent
+# diagnostic sequence of its own (see Show-DeltaNginxManagementMenu's own
+# header). Concretely: an existing NGINX installation hands off straight
+# to the management menu the moment Doctor's report and the existence
+# check below are known - no low-level port check runs first, since
+# merely inspecting or managing an already-configured NGINX never needs to
+# bind anything (see the "Port prerequisite check" section header further
+# up for the full "checks only run right before a real bind attempt"
+# principle). A fresh install (nginx.exe does not exist yet) while another
+# provider is already DELTA's active reverse proxy is recognized and
+# explained AS a "you are about to configure a second reverse proxy"
+# situation, with an explicit confirmation gate - the low-level port check
+# itself still runs, but only once that and the installation confirmation
+# have both passed, immediately before Install-Nginx, the first step that
+# actually needs the port free (and now attributes any conflict it finds
+# back to a known DELTA-managed provider when Doctor can explain it).
 
 try {
     Write-SetupBanner -Title 'DELTA NGINX Setup' -Subtitle 'Optional reverse proxy for DELTA'
 
-    # Must happen before anything else, including the existing-NGINX check
+    # Must happen before anything else, including Reverse Proxy Detection
     # below - see Resolve-DeltaInstallation's own header. Nothing above this
     # point has touched the filesystem.
     Resolve-DeltaInstallation
 
-    # Operational safety enhancement - see this function's own section
-    # header for why this runs here specifically: before the existing-vs-
-    # fresh-install branch immediately below, not only on the fresh-install
-    # side of it, so a required port already owned by something other than
-    # this installer's own managed NGINX is caught regardless of which of
-    # the two workflows is about to run. Exits (1) immediately on a genuine
-    # conflict - nothing below this point is reachable in that case either.
-    Test-DeltaNginxPortPrerequisites
+    # Doctor's own Reverse Proxy Detection - runs unconditionally, before
+    # ANY workflow decision below, so this script's own choices are driven
+    # by Doctor's already-computed, DELTA-ownership-based answer, never
+    # independently re-derived from raw ports/processes. See this section's
+    # own header above.
+    $reverseProxyState = Invoke-DeltaReverseProxyDetection
+    Write-Host ''
 
-    # The next check that must happen before any NGINX-specific action -
-    # see this script's own header and Show-DeltaNginxManagementMenu.
-    # Nothing below this point is reachable if NGINX is already installed.
-    if (Test-Path -LiteralPath $Script:NginxExePath) {
-        Show-DeltaNginxManagementMenu
+    $nginxAlreadyInstalled = Test-Path -LiteralPath $Script:NginxExePath
+
+    # An existing installation is always a management scenario - hand off
+    # immediately, with no low-level port check in front of it (see this
+    # section's own header). Nothing below this point is reachable in
+    # that case.
+    if ($nginxAlreadyInstalled) {
+        Show-DeltaNginxManagementMenu -ReverseProxyState $reverseProxyState
         exit 0
+    }
+
+    # A fresh install is only ever "a second reverse proxy" question when
+    # NGINX itself doesn't exist yet - the existing-installation case,
+    # handled above, is always a management scenario, never a competing
+    # second install.
+    $conflictingProvider = Get-DeltaReverseProxyConflictingProvider -ReverseProxyState $reverseProxyState -RequestingProviderName 'NGINX'
+    if ($conflictingProvider) {
+        if (-not (Read-DeltaNginxSecondReverseProxyConfirmation -ActiveProviderName $conflictingProvider)) {
+            Show-DeltaNginxInstallCancelledNotice
+            exit 0
+        }
     }
 
     # Installation Confirmation - the last chance to back out before
     # anything is written to disk. Nothing above this point has touched
     # the filesystem (Resolve-DeltaInstallation only reads the registry/
-    # legacy .env, and the existing-NGINX check above is a Test-Path).
+    # legacy .env, and every check above is read-only).
     if (-not (Read-DeltaNginxInstallConfirmation)) {
         Show-DeltaNginxInstallCancelledNotice
         exit 0
     }
+
+    # Operational safety enhancement - see this function's own section
+    # header for why this runs here specifically: only now, immediately
+    # before Install-Nginx, the first step that actually needs these
+    # ports free - never as an earlier blanket gate. Exits (1) immediately
+    # on a genuine conflict - nothing below this point is reachable in
+    # that case either.
+    Test-DeltaNginxPortPrerequisites -ReverseProxyState $reverseProxyState
 
     Install-Nginx
     Install-DeltaSslCertificate

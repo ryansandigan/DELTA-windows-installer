@@ -3103,192 +3103,14 @@ function Install-DeltaDependencies {
 }
 
 # ---------------------------------------------------------------------------
-# DELTA runtime process management
+# DELTA runtime process management (Get-RunningDeltaProcesses,
+# Get-RunningDeltaLauncherProcesses, Wait-ForProcessExit,
+# Invoke-DeltaTaskkill, Stop-RunningDeltaInstance) now lives in
+# lib\DeltaInstaller.Common.ps1 - uninstall.ps1 needs the exact same
+# "find and stop only THIS installation's own DELTA runtime" behavior
+# before it ever touches PostGIS/PostgreSQL/Node.js, so it was promoted
+# the same way PostgreSQL detection and Node.js detection already were.
 # ---------------------------------------------------------------------------
-
-function Get-RunningDeltaProcesses {
-    <#
-      Identifies the actual DELTA server process(es) - node.exe running
-      the deployed build\server\index.js entry point from THIS specific
-      runtime directory - rather than every node.exe on the machine.
-      Matching itself is Test-DeltaManagedProcessCommandLine's job (lib\
-      DeltaInstaller.Common.ps1) - see that function's own header for the
-      full two-signal algorithm (entry-point suffix + runtime root, both
-      slash/case-normalized) and why a single absolute-path string match
-      was confirmed unreliable and replaced. This function's only job is
-      supplying the live candidate list (CIM) and this run's own
-      $Script:DeltaRuntimeRoot to that predicate.
-
-      Deliberately scoped to the CURRENT, non-service runtime only - see
-      Test-DeltaManagedProcessCommandLine's own header for why a future
-      Windows Service-managed instance (Phase 5) should be identified via
-      the Service Control Manager instead of an extension of this
-      heuristic.
-
-      An ordinary PowerShell function, not array-guaranteed: like any
-      command whose result count varies (0, 1, or many), a caller that
-      needs collection semantics - .Count, a guaranteed-list foreach,
-      indexing - is responsible for wrapping its own call, e.g. @(Get-
-      RunningDeltaProcesses), rather than this function trying to force
-      array-ness on every possible caller regardless of what it actually
-      needs. (That would not even be reliable done here: PowerShell's
-      implicit return/Write-Output re-enumerates whatever array it's
-      given, so a bare `return @(...)` collapses right back to $null or
-      a scalar for a 0- or 1-element result by the time a caller sees
-      it - confirmed directly to throw "The property 'Count' cannot be
-      found on this object", under this script's own Set-StrictMode
-      -Version Latest, from exactly this shape. Forcing the guarantee
-      through anyway needs an unusual `return ,@(...)` - correct, but a
-      surprising thing to find in an ordinary function, and easy for a
-      future edit to "simplify" back into the bug without realizing it.)
-      Stop-RunningDeltaInstance is this function's one caller that
-      actually needs array semantics, and wraps at its own call site
-      accordingly; Resolve-DeltaApplicationPort (piped directly) and
-      Confirm-DeltaRuntimeStarted (boolean context) don't need to, and
-      deliberately don't.
-    #>
-    $candidates = Get-CimInstance -ClassName Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue
-    if (-not $candidates) {
-        return @()
-    }
-
-    return @($candidates | Where-Object { Test-DeltaManagedProcessCommandLine -CommandLine $_.CommandLine -DeltaRuntimeRoot $Script:DeltaRuntimeRoot })
-}
-
-function Wait-ForProcessExit {
-    param(
-        [Parameter(Mandatory)][int]$ProcessId,
-        [int]$TimeoutSeconds = 10
-    )
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    do {
-        if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
-            return $true
-        }
-        Start-Sleep -Milliseconds 500
-    } while ((Get-Date) -lt $deadline)
-
-    return -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
-}
-
-function Invoke-DeltaTaskkill {
-    <#
-      Runs taskkill.exe for $ProcessId (plus $ExtraArguments, e.g. '/F'),
-      without ever letting its own stderr reach the console or abort the
-      script - confirmed directly that redirecting a failing native
-      command's stderr through PowerShell (2>, in any form - merged with
-      2>&1, or sent to a file - makes no difference) wraps each line in a
-      terminating NativeCommandError under this script's own
-      Set-StrictMode -Version Latest + $ErrorActionPreference = 'Stop',
-      even though the exact same call with NO stderr redirection at all
-      merely lets taskkill's raw text (e.g. "ERROR: The process with PID
-      nnnn could not be terminated. Reason: This process can only be
-      terminated forcefully...") print straight to the console instead.
-      Neither behavior is acceptable here: that message describes the
-      GRACEFUL attempt not having worked yet, which is a normal,
-      expected, already-handled outcome (Stop-RunningDeltaInstance falls
-      back to /F for exactly this reason) - not a real error, and
-      definitely not something that should be allowed to throw.
-
-      $ErrorActionPreference is relaxed to 'Continue' for only the
-      duration of this one call (restored immediately after, even on a
-      throw, via try/finally) so the redirected stderr can be captured
-      instead of raised - Test-DeltaDatabaseExists already uses this
-      exact pattern for the same class of problem, not a new technique
-      introduced here.
-
-      The captured text is never shown on the console - only handed to
-      Write-Verbose, so an operator who wants to see exactly what
-      Windows said can re-run with -Verbose, while the normal install
-      output stays clean. This changes nothing about whether or how
-      taskkill is invoked, its arguments, or its timeout/retry behavior
-      - all of that still belongs entirely to Stop-RunningDeltaInstance.
-    #>
-    param(
-        [Parameter(Mandatory)][int]$ProcessId,
-        [string[]]$ExtraArguments = @()
-    )
-
-    $argumentList = @('/PID', $ProcessId) + $ExtraArguments
-    $previousEap = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $captured = & taskkill.exe $argumentList 2>&1
-    }
-    finally {
-        $ErrorActionPreference = $previousEap
-    }
-
-    $capturedText = ($captured | ForEach-Object { $_.ToString() } | Where-Object { $_ }) -join "`n"
-    if ($capturedText) {
-        Write-Verbose "taskkill.exe $($argumentList -join ' '): $capturedText"
-    }
-}
-
-function Stop-RunningDeltaInstance {
-    <#
-      Stops any DELTA server process already running from this specific
-      installation directory (Get-RunningDeltaProcesses), so a repeat
-      setup.ps1 run never leaves two instances bound to the same port.
-      Never touches any other node.exe process on the machine.
-
-      Attempts a graceful stop first (`taskkill` without /F, which sends
-      a close request the process can react to) and only escalates to a
-      forceful kill if it hasn't exited within the grace period -
-      Windows has no native SIGTERM, and this project's own findings
-      (docs/06 - Windows Service shutdown behavior) already note that a
-      clean shutdown handshake isn't guaranteed here regardless of
-      method, so this makes a real attempt rather than jumping straight
-      to a forceful kill.
-
-      The console only ever reports what actually happened: a quiet
-      success line when the graceful attempt alone worked, one
-      informational line when it didn't and the (designed, expected)
-      force fallback took over, and an error only in the one case
-      that's genuinely fatal - both attempts failing. Falling back to
-      force is not itself a failure, so it's never reported as one - see
-      Invoke-DeltaTaskkill for why Windows' own "could not be
-      terminated" message specifically must never reach the console
-      either, on top of that.
-    #>
-    # @() wraps the call, not just its result, so a single match is never
-    # unwrapped to a bare object before .Count/foreach below treat it as
-    # a list - see Get-RunningDeltaProcesses' own header for why that
-    # guarantee belongs here, at the one call site that needs it, rather
-    # than inside the function itself.
-    $processes = @(Get-RunningDeltaProcesses)
-    if (-not $processes -or $processes.Count -eq 0) {
-        Write-Detail 'No running DELTA instance detected.'
-        return
-    }
-
-    foreach ($proc in $processes) {
-        Write-Step 'Stopping existing DELTA...'
-
-        Invoke-DeltaTaskkill -ProcessId $proc.ProcessId
-        if (-not (Wait-ForProcessExit -ProcessId $proc.ProcessId -TimeoutSeconds 10)) {
-            Write-Host ''
-            Write-Detail 'Graceful shutdown did not complete.'
-            Write-Host ''
-            Write-Step 'Forcing shutdown...'
-            Invoke-DeltaTaskkill -ProcessId $proc.ProcessId -ExtraArguments @('/F')
-
-            if (-not (Wait-ForProcessExit -ProcessId $proc.ProcessId -TimeoutSeconds 10)) {
-                Stop-Setup @"
-Unable to stop the existing DELTA instance.
-
-PID:
-$($proc.ProcessId)
-
-The installer cannot safely continue while the previous DELTA instance is still running.
-"@
-            }
-        }
-
-        Write-Success '    DELTA stopped successfully.'
-    }
-}
 
 function Confirm-DeltaRuntimeNotRunning {
     <#
@@ -3312,7 +3134,7 @@ function Confirm-DeltaRuntimeNotRunning {
     }
 
     Write-Step 'Checking for an already-running DELTA instance...'
-    Stop-RunningDeltaInstance
+    Stop-RunningDeltaInstance -DeltaRuntimeRoot $Script:DeltaRuntimeRoot
 }
 
 # ---------------------------------------------------------------------------
@@ -3401,7 +3223,7 @@ function Resolve-DeltaApplicationPort {
         return
     }
 
-    $managedProcess = Get-RunningDeltaProcesses | Where-Object { [int]$_.ProcessId -eq [int]$check.OwningProcessId } | Select-Object -First 1
+    $managedProcess = Get-RunningDeltaProcesses -DeltaRuntimeRoot $Script:DeltaRuntimeRoot | Where-Object { [int]$_.ProcessId -eq [int]$check.OwningProcessId } | Select-Object -First 1
     if ($managedProcess) {
         Write-Host ''
         Write-Host ('-' * $Script:BannerWidth)
@@ -3656,7 +3478,7 @@ function Start-DeltaRuntimeForValidation {
 
     try {
         Start-Process -FilePath 'cmd.exe' `
-            -ArgumentList '/c dotenv -e .env -- yarn start' `
+            -ArgumentList $Script:DeltaLauncherCommandArguments `
             -WorkingDirectory $Script:DeltaRuntimeRoot `
             -WindowStyle Hidden `
             -RedirectStandardOutput $logPaths.StdOut `
@@ -3788,7 +3610,7 @@ function Confirm-DeltaRuntimeStarted {
     $isListening = $false
     $hasBeenObservedRunning = $false
     while ((Get-Date) -lt $portDeadline) {
-        if (Get-RunningDeltaProcesses) {
+        if (Get-RunningDeltaProcesses -DeltaRuntimeRoot $Script:DeltaRuntimeRoot) {
             $hasBeenObservedRunning = $true
         }
         elseif ($hasBeenObservedRunning) {
@@ -3810,7 +3632,7 @@ function Confirm-DeltaRuntimeStarted {
     $httpDeadline = (Get-Date).AddSeconds($Script:DeltaStartupHttpTimeoutSeconds)
     $isResponding = $false
     while ((Get-Date) -lt $httpDeadline) {
-        if (-not (Get-RunningDeltaProcesses)) {
+        if (-not (Get-RunningDeltaProcesses -DeltaRuntimeRoot $Script:DeltaRuntimeRoot)) {
             Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it responded over HTTP.')
         }
         if (Test-DeltaHttpEndpoint -Url $url) {
