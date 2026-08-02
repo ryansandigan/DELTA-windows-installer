@@ -2347,16 +2347,41 @@ function Test-PostgresServerPresent {
       uninstall.ps1, which uses this instead of Find-PostgresInstallation
       for exactly that reason).
 
+      $ServiceName, if supplied, scopes the service check to that exact
+      name instead of the broad 'postgresql*' wildcard. This matters
+      post-uninstall: the wildcard also matches a second PostgreSQL
+      version's service, an unrelated postgresql*-named service, or a
+      stopped/stale registration left behind by something other than
+      the installation actually being validated here - any of which
+      would make this function report "still present" for an
+      installation that was in fact fully removed. Callers that already
+      captured a specific installation via Find-PostgresInstallation
+      (e.g. Uninstall-PostgreSql, uninstall.ps1) should always pass
+      $existing.ServiceName. Only when no specific name is available
+      does this fall back to the wildcard, matching this function's
+      prior (unscoped) behavior.
+
       $InstallDir is optional - the install directory a prior
       Find-PostgresInstallation call already resolved, if any - and is
       only used to check for postgres.exe; without it, the service check
       alone still runs.
     #>
-    param([string]$InstallDir)
+    param(
+        [string]$InstallDir,
+        [string]$ServiceName
+    )
 
-    $service = Get-Service -Name 'postgresql*' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($service) {
-        return $true
+    if ($ServiceName) {
+        $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($service) {
+            return $true
+        }
+    }
+    else {
+        $service = Get-Service -Name 'postgresql*' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($service) {
+            return $true
+        }
     }
 
     if ($InstallDir) {
