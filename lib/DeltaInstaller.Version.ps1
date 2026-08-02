@@ -24,6 +24,20 @@
     version here, rather than at the repository root, means it ships
     inside the release ZIP automatically, with no packaging-script
     changes required to keep it there.
+
+    .env.installer (repository root - see lib\DeltaInstaller.Configuration.ps1)
+    also defines a DELTA_VERSION key. That duplication is intentional, not
+    an oversight: this file must stay a plain, standalone literal, because
+    .github\workflows\release.yml dot-sources it BY ITSELF - no
+    $Script:ProjectRoot, no DeltaInstaller.Common.ps1, no
+    DeltaInstaller.Configuration.ps1 - purely to compare
+    $Script:DeltaInstallerVersion against the pushed Git tag before a
+    release build proceeds. Making this value derive from
+    $Script:InstallerConfig would break that CI gate outright. THIS file
+    remains the sole authoritative source; .env.installer's own
+    DELTA_VERSION is not read by any script today and exists for future
+    diagnostics/installer reporting - keep both values in sync by hand
+    when bumping the installer version.
 #>
 
 $Script:DeltaInstallerVersion = '1.0.3'

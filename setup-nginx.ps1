@@ -178,6 +178,12 @@ $ErrorActionPreference = 'Stop'
 $Script:ProjectRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 . (Join-Path -Path $Script:ProjectRoot -ChildPath 'lib\DeltaInstaller.Common.ps1')
 
+# Pinned NGINX version, installer filename, and download URL - see that
+# file's own header. Dot-sourced immediately after
+# DeltaInstaller.Common.ps1 since its own fail-fast error path uses
+# Stop-Setup, defined there.
+. (Join-Path -Path $Script:ProjectRoot -ChildPath 'lib\DeltaInstaller.Configuration.ps1')
+
 # lib\DeltaDoctor.ReverseProxy.ps1 dot-sources lib\DeltaDoctor.NGINX.ps1
 # (which owns NGINX's installation location, the DELTA virtual host's own
 # fixed identity, and its pid-file-based Managed Runtime State machine) AND
@@ -229,14 +235,17 @@ $Script:SslCertificateSource = $null
 # The one NGINX version this installer ever installs - pinned, not "latest",
 # so a run today and a run next year install byte-for-byte the same NGINX.
 # Used consistently below wherever a version could otherwise vary: the local
-# package filename, the download URL, and the installation summary. Official
+# package filename, the download URL, and the installation summary. Comes
+# from .env.installer (NGINX_VERSION/NGINX_URL - see
+# lib\DeltaInstaller.Configuration.ps1), not a literal here. Official
 # Windows ZIP distribution only - nginx.org publishes precompiled Windows
 # binaries under this exact naming convention (confirmed live via a direct
-# HTTP HEAD request at the time this was written - re-verify against
-# https://nginx.org/en/download.html before bumping this version, the same
-# caveat setup.ps1 carries for its own EDB/PostGIS download URLs).
-$Script:NginxVersion     = '1.29.2'
-$Script:NginxDownloadUrl = "https://nginx.org/download/nginx-$($Script:NginxVersion).zip"
+# HTTP HEAD request at the time this was pinned - re-verify against
+# https://nginx.org/en/download.html before bumping NGINX_VERSION/
+# NGINX_INSTALLER/NGINX_URL in .env.installer, the same caveat setup.ps1
+# carries for its own EDB/PostGIS download URLs).
+$Script:NginxVersion     = $Script:InstallerConfig.NGINX_VERSION
+$Script:NginxDownloadUrl = $Script:InstallerConfig.NGINX_URL
 
 # Downloaded packages are cached project-locally in .\installers (sibling to
 # this script, gitignored), matching setup.ps1's own $Script:InstallersDirectory
@@ -647,7 +656,7 @@ function Get-NginxPackage {
       rather than two separate code paths.
     #>
 
-    $packagePath = Join-Path -Path $Script:InstallersDirectory -ChildPath "nginx-$($Script:NginxVersion).zip"
+    $packagePath = Join-Path -Path $Script:InstallersDirectory -ChildPath $Script:InstallerConfig.NGINX_INSTALLER
 
     if (Test-Path -LiteralPath $packagePath) {
         Write-Step 'Using local NGINX package...'

@@ -144,6 +144,12 @@ $Script:DeltaRuntimeSourceDirectory = Join-Path -Path $Script:ProjectRoot -Child
 # must be set before this line rather than computed inside it.
 . (Join-Path -Path $Script:ProjectRoot -ChildPath 'lib\DeltaInstaller.Common.ps1')
 
+# Pinned Node.js/PostgreSQL/PostGIS/NGINX versions, installer filenames,
+# and download URLs - see that file's own header. Dot-sourced immediately
+# after DeltaInstaller.Common.ps1 since its own fail-fast error path uses
+# Stop-Setup, defined there.
+. (Join-Path -Path $Script:ProjectRoot -ChildPath 'lib\DeltaInstaller.Configuration.ps1')
+
 # Single source of truth for this installer's own version - see that
 # file's header. Dot-sourced separately from DeltaInstaller.Common.ps1
 # so the version stays a plain, standalone piece of data rather than
@@ -161,8 +167,8 @@ $Script:DeltaRuntimeSourceDirectory = Join-Path -Path $Script:ProjectRoot -Child
 # Configuration
 # ---------------------------------------------------------------------------
 
-$Script:RequiredNodeVersion = '24.18.0'
-$Script:NodeDownloadUrl     = "https://nodejs.org/dist/v$($Script:RequiredNodeVersion)/node-v$($Script:RequiredNodeVersion)-x64.msi"
+$Script:RequiredNodeVersion = $Script:InstallerConfig.NODE_VERSION
+$Script:NodeDownloadUrl     = $Script:InstallerConfig.NODE_URL
 $Script:WorkingDirectory    = Join-Path -Path $env:TEMP -ChildPath 'delta-setup'
 
 # Downloaded installers are cached project-locally in .\installers (sibling
@@ -171,17 +177,18 @@ $Script:WorkingDirectory    = Join-Path -Path $env:TEMP -ChildPath 'delta-setup'
 $Script:InstallersDirectory = Join-Path -Path $Script:ProjectRoot -ChildPath 'installers'
 
 # PostgreSQL (Phase 2A). EDB does not publish a stable, guaranteed
-# download URL the way nodejs.org does - this filename pattern
-# (get.enterprisedb.com/postgresql/postgresql-{version}-{build}-windows-x64.exe)
-# was confirmed live via a direct HTTP request at the time this was written,
-# not officially documented as permanent. Re-verify against
+# download URL the way nodejs.org does - the version, installer filename,
+# and download URL below (from .env.installer - see
+# lib\DeltaInstaller.Configuration.ps1) were confirmed live via a direct
+# HTTP request at the time they were pinned, not officially documented as
+# permanent. Re-verify against
 # https://www.enterprisedb.com/downloads/postgres-postgresql-downloads
-# before bumping $RequiredPostgresVersion. See docs/06-deployment-risks.md
-# ("EDB installer has no stable download URL") for the full finding.
-$Script:RequiredPostgresVersion      = '16.14'
-$Script:RequiredPostgresBuild        = '2'
+# before bumping POSTGRES_VERSION/POSTGRES_INSTALLER/POSTGRES_URL in
+# .env.installer. See docs/06-deployment-risks.md ("EDB installer has no
+# stable download URL") for the full finding.
+$Script:RequiredPostgresVersion      = $Script:InstallerConfig.POSTGRES_VERSION
 $Script:RequiredPostgresMajorVersion = ($Script:RequiredPostgresVersion -split '\.')[0]
-$Script:PostgresDownloadUrl          = "https://get.enterprisedb.com/postgresql/postgresql-$($Script:RequiredPostgresVersion)-$($Script:RequiredPostgresBuild)-windows-x64.exe"
+$Script:PostgresDownloadUrl          = $Script:InstallerConfig.POSTGRES_URL
 $Script:PostgresInstallPrefix        = "C:\Program Files\PostgreSQL\$($Script:RequiredPostgresMajorVersion)"
 $Script:PostgresDataDirectory        = Join-Path -Path $Script:PostgresInstallPrefix -ChildPath 'data'
 $Script:PostgresServiceName          = "postgresql-x64-$($Script:RequiredPostgresMajorVersion)"
@@ -217,10 +224,10 @@ $Script:PostgresReuseMode = $false
 # succeed afterward. Unlike the PostgreSQL installer, official MD5
 # checksums are published alongside each release - see
 # Test-PostGISInstallerIntegrity. Re-verify the version/build at
-# https://download.osgeo.org/postgis/windows/pg<major>/ before bumping.
-$Script:RequiredPostGISVersion = '3.6.2'
-$Script:RequiredPostGISBuild   = '1'
-$Script:PostGISDownloadUrl     = "https://download.osgeo.org/postgis/windows/pg$($Script:RequiredPostgresMajorVersion)/postgis-bundle-pg$($Script:RequiredPostgresMajorVersion)x64-setup-$($Script:RequiredPostGISVersion)-$($Script:RequiredPostGISBuild).exe"
+# https://download.osgeo.org/postgis/windows/pg<major>/ before bumping
+# POSTGIS_VERSION/POSTGIS_INSTALLER/POSTGIS_URL in .env.installer.
+$Script:RequiredPostGISVersion = $Script:InstallerConfig.POSTGIS_VERSION
+$Script:PostGISDownloadUrl     = $Script:InstallerConfig.POSTGIS_URL
 $Script:PostGISChecksumUrl     = "$($Script:PostGISDownloadUrl).md5"
 
 # DELTA database + environment file. init_db.ps1/upgrade_database.ps1 own
@@ -853,7 +860,7 @@ function Get-NodeInstaller {
         New-Item -Path $DestinationDirectory -ItemType Directory -Force | Out-Null
     }
 
-    $installerPath = Join-Path -Path $DestinationDirectory -ChildPath "node-v$($Script:RequiredNodeVersion)-x64.msi"
+    $installerPath = Join-Path -Path $DestinationDirectory -ChildPath $Script:InstallerConfig.NODE_INSTALLER
 
     if (Test-Path -Path $installerPath) {
         Write-Step 'Using cached Node.js installer...'
@@ -1016,7 +1023,7 @@ function Get-PostgresInstaller {
         New-Item -Path $DestinationDirectory -ItemType Directory -Force | Out-Null
     }
 
-    $installerPath = Join-Path -Path $DestinationDirectory -ChildPath "postgresql-$($Script:RequiredPostgresVersion)-$($Script:RequiredPostgresBuild)-windows-x64.exe"
+    $installerPath = Join-Path -Path $DestinationDirectory -ChildPath $Script:InstallerConfig.POSTGRES_INSTALLER
 
     if (Test-Path -Path $installerPath) {
         Write-Step 'Using cached PostgreSQL installer...'
@@ -1033,7 +1040,7 @@ function Get-PostgresInstaller {
         Invoke-WebRequest -Uri $Script:PostgresDownloadUrl -OutFile $installerPath -UseBasicParsing
     }
     catch {
-        $downloadFailureDetail = 'EnterpriseDB does not publish a permanently stable download URL for this file (see docs/06-deployment-risks.md). Confirm the current filename at https://www.enterprisedb.com/downloads/postgres-postgresql-downloads and update the RequiredPostgresVersion/RequiredPostgresBuild values in this script if it has changed.'
+        $downloadFailureDetail = 'EnterpriseDB does not publish a permanently stable download URL for this file (see docs/06-deployment-risks.md). Confirm the current filename at https://www.enterprisedb.com/downloads/postgres-postgresql-downloads and update POSTGRES_VERSION/POSTGRES_INSTALLER/POSTGRES_URL in .env.installer if it has changed.'
         Stop-Setup "Failed to download the PostgreSQL installer from $($Script:PostgresDownloadUrl): $($_.Exception.Message). $downloadFailureDetail"
     }
 
@@ -1868,7 +1875,7 @@ function Get-PostGISInstaller {
         New-Item -Path $DestinationDirectory -ItemType Directory -Force | Out-Null
     }
 
-    $installerPath = Join-Path -Path $DestinationDirectory -ChildPath "postgis-bundle-pg$($Script:RequiredPostgresMajorVersion)x64-setup-$($Script:RequiredPostGISVersion)-$($Script:RequiredPostGISBuild).exe"
+    $installerPath = Join-Path -Path $DestinationDirectory -ChildPath $Script:InstallerConfig.POSTGIS_INSTALLER
 
     if (Test-Path -Path $installerPath) {
         Write-Step 'Using cached PostGIS installer...'
