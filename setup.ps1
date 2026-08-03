@@ -250,6 +250,15 @@ $Script:PostGISChecksumUrl     = "$($Script:PostGISDownloadUrl).md5"
 $Script:DefaultDeltaDatabaseName = 'delta_db'
 $Script:EnvTemplatePath          = Join-Path -Path $Script:ProjectRoot -ChildPath '.env.example'
 
+# The DELTA administrator account dts_db_schema.sql itself seeds
+# (first_name/last_name = 'admin', email = 'admin@admin.com') - a fixed,
+# schema-defined value, identical to init_db.ps1's own local $adminEmail
+# (Set-DeltaAdministratorPassword), never prompted for or read from
+# configuration. Used by Invoke-DeltaAdminPasswordReset (Show-MainMenu's
+# "Reset administrator password" option) to identify the one row it's
+# allowed to update.
+$Script:DeltaAdminAccountEmail = 'admin@admin.com'
+
 # Set by Resolve-ExistingDeltaDeployment - 'Upgrade' (default), 'Recreate',
 # or 'Fresh'. Stays 'Upgrade' unmodified whenever no existing DELTA
 # deployment is found at all, which is exactly what makes that case behave
@@ -460,7 +469,8 @@ function Show-MainMenu {
         Write-Host ''
         Write-Host '1. Update DELTA'
         Write-Host '2. Reinstall DELTA'
-        Write-Host '3. Exit'
+        Write-Host '3. Reset administrator password'
+        Write-Host '4. Exit'
         Write-Host ''
         $choice = Read-Host -Prompt 'Selection'
         Write-Host ''
@@ -468,12 +478,399 @@ function Show-MainMenu {
         switch ($choice.Trim()) {
             '1' { return $true }
             '2' { return $true }
-            '3' { return $false }
+            '3' {
+                # Recovery-only action: never returns $true/$false itself -
+                # falling out of this case with no `return` (same pattern
+                # setup-nginx.ps1's own management menu already uses for
+                # its own non-exiting actions) re-enters this while loop,
+                # which redisplays this exact menu from the top. Requires
+                # the `default` branch below rather than the unconditional
+                # trailing "not a valid option" message this switch used
+                # to end with - that message would otherwise incorrectly
+                # print after every legitimate password reset too, since a
+                # PowerShell `switch` case that doesn't `return` still
+                # falls through to whatever follows the switch statement.
+                Invoke-DeltaAdminPasswordReset
+            }
+            '4' { return $false }
+            default {
+                Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
+                Write-Host ''
+            }
         }
-
-        Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
-        Write-Host ''
     }
+}
+
+function Show-DeltaAdminPasswordResetConfirmation {
+    <#
+      The confirmation screen for Show-MainMenu's "Reset administrator
+      password" option - its own explicit yes/no gate rather than the
+      shared Read-DeltaYesNoConfirmation helper (lib\
+      DeltaInstaller.Common.ps1), because that helper's fixed '-' rule /
+      "[y/N]" frame doesn't match this feature's required screen layout
+      (a '=' banner and explicit "[Y] Yes" / "[N] No" labels, the same
+      shape Show-MainMenu itself already uses for its own menus - this
+      re-displays the whole screen on an invalid choice rather than only
+      re-prompting, for the same reason). Unlike Get-
+      DeltaManagedInstanceRestartPolicy's bare-Enter-means-recommended
+      convention, there is no default here: resetting a live credential
+      is significant enough that the operator must type Y explicitly.
+
+      Returns $true only for an explicit Y; $false for N or anything
+      that isn't a recognized option loops back to redisplay this same
+      screen (matching Show-MainMenu's own invalid-choice handling)
+      until one of the two is chosen.
+
+      Deliberately silent on HOW the new password will be chosen -
+      Read-DeltaAdminPasswordResetMethodChoice (below) asks that
+      separately, only once the operator has confirmed they want to
+      reset the password at all.
+    #>
+    while ($true) {
+        Write-Host ''
+        Write-Host ('=' * $Script:BannerWidth)
+        Write-Host 'Reset Administrator Password'
+        Write-Host ('=' * $Script:BannerWidth)
+        Write-Host ''
+        Write-Host 'This will reset the password for:'
+        Write-Host ''
+        Write-Host 'Email:'
+        Write-Host $Script:DeltaAdminAccountEmail
+        Write-Host ''
+        Write-Host 'Continue?'
+        Write-Host ''
+        Write-Host '[Y] Yes'
+        Write-Host '[N] No'
+        Write-Host ''
+        Write-Host 'Choose an option:'
+        Write-Host ''
+        $choice = Read-Host -Prompt 'Selection'
+        Write-Host ''
+
+        switch ($choice.Trim().ToUpperInvariant()) {
+            'Y' { return $true }
+            'N' { return $false }
+            default {
+                Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+function Read-DeltaAdminPasswordResetMethodChoice {
+    <#
+      The second screen of the "Reset administrator password" flow,
+      shown only after Show-DeltaAdminPasswordResetConfirmation's Y/N
+      gate - lets the operator choose HOW the new password is set,
+      rather than Invoke-DeltaAdminPasswordReset assuming a generated
+      password is always what's wanted. Production operators generally
+      want to choose their own administrator password; ad hoc/test
+      installs may prefer a generated one - this is that choice, made
+      explicit instead of assumed.
+
+      Returns 'Manual', 'Generate', or 'Cancel'. Same '=' banner/title
+      as the confirmation screen before it (this project's established
+      shape for a full-screen prompt - see that function's own header),
+      and the same invalid-choice-redisplays-the-whole-screen handling
+      Show-MainMenu and Show-DeltaAdminPasswordResetConfirmation both
+      already use.
+    #>
+    while ($true) {
+        Write-Host ''
+        Write-Host ('=' * $Script:BannerWidth)
+        Write-Host 'Reset Administrator Password'
+        Write-Host ('=' * $Script:BannerWidth)
+        Write-Host ''
+        Write-Host 'Choose how you would like to set the new administrator password.'
+        Write-Host ''
+        Write-Host '1. Enter a password'
+        Write-Host '2. Generate a secure password'
+        Write-Host '3. Cancel'
+        Write-Host ''
+        $choice = Read-Host -Prompt 'Selection'
+        Write-Host ''
+
+        switch ($choice.Trim()) {
+            '1' { return 'Manual' }
+            '2' { return 'Generate' }
+            '3' { return 'Cancel' }
+            default {
+                Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+function Read-DeltaAdminNewPassword {
+    <#
+      Prompts twice for the new DELTA administrator password and
+      requires a match - masked input (Read-Host -AsSecureString) and
+      the identical non-empty/match validation rules this project
+      already uses for every other operator-chosen credential (Read-
+      PostgresSuperuserPassword, lib\DeltaInstaller.Common.ps1;
+      init_db.ps1's own Read-DeltaAdministratorPassword). Kept as its
+      own small copy rather than sharing either of those, for the same
+      reason init_db.ps1's own header already gives for not sharing
+      Read-PostgresSuperuserPassword: this is a different, unrelated
+      credential with its own prompt text, and duplicating this already-
+      simple loop once more is lower-risk than reworking already-tested
+      password logic just to parameterize it.
+
+      Returns a SecureString, matching how a password is handled
+      everywhere else in this project - converted to plain text only at
+      the point Invoke-DeltaAdminPasswordReset actually needs it.
+    #>
+    while ($true) {
+        $first  = Read-Host -Prompt 'Enter the new password' -AsSecureString
+        $second = Read-Host -Prompt 'Confirm the new password' -AsSecureString
+
+        $plainFirst  = ConvertTo-PlainText -SecureString $first
+        $plainSecond = ConvertTo-PlainText -SecureString $second
+
+        if ($plainFirst.Length -eq 0) {
+            Write-Host 'Password cannot be empty. Try again.' -ForegroundColor Yellow
+            continue
+        }
+        if ($plainFirst -cne $plainSecond) {
+            Write-Host 'Passwords did not match. Try again.' -ForegroundColor Yellow
+            continue
+        }
+        return $first
+    }
+}
+
+function Invoke-DeltaAdminPasswordReset {
+    <#
+      Recovery path for a forgotten DELTA administrator password,
+      offered from Show-MainMenu's existing-installation menu (option
+      3) - deliberately independent of the Update/Reinstall lifecycle
+      entirely: it never touches application files, .env, or any
+      installer-managed configuration, only the one password column on
+      the DELTA database's own seeded administrator row. Declining the
+      confirmation screen (Show-DeltaAdminPasswordResetConfirmation) or
+      choosing Cancel on the follow-up method screen (Read-
+      DeltaAdminPasswordResetMethodChoice) both simply return here with
+      nothing changed, back to the caller's own menu loop - the account
+      lookup below runs read-only, before either the password itself or
+      the database row it belongs to are ever touched.
+
+      Deliberately reuses this project's already-established connection
+      primitives rather than re-implementing any of them - Get-
+      DeltaInstallPath (installation discovery, the same one Show-
+      MainMenu itself already called to get here), Get-EnvFileValue +
+      ConvertFrom-DatabaseUrl (reading and parsing the existing .env's
+      DATABASE_URL, lib\DeltaInstaller.Common.ps1 - the same pair
+      Resolve-ExistingPostgresCredentials/Get-DeltaUpgradeDatabaseUrlComponents
+      already use for Upgrade-lifecycle credential reuse), Get-
+      PostgresBinDirectory (psql.exe discovery), and Test-
+      PostgresCredentials + Get-PostgresConnectionFailureReason (live
+      connectivity validation with the same accurate, classified error
+      reporting Resolve-ExistingPostgresCredentials's own retry loop
+      relies on) - so this feature adds no second way to resolve or
+      validate a PostgreSQL connection.
+
+      The actual account lookup/update below intentionally mirrors
+      init_db.ps1's own Set-DeltaAdministratorPassword as closely as a
+      separate top-level script can (that function cannot be called
+      directly - init_db.ps1 is a standalone entry point with its own
+      top-level try/catch/exit, not a dot-sourceable library): same
+      table (public.super_admin_users), same pgcrypto
+      hashing call (crypt(:'password', gen_salt('bf', 10)) - the exact
+      algorithm the schema itself seeds accounts with, so this changes
+      only what the stored hash is, never how the application verifies
+      it), and the same quoted-psql-variable + \getenv mechanism for
+      passing the new password to psql -f without either SQL-escaping
+      it by hand or exposing it to Windows argv-escaping (see that
+      function's own header for why both those alternatives were ruled
+      out - both apply exactly as much here).
+
+      Looks the account up first (a plain SELECT) before asking how the
+      new password should be set, generating one, or touching anything,
+      so "the admin account does not exist" is reported precisely,
+      distinct from a hashing/update failure -
+      unlike Set-DeltaAdministratorPassword, which is only ever invoked
+      immediately after this same schema was just restored (so a
+      missing seeded row would mean the restore itself failed), this
+      runs against a live, already-deployed database an operator could
+      have modified, so that assumption no longer holds and the two
+      failure modes are kept distinguishable.
+    #>
+    if (-not (Show-DeltaAdminPasswordResetConfirmation)) {
+        return
+    }
+
+    $adminEmail = $Script:DeltaAdminAccountEmail
+
+    Write-Step 'Locating DELTA installation...'
+    $installPath = Get-DeltaInstallPath
+    if (-not $installPath) {
+        Stop-Setup 'No existing DELTA installation was detected.'
+    }
+    Write-Detail 'DELTA installation found.'
+
+    Write-Step 'Loading DELTA configuration...'
+    $envPath = Join-Path -Path $installPath -ChildPath '.env'
+    if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
+        Stop-Setup "DELTA configuration file not found: $envPath"
+    }
+    $databaseUrl = Get-EnvFileValue -Path $envPath -Key 'DATABASE_URL'
+    if ([string]::IsNullOrWhiteSpace($databaseUrl)) {
+        Stop-Setup "DATABASE_URL is not set in $envPath. Cannot determine how to connect to the DELTA database."
+    }
+    $connection = ConvertFrom-DatabaseUrl -DatabaseUrl $databaseUrl
+    if (-not $connection) {
+        Stop-Setup "DATABASE_URL in $envPath could not be parsed. Verify it is a well-formed postgresql:// connection string."
+    }
+
+    Write-Step 'Connecting to PostgreSQL...'
+    $bin = Get-PostgresBinDirectory
+    $psqlExe = Join-Path -Path $bin -ChildPath 'psql.exe'
+    if (-not (Test-Path -LiteralPath $psqlExe)) {
+        Stop-Setup "Required PostgreSQL executable not found: $psqlExe"
+    }
+    $connectivityCheck = Test-PostgresCredentials -PostgresHost $connection.PostgresHost -Port $connection.Port `
+        -Username $connection.Username -Password $connection.Password
+    if (-not $connectivityCheck.Success) {
+        $failureReason = Get-PostgresConnectionFailureReason -ErrorMessage $connectivityCheck.ErrorMessage
+        Stop-Setup "Unable to connect to PostgreSQL: $failureReason"
+    }
+
+    Write-Step 'Locating administrator account...'
+    $escapedEmail = $adminEmail.Replace("'", "''")
+    $lookupSqlPath = Join-Path -Path $env:TEMP -ChildPath "delta-admin-lookup-$([guid]::NewGuid().ToString('N')).sql"
+    Set-Content -LiteralPath $lookupSqlPath -Encoding utf8 -Value "SELECT email FROM public.super_admin_users WHERE email = '$escapedEmail';"
+
+    $plainConnectionPassword = ConvertTo-PlainText -SecureString $connection.Password
+    $previousPgPassword = $env:PGPASSWORD
+    $previousEap = $ErrorActionPreference
+    $lookupOutput = $null
+    $lookupExitCode = $null
+    try {
+        # Same reasoning as every other psql invocation in this project
+        # (Test-PostgresCredentials, init_db.ps1's Set-
+        # DeltaAdministratorPassword): psql's routine stderr output would
+        # otherwise become a terminating error under this script's global
+        # $ErrorActionPreference = 'Stop'.
+        $ErrorActionPreference = 'Continue'
+        $env:PGPASSWORD = $plainConnectionPassword
+        $lookupOutput = & $psqlExe -h $connection.PostgresHost -p $connection.Port -U $connection.Username -d $connection.DatabaseName `
+            --set ON_ERROR_STOP=on --tuples-only --no-align --quiet -f $lookupSqlPath 2>&1
+        $lookupExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousEap
+        if ($null -eq $previousPgPassword) {
+            Remove-Item -Path Env:\PGPASSWORD -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:PGPASSWORD = $previousPgPassword
+        }
+        Remove-Item -LiteralPath $lookupSqlPath -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($lookupExitCode -ne 0) {
+        $failureReason = Get-PostgresConnectionFailureReason -ErrorMessage (($lookupOutput | Out-String).Trim())
+        Stop-Setup "Failed to query the DELTA database: $failureReason"
+    }
+    $matchedRows = @($lookupOutput | Where-Object { $_.Trim() })
+    if ($matchedRows.Count -eq 0) {
+        Stop-Setup "The administrator account '$adminEmail' does not exist in this database."
+    }
+    if ($matchedRows.Count -gt 1) {
+        Stop-Setup "Expected exactly one administrator account for email '$adminEmail', but $($matchedRows.Count) rows matched. Refusing to continue with an ambiguous match."
+    }
+
+    $resetMethod = Read-DeltaAdminPasswordResetMethodChoice
+    if ($resetMethod -eq 'Cancel') {
+        return
+    }
+
+    if ($resetMethod -eq 'Manual') {
+        $newPassword = Read-DeltaAdminNewPassword
+        $newPlainPassword = ConvertTo-PlainText -SecureString $newPassword
+    }
+    else {
+        Write-Step 'Generating secure password...'
+        # 15 random bytes Base64-encodes to exactly 20 characters with no
+        # padding (120 bits is evenly divisible by the 6 bits/character
+        # Base64 uses) - squarely inside this feature's required ~16-20
+        # character range. Reuses New-DeltaRandomPassword unchanged (lib\
+        # DeltaInstaller.Common.ps1) rather than a second random-password
+        # generator; that function's own CSPRNG (RNGCryptoServiceProvider)
+        # is exactly what a credential like this needs.
+        $newPlainPassword = New-DeltaRandomPassword -ByteLength 15
+    }
+
+    Write-Step 'Updating administrator password...'
+    $updateSqlPath = Join-Path -Path $env:TEMP -ChildPath "delta-admin-reset-$([guid]::NewGuid().ToString('N')).sql"
+    Set-Content -LiteralPath $updateSqlPath -Encoding utf8 -Value @(
+        '\getenv password DELTA_ADMIN_NEW_PASSWORD'
+        "UPDATE public.super_admin_users SET password = crypt(:'password', gen_salt('bf', 10)) WHERE email = '$escapedEmail' RETURNING email;"
+    )
+
+    $previousAdminPwEnv = $env:DELTA_ADMIN_NEW_PASSWORD
+    $updateOutput = $null
+    $updateExitCode = $null
+    try {
+        $ErrorActionPreference = 'Continue'
+        $env:PGPASSWORD = $plainConnectionPassword
+        $env:DELTA_ADMIN_NEW_PASSWORD = $newPlainPassword
+        $updateOutput = & $psqlExe -h $connection.PostgresHost -p $connection.Port -U $connection.Username -d $connection.DatabaseName `
+            --set ON_ERROR_STOP=on --tuples-only --no-align --quiet -f $updateSqlPath 2>&1
+        $updateExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousEap
+        if ($null -eq $previousPgPassword) {
+            Remove-Item -Path Env:\PGPASSWORD -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:PGPASSWORD = $previousPgPassword
+        }
+        if ($null -eq $previousAdminPwEnv) {
+            Remove-Item -Path Env:\DELTA_ADMIN_NEW_PASSWORD -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:DELTA_ADMIN_NEW_PASSWORD = $previousAdminPwEnv
+        }
+        $plainConnectionPassword = $null
+        Remove-Item -LiteralPath $updateSqlPath -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($updateExitCode -ne 0) {
+        $failureReason = Get-PostgresConnectionFailureReason -ErrorMessage (($updateOutput | Out-String).Trim())
+        Stop-Setup "Failed to update the administrator password: $failureReason"
+    }
+    $updatedRows = @($updateOutput | Where-Object { $_.Trim() })
+    if ($updatedRows.Count -ne 1) {
+        Stop-Setup "Password update did not affect exactly one row (matched $($updatedRows.Count)). Refusing to report success for an ambiguous update."
+    }
+
+    Write-Success 'Administrator password has been reset successfully.'
+    Write-Host ''
+    Write-Host 'Email:'
+    Write-Host $adminEmail
+
+    # Manual mode never echoes the password back - the operator just
+    # typed it in themselves, twice, so printing it a third time would
+    # only add it to scrollback/screen-capture risk for no benefit.
+    # Generate mode is the one case the operator has no other record of
+    # it, so it's shown once, here, with an explicit reminder to store
+    # it - the same reasoning the previous, generate-only version of
+    # this feature already applied, just no longer unconditional.
+    if ($resetMethod -eq 'Generate') {
+        Write-Host ''
+        Write-Host 'Password:'
+        Write-Host $newPlainPassword
+        Write-Host ''
+        Write-Host 'Please store this password securely.'
+    }
+
+    Write-Host ''
+    Write-Host 'Press Enter to continue...' -NoNewline
+    Read-Host | Out-Null
+
+    $newPlainPassword = $null
 }
 
 function Invoke-DeltaOptionalReverseProxySetup {
