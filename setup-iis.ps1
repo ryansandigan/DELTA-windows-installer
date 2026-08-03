@@ -1794,6 +1794,120 @@ function Show-DeltaIisPortConflictNotice {
     Write-Host ''
 }
 
+function Show-DeltaIisForeignNginxConflictNotice {
+    <#
+      IIS-side mirror of setup-nginx.ps1's own
+      Show-DeltaNginxForeignIisConflictNotice - see that function's own
+      header for the full rationale. Shown only when the conflicting
+      owner looks like NGINX but Doctor already established
+      (Get-DeltaReverseProxyHandoverPlan returning $null - see
+      Test-DeltaIisPortPrerequisites's own header) that it is NOT a
+      DELTA-managed provider, so automatic handover was never offered.
+      Purely better guidance before asking to stop it - never a widening
+      of the Manual Reverse Proxy Handover feature's own DELTA-managed-only
+      ownership rule; this function itself only asks, it never stops
+      anything (Stop-DeltaForeignNginx, below, does that, and only once
+      this returns $true).
+
+      NGINX runs as a real user-mode process (nginx.exe), unlike IIS's
+      own HTTP.sys-owned listeners (always attributed to PID 4/"System" -
+      see Test-DeltaIisRequiredPortAvailability's own header) - so "looks
+      like NGINX" is a plain ProcessName check on the calling side, no
+      PID special-case needed.
+
+      Reuses Read-DeltaYesNoConfirmation (lib\DeltaInstaller.Common.ps1) -
+      see Show-DeltaNginxForeignIisConflictNotice's own header
+      (setup-nginx.ps1) for why, rather than a second confirmation
+      mechanism for the same kind of question.
+
+      Returns [bool] - $true if the operator confirmed stopping NGINX,
+      $false to decline.
+    #>
+    param([Parameter(Mandatory)][array]$RequiredPorts)
+
+    $portsPhrase = ConvertTo-DeltaEnglishList -Items ($RequiredPorts | ForEach-Object { "$_" })
+    $portWord    = if ($RequiredPorts.Count -gt 1) { 'ports' } else { 'port' }
+
+    return Read-DeltaYesNoConfirmation -Body {
+        Write-Host 'NGINX is currently using one or more ports required by IIS.'
+        Write-Host ''
+        Write-Host "IIS requires exclusive access to $portWord $portsPhrase."
+        Write-Host ''
+        Write-Host 'The detected NGINX instance is NOT managed by DELTA.'
+        Write-Host ''
+        Write-Host 'Stopping NGINX may temporarily interrupt websites or applications currently being served.'
+        Write-Host ''
+        Write-Host 'If this server is dedicated to DELTA, it is generally safe to stop NGINX before continuing.'
+        Write-Host ''
+        Write-Host 'Would you like DELTA to stop NGINX now and continue?'
+        Write-Host ''
+        Write-Host '[Y] Yes - Stop NGINX and continue'
+        Write-Host '[N] No  - Exit without making changes'
+    }
+}
+
+function Stop-DeltaForeignNginx {
+    <#
+      Stops a non-DELTA-managed NGINX instance so IIS can bind its
+      required ports - only ever called after
+      Show-DeltaIisForeignNginxConflictNotice's own explicit Y/N
+      confirmation, never automatically.
+
+      Deliberately separate from lib\DeltaDoctor.NGINX.ps1's own
+      Stop-DeltaManagedNginx, which is hardcoded to
+      $Script:NginxExePath/$Script:NginxHome and explicitly documented to
+      "never terminate an unrelated nginx.exe process" - repurposing it
+      here would silently violate that guarantee for every other caller
+      of it. Uses the same control mechanism NGINX itself documents for
+      stopping any instance - `nginx.exe -s stop`, run against the actual
+      conflicting binary's own path ($Owner.ExecutablePath, resolved by
+      Test-DeltaIisRequiredPortAvailability's own Get-ListeningTcpPortOwner
+      call), letting nginx resolve its own default prefix/pid file
+      exactly as it would if an administrator ran the identical command
+      by hand from that binary's own directory - never
+      $Script:NginxExePath, DELTA's own instance. Falls back to
+      Stop-Process -Force against the raw PID only when no executable
+      path could be resolved at all (Get-ListeningTcpPortOwner's own
+      header - a process that has already exited, or one
+      Get-DeltaProcessById could not read) - `-s stop` requires a real
+      path to invoke.
+
+      Reuses Wait-DeltaPortsReleased (lib\DeltaInstaller.Common.ps1) - see
+      setup-nginx.ps1's own Stop-DeltaForeignIis for why this does not
+      itself decide success/failure if ports remain occupied; the caller
+      (Test-DeltaIisPortPrerequisites) re-runs its own normal port check
+      afterward and falls through to the existing hard-failure notice in
+      that case, per this feature's own explicit "if the ports remain
+      unavailable, display the existing prerequisite failure" requirement.
+    #>
+    param(
+        [Parameter(Mandatory)][PSCustomObject]$Owner,
+        [Parameter(Mandatory)][int[]]$RequiredPorts
+    )
+
+    Write-Step 'Stopping NGINX...'
+
+    if ($Owner.ExecutablePath) {
+        $previousEap = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            & $Owner.ExecutablePath '-s' 'stop' 2>&1 | Out-Null
+        }
+        finally {
+            $ErrorActionPreference = $previousEap
+        }
+    }
+    else {
+        Stop-Process -Id $Owner.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Step 'Verifying required ports were released...'
+    $stillOccupied = Wait-DeltaPortsReleased -Ports $RequiredPorts
+    if ($stillOccupied.Count -eq 0) {
+        Write-Success '    NGINX stopped; ports released.'
+    }
+}
+
 function Show-DeltaIisPortsAvailableNotice {
     <#
       The IIS analogue of setup-nginx.ps1's own
@@ -1848,8 +1962,41 @@ function Test-DeltaIisPortPrerequisites {
         }
     }
 
+    # NGINX Installed (Doctor-reported, not re-detected here) is the
+    # signal here - see Show-DeltaIisForeignNginxConflictNotice's own
+    # header for why NGINX, unlike IIS, needs no PID special-case on top
+    # of it. Only used to choose which notice to show below - the
+    # DELTA-managed handover path above already fully owns the case
+    # where this same NGINX is DELTA-managed.
+    $nginxInstalled = [bool](($ReverseProxyState.ProviderStates | Where-Object { $_.Name -eq 'NGINX' } | Select-Object -First 1).Installed)
+
     $results  = @(foreach ($port in $requiredPorts) { Test-DeltaIisRequiredPortAvailability -Port $port })
     $conflict = $results | Where-Object { -not $_.Available } | Select-Object -First 1
+
+    if ($conflict) {
+        $looksLikeNginx = $nginxInstalled -and $conflict.Owner -and ($conflict.Owner.ProcessName -eq 'nginx')
+        if ($looksLikeNginx) {
+            $wantsStop = Show-DeltaIisForeignNginxConflictNotice -RequiredPorts $requiredPorts
+            if (-not $wantsStop) {
+                Write-Host ''
+                Write-Detail 'No changes have been made.'
+                Write-Host ''
+                exit 0
+            }
+
+            Stop-DeltaForeignNginx -Owner $conflict.Owner -RequiredPorts $requiredPorts
+
+            # Re-run the same check once more - success or failure from
+            # here on is decided exactly as if this had been the first
+            # attempt (still-occupied falls straight through to the
+            # existing hard-failure notice below, per this feature's own
+            # "if the ports remain unavailable, display the existing
+            # prerequisite failure" requirement).
+            $results  = @(foreach ($port in $requiredPorts) { Test-DeltaIisRequiredPortAvailability -Port $port })
+            $conflict = $results | Where-Object { -not $_.Available } | Select-Object -First 1
+        }
+    }
+
     if ($conflict) {
         Show-DeltaIisPortConflictNotice -PortCheck $conflict
         exit 1
@@ -1971,6 +2118,121 @@ function Test-DeltaIisManagedWebsiteConfiguration {
     Show-DeltaDoctorChecks -Checks $result.Checks
 }
 
+# ---------------------------------------------------------------------------
+# PUBLIC_URL synchronization (existing installation)
+# ---------------------------------------------------------------------------
+#
+# After initial installation, IIS - not .env.example/setup.ps1 - is the
+# source of truth for the deployed PUBLIC_URL
+# (lib\DeltaInstaller.Common.ps1's own Sync-DeltaPublicUrlEnvironment
+# header). Runs once, before the management menu is ever shown, so every
+# successful re-run of this script against an already-configured
+# installation keeps .env in sync with whatever IIS is actually serving -
+# never only on a fresh install. The direct IIS analogue of
+# setup-nginx.ps1's own identical Resolve-DeltaNginxPublicUrlSync. This
+# section only ever writes .env - it deliberately never restarts DELTA
+# itself; the management menu's own "Restart DELTA backend" option
+# (Restart-DeltaRuntimeForReverseProxy, lib\DeltaInstaller.Common.ps1) is
+# the one place that does, and only when the administrator explicitly
+# chooses it.
+
+function Show-DeltaIisPublicUrlMismatchNotice {
+    <#
+      The IIS analogue of setup-nginx.ps1's own
+      Show-DeltaNginxPublicUrlMismatchNotice - see that function's own
+      header for the full rationale.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ConfiguredUrl,
+        [Parameter(Mandatory)][string]$EnvUrl
+    )
+
+    Write-Host ''
+    Write-Host 'The configured IIS domain and PUBLIC_URL do not match.'
+    Write-Host ''
+    Write-Host 'IIS:'
+    Write-Detail $ConfiguredUrl
+    Write-Host ''
+    Write-Host '.env:'
+    Write-Detail $EnvUrl
+    Write-Host ''
+}
+
+function Resolve-DeltaIisPublicUrlSync {
+    <#
+      Reads the managed site's own already-configured host header
+      (Get-DeltaIisSiteHostHeader) and HTTPS state
+      (Get-DeltaIisExistingHttpsCertificateState) - the same read-only
+      sources the management menu's own display already trusts - compares
+      the resulting URL against PUBLIC_URL in .env
+      (Test-DeltaPublicUrlsMatch), and only acts on a genuine
+      disagreement. See setup-nginx.ps1's own Resolve-DeltaNginxPublicUrlSync
+      for the full four-outcome breakdown (no host header yet / PUBLIC_URL
+      absent / already matching / genuine mismatch) - identical here,
+      just against IIS's own site/binding state instead of a vhost file.
+
+      A genuine mismatch re-prompts for the domain
+      (Resolve-DeltaWebsiteDomain -DefaultDomain, defaulting a bare Enter
+      to the domain IIS is already configured with, not "localhost" - the
+      same footgun Repair-DeltaIisManagedWebsite's own header already
+      calls out), then reconciles ONLY the artifacts this installer owns -
+      Confirm-DeltaIisAppPool/New-DeltaIisWebConfig/Confirm-DeltaIisWebsite
+      (which updates the HTTP:80 binding's host header via
+      Confirm-DeltaIisWebsiteBinding) and, only when HTTPS is already
+      configured, Confirm-DeltaIisHttpsBinding with the SAME thumbprint
+      already in place - only the domain is being resynchronized here,
+      never the certificate itself. Mirrors Repair-DeltaIisManagedWebsite's
+      own composition rather than duplicating it, except for domain
+      resolution: that function reads the EXISTING domain and never
+      prompts, which is exactly wrong for a call site that got here
+      because the domain needs to change.
+
+      DELTA itself is never restarted here, in any of the four outcomes -
+      see this section's own header for why.
+    #>
+    param([Parameter(Mandatory)]$ManagedSite)
+
+    $hostHeader = Get-DeltaIisSiteHostHeader -Site $ManagedSite
+    if (-not $hostHeader) {
+        return
+    }
+
+    $httpsState = Get-DeltaIisExistingHttpsCertificateState
+    $isHttps = [bool]($httpsState -and $httpsState.CertificateExists)
+
+    $configuredUrl = Get-DeltaPublicUrl -Domain $hostHeader -Https $isHttps
+    $envUrl = Get-EnvFileValue -Path $Script:DeltaEnvPath -Key 'PUBLIC_URL'
+
+    if (-not $envUrl) {
+        Sync-DeltaPublicUrlEnvironment -Domain $hostHeader -Https:$isHttps
+        return
+    }
+
+    if (Test-DeltaPublicUrlsMatch -First $configuredUrl -Second $envUrl) {
+        return
+    }
+
+    Show-DeltaIisPublicUrlMismatchNotice -ConfiguredUrl $configuredUrl -EnvUrl $envUrl
+
+    Write-PhaseBanner 'Public Website Domain'
+    $Script:DeltaWebsiteDomain = Resolve-DeltaWebsiteDomain -DefaultDomain $hostHeader
+    Write-Success "    Website domain: $($Script:DeltaWebsiteDomain)"
+
+    Resolve-DeltaBackendPort
+
+    Confirm-DeltaIisAppPool
+    New-DeltaIisWebConfig
+    Confirm-DeltaIisWebsite -ManagedSite $ManagedSite
+
+    if ($isHttps -and $httpsState.Thumbprint) {
+        Confirm-DeltaIisHttpsBinding -Thumbprint $httpsState.Thumbprint
+    }
+
+    Confirm-DeltaIisWebsiteConfigurationResult | Out-Null
+
+    Sync-DeltaPublicUrlEnvironment -Domain $Script:DeltaWebsiteDomain -Https:$isHttps
+}
+
 function Show-DeltaIisManagementMenu {
     <#
       The Phase 5/8 hand-off point - replaces the old "Website
@@ -1987,7 +2249,7 @@ function Show-DeltaIisManagementMenu {
       .env or re-derived.
 
       Unlike setup-nginx.ps1's own Running/Stopped/Broken/NotInstalled
-      branching menu, this always offers the same seven options - IIS's
+      branching menu, this always offers the same eight options - IIS's
       own Start-Website/Stop-Website/Restart-WebAppPool cmdlets are
       idempotent no-ops to call against an already-matching state (and
       Start-DeltaIisManagedWebsite/Stop-DeltaIisManagedWebsite each still
@@ -1997,6 +2259,15 @@ function Show-DeltaIisManagementMenu {
       have. The full three-signal Broken-state model setup-nginx.ps1 uses
       belongs to Phase 8's own later, separate runtime-management
       redesign - out of scope for this UX/orchestration-only adjustment.
+
+      "Restart DELTA backend" (Restart-DeltaRuntimeForReverseProxy,
+      lib\DeltaInstaller.Common.ps1) is the one option here that touches
+      the DELTA (Node.js) process rather than IIS itself - the direct IIS
+      analogue of setup-nginx.ps1's own identical menu option. Kept as
+      its own explicit, administrator-triggered choice: the PUBLIC_URL
+      synchronization section above never restarts DELTA automatically,
+      so this is where an administrator goes to actually make DELTA pick
+      up a newly-synchronized .env value.
 
       Loops until the administrator chooses Exit (bare Enter also exits),
       re-reading the site fresh at the top of every iteration so
@@ -2073,13 +2344,14 @@ function Show-DeltaIisManagementMenu {
         Write-Host '2) Stop Website'
         Write-Host '3) Restart Website'
         Write-Host '4) Restart Application Pool'
-        Write-Host '5) Browse Website'
-        Write-Host '6) Validate Configuration'
-        Write-Host '7) Exit'
+        Write-Host '5) Restart DELTA backend'
+        Write-Host '6) Browse Website'
+        Write-Host '7) Validate Configuration'
+        Write-Host '8) Exit'
         Write-Host ''
 
-        $choice = Read-Host -Prompt 'Choose an option [7]'
-        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '7' }
+        $choice = Read-Host -Prompt 'Choose an option [8]'
+        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '8' }
 
         switch ($choice.Trim()) {
             '1' {
@@ -2096,9 +2368,10 @@ function Show-DeltaIisManagementMenu {
                 Show-DeltaIisPostHandoverValidation
             }
             '4' { Restart-DeltaIisManagedAppPool }
-            '5' { Open-DeltaIisManagedWebsite -Scheme $scheme -HostHeader $hostHeader }
-            '6' { Test-DeltaIisManagedWebsiteConfiguration }
-            '7' { return }
+            '5' { Restart-DeltaRuntimeForReverseProxy }
+            '6' { Open-DeltaIisManagedWebsite -Scheme $scheme -HostHeader $hostHeader }
+            '7' { Test-DeltaIisManagedWebsiteConfiguration }
+            '8' { return }
             default { Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow }
         }
     }
@@ -2224,6 +2497,7 @@ try {
         # attention" posture rather than presenting a menu for a site this
         # script cannot yet vouch for.
         if ($checkup.Healthy) {
+            Resolve-DeltaIisPublicUrlSync -ManagedSite $websiteResult.ManagedSite
             Show-DeltaIisManagementMenu
         }
         exit 0
@@ -2247,6 +2521,8 @@ try {
     if ($sslResult.Cancelled) {
         exit 0
     }
+
+    Sync-DeltaPublicUrlEnvironment -Domain $Script:DeltaWebsiteDomain -Https:$sslResult.HttpsConfigured
 
     Show-DeltaIisSslSummary -SslResult $sslResult
 

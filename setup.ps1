@@ -276,14 +276,17 @@ $Script:DeltaDeploymentLifecycle = 'Upgrade'
 # meaningful for Update/Recreate, which may already have one configured.
 $Script:DeltaIsFreshInstallation = $true
 
-# DELTA application startup validation (Start-DeltaRuntimeForValidation /
-# Confirm-DeltaRuntimeStarted, below) - an interim convenience until Phase 5
-# (Windows Service) supersedes it, see those functions' own headers. How
-# long Confirm-DeltaRuntimeStarted waits for the just-started process to
-# bind $Script:DeltaBackendPort, and then to answer an HTTP request, before
-# treating startup as failed rather than merely slow.
-$Script:DeltaStartupPortTimeoutSeconds = 60
-$Script:DeltaStartupHttpTimeoutSeconds = 20
+# $Script:DeltaStartupPortTimeoutSeconds/DeltaStartupHttpTimeoutSeconds
+# (how long Confirm-DeltaRuntimeStarted waits for the just-started process
+# to bind $Script:DeltaBackendPort, and then to answer an HTTP request,
+# before treating startup as failed rather than merely slow) now live in
+# lib\DeltaInstaller.Common.ps1 (dot-sourced above) alongside
+# Start-DeltaRuntimeForValidation/Confirm-DeltaRuntimeStarted themselves -
+# promoted there once setup-nginx.ps1/setup-iis.ps1 needed the identical
+# stop/start/verify sequence to restart DELTA after a successful reverse
+# proxy configuration, so .env changes (PUBLIC_URL, which only setup.ps1
+# previously ever wrote) actually take effect. See that file's own
+# section header for the full rationale.
 
 # Set by Resolve-DeltaApplicationPort only when the port conflict it found
 # turned out to be the installer's own managed DELTA instance (per Get-
@@ -339,26 +342,10 @@ $Script:DeltaSkipManagedInstanceRestart = $false
 # refactor's scope is setup.ps1's own presentation only.
 # ---------------------------------------------------------------------------
 
-function Show-Section {
-    <#
-      The full-width '====' banner used for setup.ps1's own major
-      screens - the installer banner, each phase, DELTA Runtime
-      Deployment, Registry Registration, and the final summary.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$Title,
-        [string]$Subtitle
-    )
-    $rule = '=' * $Script:BannerWidth
-    Write-Host ''
-    Write-Host $rule
-    Write-Host $Title
-    if ($Subtitle) {
-        Write-Host $Subtitle
-    }
-    Write-Host $rule
-    Write-Host ''
-}
+# Show-Section now lives in lib\DeltaInstaller.Common.ps1 (dot-sourced
+# above) - promoted there alongside the DELTA runtime start/verify
+# functions that call it once setup-nginx.ps1/setup-iis.ps1 needed those
+# too. Still used throughout this file exactly as before.
 
 function Show-Warning {
     <#
@@ -1109,41 +1096,11 @@ function New-ServiceAccountPassword {
     }
 }
 
-function Test-TcpPortAvailable {
-    <#
-      Reports whether $Port is free to listen on and, if not, a
-      human-readable description (process name + PID) of whatever
-      already owns it, for display to the operator, plus the raw owning
-      process ID itself (OwningProcessId). Uses Get-NetTCPConnection
-      (built into Windows Server's NetTCPIP module) rather than a raw
-      socket bind, since it also identifies the owner.
-
-      Originally Test-PostgresPort (Resolve-PostgresPort's own helper) -
-      generalized and renamed once Resolve-DeltaApplicationPort needed the
-      identical "is this port free, and who owns it if not" check for
-      DELTA's own application port. Nothing about the implementation is
-      PostgreSQL-specific; only the name was.
-
-      OwningProcessId exists specifically for Resolve-DeltaApplicationPort's
-      own use: cross-referencing it against Get-RunningDeltaProcesses'
-      PIDs is how that function tells "this port is occupied by our own
-      managed DELTA instance" apart from "this port is occupied by
-      something else entirely" - process ownership is still determined
-      exclusively by Get-RunningDeltaProcesses (command line, application
-      root), never by this function or anything registry-based; this only
-      supplies the PID being cross-referenced.
-    #>
-    param([Parameter(Mandatory)][int]$Port)
-
-    $connection = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $connection) {
-        return [PSCustomObject]@{ Available = $true; OwnerDescription = $null; OwningProcessId = $null }
-    }
-
-    $owner = Get-Process -Id $connection.OwningProcess -ErrorAction SilentlyContinue
-    $description = if ($owner) { "$($owner.ProcessName).exe (PID $($owner.Id))" } else { "PID $($connection.OwningProcess)" }
-    return [PSCustomObject]@{ Available = $false; OwnerDescription = $description; OwningProcessId = $connection.OwningProcess }
-}
+# Test-TcpPortAvailable now lives in lib\DeltaInstaller.Common.ps1
+# (dot-sourced above) - promoted there alongside Confirm-DeltaRuntimeStarted
+# (its own caller) once setup-nginx.ps1/setup-iis.ps1 needed the identical
+# DELTA runtime restart/verify sequence. Still used exactly as before by
+# Resolve-DeltaApplicationPort/Resolve-PostgresPort below.
 
 function Resolve-PostgresPort {
     <#
@@ -1301,6 +1258,13 @@ function Install-PostgresServer {
       documents no exit-code table beyond "0 = success" and no
       reboot-required code equivalent to msiexec's 3010 - any non-zero
       exit code is therefore treated as an unconditional failure here.
+
+      --errortrace is version-conditional: present in the PostgreSQL 16
+      installer's own --help, removed from 17's (confirmed directly
+      against both cached installers - see docs/08-development-roadmap.md).
+      Passing it to 17 makes the installer reject the entire command line
+      with "Unknown option: --errortrace" and exit 1 during argument
+      parsing, before --debugtrace (or any log) is ever opened.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallerPath,
@@ -1321,11 +1285,14 @@ function Install-PostgresServer {
     # actually selected.
     $Script:PostgresPort = Resolve-PostgresPort
 
-    $logPath        = Join-Path -Path $Script:WorkingDirectory -ChildPath 'postgres-install.log'
-    $errorTracePath = Join-Path -Path $Script:WorkingDirectory -ChildPath 'postgres-errortrace.log'
+    $logPath            = Join-Path -Path $Script:WorkingDirectory -ChildPath 'postgres-install.log'
+    $supportsErrorTrace = [int]$Script:RequiredPostgresMajorVersion -lt 17
+    $errorTracePath     = if ($supportsErrorTrace) { Join-Path -Path $Script:WorkingDirectory -ChildPath 'postgres-errortrace.log' } else { $null }
 
     Write-Detail "Log: $logPath"
-    Write-Detail "Error trace: $errorTracePath"
+    if ($supportsErrorTrace) {
+        Write-Detail "Error trace: $errorTracePath"
+    }
     Write-Detail "Install directory: $($Script:PostgresInstallPrefix)"
     Write-Detail "Data directory: $($Script:PostgresDataDirectory)"
     Write-Detail "Port: $($Script:PostgresPort)"
@@ -1349,7 +1316,7 @@ function Install-PostgresServer {
             "--servicepassword `"$servicePassword`""
             '--enable-components server,commandlinetools'
             "--debugtrace `"$logPath`""
-            "--errortrace `"$errorTracePath`""
+            if ($supportsErrorTrace) { "--errortrace `"$errorTracePath`"" }
         ) -join ' '
 
         $process = Start-ProcessWithActivityIndicator -FilePath $InstallerPath -ArgumentList $argumentString -ActivityName 'Installing PostgreSQL'
@@ -1648,12 +1615,30 @@ function Install-PostgreSql {
 
                 Write-Detail 'Proceeding with a new PostgreSQL installation alongside the existing one.'
             }
-            else {
+            elseif ($existing.ServiceName) {
                 Show-ComponentStatus -Name 'PostgreSQL' -Fields ([ordered]@{
                     'Version' = $existing.Version
                     'Status'  = 'Already installed'
                 }) -Message @('Skipping installation.')
                 return
+            }
+            else {
+                # psql.exe/postgres.exe were found, but no postgresql* Windows
+                # service is registered at all - not a stopped service, no
+                # service exists to start. Reproduced directly: EDB's own
+                # installer can leave a fully populated bin\/lib\/share\ tree
+                # behind with no data\ directory and no service if a prior
+                # run was interrupted or only partially completed. Treating
+                # that as "Already installed" was the exact false positive
+                # this addresses - the next phase's psql connection then
+                # fails with "connection refused" because nothing is
+                # listening. Falling through here (no return) lets the
+                # normal installer run below to repair it, same as the
+                # "not found" and "different major version" paths already do.
+                Show-ComponentStatus -Name 'PostgreSQL' -Fields ([ordered]@{
+                    'Version' = $(if ($existing.Version) { $existing.Version } else { '(unknown version)' })
+                    'Status'  = 'Incomplete installation (no PostgreSQL service registered)'
+                }) -Message @('Proceeding with installation to repair it.')
             }
         }
         else {
@@ -2348,24 +2333,12 @@ function Resolve-DeltaEnvironmentTemplatePath {
     Stop-Setup "No configuration template could be found. Checked the installer template ($($Script:EnvTemplatePath)) and the runtime artifact fallback ($fallbackTemplatePath). Cannot generate the environment file."
 }
 
-function Backup-DeltaEnvironmentFile {
-    <#
-      Timestamped backup of an existing .env before this installer writes
-      to it - shared by New-DeltaEnvironmentFile (DATABASE_URL, and any
-      other template-driven regeneration) and Update-DeltaApplicationPortEnvironment
-      (PORT) rather than each keeping its own copy of the same few lines.
-      A no-op if $Path doesn't exist yet - there's nothing to protect.
-    #>
-    param([Parameter(Mandatory)][string]$Path)
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return
-    }
-
-    $backupPath = "$Path.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-    Copy-Item -LiteralPath $Path -Destination $backupPath -Force
-    Write-Detail "Existing .env backed up to: $backupPath"
-}
+# Backup-DeltaEnvironmentFile now lives in lib\DeltaInstaller.Common.ps1
+# (dot-sourced above) - promoted there alongside Update-ManagedEnvironmentLines
+# once setup-nginx.ps1/setup-iis.ps1 needed the identical "back up before
+# writing PUBLIC_URL" behavior this file's own New-DeltaEnvironmentFile/
+# Update-DeltaApplicationPortEnvironment already relied on, rather than
+# either script growing its own copy.
 
 function New-DeltaEnvironmentFile {
     <#
@@ -2501,65 +2474,12 @@ function New-DeltaEnvironmentFile {
     Write-Detail "Location: $envTargetPath"
 }
 
-function Update-ManagedEnvironmentLines {
-    <#
-      The generic mechanism New-DeltaEnvironmentFile's architecture
-      depends on: given the lines of a .env/.env.example file and an
-      ordered table of installer-managed KEY = value pairs, returns the
-      same lines with only those specific keys' lines replaced (or
-      appended, for a key not already present in the source at all) -
-      every other line passed through byte-for-byte unmodified,
-      including its original quoting style, comments, and blank lines.
-      Deliberately the only place in this installer that ever decides
-      "which .env lines am I allowed to change" - New-DeltaEnvironmentFile
-      never matches or replaces a variable itself, so there is exactly
-      one mechanism to audit for that guarantee, not one per variable.
-    #>
-    param(
-        [AllowEmptyCollection()][string[]]$SourceLines,
-        [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$ManagedValues
-    )
-
-    # Which managed keys were actually found (and replaced) in the source
-    # file - tracked with a plain hashtable rather than removing from a
-    # copy of $ManagedValues.Keys, since OrderedDictionary's Keys
-    # collection is only a non-generic ICollection and isn't something
-    # PowerShell can hand straight to a typed generic collection.
-    $foundKeys = @{}
-
-    $updatedLines = foreach ($line in $SourceLines) {
-        $matchedKey = $null
-        foreach ($key in $ManagedValues.Keys) {
-            if ($line -match "^\s*$([regex]::Escape($key))\s*=") {
-                $matchedKey = $key
-                break
-            }
-        }
-
-        if ($matchedKey) {
-            $foundKeys[$matchedKey] = $true
-            "$matchedKey=`"$($ManagedValues[$matchedKey])`""
-        }
-        else {
-            $line
-        }
-    }
-
-    # Any managed key never found in the source file at all (a brand new
-    # installer-managed variable that .env.example doesn't define yet, or
-    # an existing .env predating it) is appended rather than silently
-    # dropped - matches the original single-variable behavior this
-    # generalizes, just for however many managed keys there are now.
-    # $ManagedValues.Keys (not $foundKeys) drives this loop so append
-    # order always matches the table's own declared, stable order.
-    foreach ($key in $ManagedValues.Keys) {
-        if (-not $foundKeys.ContainsKey($key)) {
-            $updatedLines = @($updatedLines) + "$key=`"$($ManagedValues[$key])`""
-        }
-    }
-
-    return $updatedLines
-}
+# Update-ManagedEnvironmentLines now lives in lib\DeltaInstaller.Common.ps1
+# (dot-sourced above) - promoted there once setup-nginx.ps1/setup-iis.ps1
+# needed the identical generic "replace/append only these managed KEY=value
+# lines" mechanism for PUBLIC_URL, rather than either script growing a
+# second .env writer of its own. See that file's own header for the full
+# mechanism description.
 
 function Invoke-DeltaDatabaseInit {
     <#
@@ -3119,30 +3039,11 @@ function Install-DeltaDependencies {
 # the same way PostgreSQL detection and Node.js detection already were.
 # ---------------------------------------------------------------------------
 
-function Confirm-DeltaRuntimeNotRunning {
-    <#
-      Ensures no DELTA instance from a previous run is still bound to the
-      application port before this run starts a fresh one. Deliberately
-      does not restart anything itself - Start-DeltaRuntimeForValidation
-      (called right after this, from the orchestration block) owns that,
-      so this function's only job is guaranteeing a clean start: nothing
-      already bound to $Script:DeltaBackendPort when it runs.
-
-      A no-op when Resolve-DeltaApplicationPort already recorded that the
-      operator chose to leave the existing managed instance running
-      ($Script:DeltaSkipManagedInstanceRestart) - stopping it here would
-      silently override that explicit choice.
-    #>
-    Show-Section -Title 'DELTA Runtime Status'
-
-    if ($Script:DeltaSkipManagedInstanceRestart) {
-        Write-Detail "Leaving the existing DELTA instance running, per the operator's choice above."
-        return
-    }
-
-    Write-Step 'Checking for an already-running DELTA instance...'
-    Stop-RunningDeltaInstance -DeltaRuntimeRoot $Script:DeltaRuntimeRoot
-}
+# Confirm-DeltaRuntimeNotRunning now lives in lib\DeltaInstaller.Common.ps1
+# (dot-sourced above) - promoted there alongside Start-DeltaRuntimeForValidation/
+# Confirm-DeltaRuntimeStarted once setup-nginx.ps1/setup-iis.ps1 needed the
+# identical stop/start/verify sequence to restart DELTA after a successful
+# reverse proxy configuration. See that file's own section header.
 
 # ---------------------------------------------------------------------------
 # DELTA application startup (installer validation step)
@@ -3416,243 +3317,16 @@ function Update-DeltaApplicationPortEnvironment {
     Write-Success "    .env updated (PORT=$($Script:DeltaBackendPort))."
 }
 
-function Get-DeltaStartupLogPaths {
-    <#
-      The two fixed log file paths Start-DeltaRuntimeForValidation
-      redirects DELTA's stdout/stderr into, and Get-DeltaStartupFailureMessage
-      reads back from on a verification failure - one place computing
-      both so they can never drift apart between the two call sites.
-      Lives under <AppRoot>\logs - already created and proven writable by
-      Initialize-DeltaRuntimeDirectories earlier in this run, so nothing
-      here needs to create or permission it again.
-    #>
-    $logsDirectory = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath 'logs'
-    return [PSCustomObject]@{
-        StdOut = Join-Path -Path $logsDirectory -ChildPath 'delta-startup-stdout.log'
-        StdErr = Join-Path -Path $logsDirectory -ChildPath 'delta-startup-stderr.log'
-    }
-}
-
-function Start-DeltaRuntimeForValidation {
-    <#
-      Starts DELTA so the installer can hand the operator a working URL
-      immediately - an interim convenience for this validation phase,
-      standing in for the eventual Windows Service (Phase 5, see
-      docs/08-development-roadmap.md). Deliberately does none of what a
-      real service would: no restart policy, no crash supervision, no
-      watchdog. It starts the process once; Confirm-DeltaRuntimeStarted
-      (called right after, from the orchestration block) either confirms
-      it came up cleanly or stops the installer outright. Whichever
-      happens, this function's own job ends the moment the process has
-      been launched.
-
-      Runs the exact command start.bat itself wraps - `dotenv -e .env --
-      yarn start` - rather than invoking start.bat directly: start.bat's
-      own trailing `pause` is documented (docs/02 - Windows Service
-      installation) as something that hangs a non-interactive caller
-      indefinitely, which is exactly why the NSSM example there already
-      bypasses start.bat and invokes the underlying command directly
-      instead of wrapping it. This reuses that same lesson rather than
-      re-learning it.
-
-      Launched detached (Start-Process, no -Wait) with its console window
-      hidden and stdout/stderr redirected to <AppRoot>\logs\
-      (Get-DeltaStartupLogPaths) - the only place this run's startup
-      diagnostics go, reused as-is rather than standing up a separate
-      logging mechanism. Confirm-DeltaRuntimeNotRunning must already have
-      run before this - never called from here - so this is always a
-      clean start, never a restart racing a not-yet-stopped previous
-      instance.
-
-      A no-op when $Script:DeltaSkipManagedInstanceRestart is set
-      (Resolve-DeltaApplicationPort) - the operator chose to leave the
-      existing managed instance running rather than restart it, so there
-      is nothing to launch this run.
-    #>
-    Show-Section -Title 'Starting DELTA'
-
-    if ($Script:DeltaSkipManagedInstanceRestart) {
-        Write-Detail 'Skipping automatic startup - the existing DELTA instance was left running untouched.'
-        return
-    }
-
-    Write-Step 'Starting DELTA for installation validation...'
-    Write-Detail 'This is an interim step - DELTA is not yet running as a supervised Windows Service.'
-
-    $logPaths = Get-DeltaStartupLogPaths
-    Write-Detail "Standard output: $($logPaths.StdOut)"
-    Write-Detail "Standard error : $($logPaths.StdErr)"
-
-    try {
-        Start-Process -FilePath 'cmd.exe' `
-            -ArgumentList $Script:DeltaLauncherCommandArguments `
-            -WorkingDirectory $Script:DeltaRuntimeRoot `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput $logPaths.StdOut `
-            -RedirectStandardError $logPaths.StdErr `
-            | Out-Null
-    }
-    catch {
-        Stop-Setup "Failed to launch DELTA: $($_.Exception.Message)"
-    }
-
-    Write-Success '    DELTA start requested.'
-}
-
-function Test-DeltaHttpEndpoint {
-    <#
-      A single HTTP probe against $Url - returns $true for any response
-      the server actually sent (status < 500), $false for a connection-
-      level failure (nothing listening yet, connection refused/reset) or
-      a server error. Invoke-WebRequest throws on a non-2xx status in
-      Windows PowerShell 5.1, so a thrown exception that still carries a
-      real HTTP response is treated as "responded", not as a failure -
-      DELTA answering with, say, a redirect or a 404 already proves the
-      HTTP server itself is up, which is all this specific check is
-      responsible for confirming.
-    #>
-    param([Parameter(Mandatory)][string]$Url)
-
-    try {
-        $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-        return ($response.StatusCode -lt 500)
-    }
-    catch {
-        $webResponse = $_.Exception.Response
-        if ($webResponse -and $webResponse.StatusCode) {
-            return ([int]$webResponse.StatusCode -lt 500)
-        }
-        return $false
-    }
-}
-
-function Get-DeltaStartupFailureMessage {
-    <#
-      Builds a Stop-Setup message that always points at the two startup
-      log files (Get-DeltaStartupLogPaths) and, when the stderr log
-      actually has content, includes its last few lines inline - so a
-      failed verification is diagnosable straight from the console
-      output that already stopped the installer, not just from a path
-      the operator still has to go open themselves.
-    #>
-    param([Parameter(Mandatory)][string]$Reason)
-
-    $logPaths = Get-DeltaStartupLogPaths
-    $message = "$Reason`n`nStartup logs:`n$($logPaths.StdOut)`n$($logPaths.StdErr)"
-
-    if (Test-Path -LiteralPath $logPaths.StdErr) {
-        $tail = @(Get-Content -LiteralPath $logPaths.StdErr -Tail 15 -ErrorAction SilentlyContinue)
-        if ($tail.Count -gt 0) {
-            $message += "`n`nLast lines of stderr:`n$($tail -join "`n")"
-        }
-    }
-
-    return $message
-}
-
-function Confirm-DeltaRuntimeStarted {
-    <#
-      Layered startup verification, in the order Test-DeltaNginxStartupHealth
-      (setup-nginx.ps1) already established for the same problem: a
-      running process alone is never reported as success, and neither is
-      a bound port on its own - only escalating through process, then
-      port, then a real HTTP round-trip proves DELTA actually came up.
-
-      Each wait loop re-checks Get-RunningDeltaProcesses on every
-      iteration, not just once at the start, so a process that starts and
-      then crashes mid-wait (e.g. a bad DATABASE_URL) fails fast with a
-      real diagnostic instead of running out the full timeout first.
-
-      The port-wait loop specifically tracks whether it has EVER observed
-      the managed process before treating "not found" as a failure -
-      confirmed directly (real captured launch, dotenv-cli -> yarn.js ->
-      the react-router-serve .bin shim -> the final node.exe actually
-      running build/server/index.js) that this multi-hop chain takes
-      real, measurable time to reach its last hop, which is the only one
-      Get-RunningDeltaProcesses can ever match. On the loop's first
-      iteration - which runs immediately, since Start-Process returns as
-      soon as the top-level cmd.exe exists, not once the whole chain has
-      - "not found yet" is the normal, expected state, not evidence of a
-      crash; only a transition from "was found" to "no longer found"
-      means it actually exited. Without this, a perfectly healthy
-      startup that simply takes a moment to descend through that chain
-      gets reported as failed while the real process goes on to start
-      successfully in the background, unaware the installer already gave
-      up on it.
-
-      A no-op when $Script:DeltaSkipManagedInstanceRestart is set - there
-      is nothing to verify this run, since Start-DeltaRuntimeForValidation
-      didn't start anything either. Reports that plainly, in a dedicated
-      banner, rather than letting the run end looking like a normal
-      success: the runtime files, dependencies, .env, and database were
-      all still updated by the phases before this one (a real, completed
-      deployment - see Register-DeltaInstallation, still called
-      unconditionally after this), but the deployment is not yet ACTIVE -
-      the process actually serving traffic is still whatever was running
-      before this install/update started. Those are two different facts,
-      and this is the one place that draws the line between them, so
-      nothing downstream (the final summary included) can imply HTTP
-      validation succeeded when it never ran.
-    #>
-    Show-Section -Title 'Verifying DELTA Startup'
-
-    if ($Script:DeltaSkipManagedInstanceRestart) {
-        Write-Host ''
-        Write-Host ('-' * $Script:BannerWidth)
-        Write-Host ''
-        Write-Host 'Deployment completed.'
-        Write-Host ''
-        Write-Host 'The existing DELTA instance was left running.'
-        Write-Host ''
-        Write-Host 'The updated deployment will become active after DELTA is restarted manually.'
-        Write-Host ''
-        Write-Host 'Current running instance may still be the previous deployment.'
-        Write-Host ''
-        Write-Host ('-' * $Script:BannerWidth)
-        return
-    }
-
-    Write-Step 'Waiting for DELTA to start listening on its configured port...'
-    $portDeadline = (Get-Date).AddSeconds($Script:DeltaStartupPortTimeoutSeconds)
-    $isListening = $false
-    $hasBeenObservedRunning = $false
-    while ((Get-Date) -lt $portDeadline) {
-        if (Get-RunningDeltaProcesses -DeltaRuntimeRoot $Script:DeltaRuntimeRoot) {
-            $hasBeenObservedRunning = $true
-        }
-        elseif ($hasBeenObservedRunning) {
-            Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it finished starting.')
-        }
-        if (-not (Test-TcpPortAvailable -Port $Script:DeltaBackendPort).Available) {
-            $isListening = $true
-            break
-        }
-        Start-Sleep -Milliseconds 500
-    }
-    if (-not $isListening) {
-        Stop-Setup (Get-DeltaStartupFailureMessage -Reason "DELTA did not start listening on port $($Script:DeltaBackendPort) within $($Script:DeltaStartupPortTimeoutSeconds) seconds.")
-    }
-    Write-Success "    DELTA is listening on port $($Script:DeltaBackendPort)."
-
-    Write-Step 'Confirming DELTA responds over HTTP...'
-    $url = "http://localhost:$($Script:DeltaBackendPort)/"
-    $httpDeadline = (Get-Date).AddSeconds($Script:DeltaStartupHttpTimeoutSeconds)
-    $isResponding = $false
-    while ((Get-Date) -lt $httpDeadline) {
-        if (-not (Get-RunningDeltaProcesses -DeltaRuntimeRoot $Script:DeltaRuntimeRoot)) {
-            Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it responded over HTTP.')
-        }
-        if (Test-DeltaHttpEndpoint -Url $url) {
-            $isResponding = $true
-            break
-        }
-        Start-Sleep -Milliseconds 1000
-    }
-    if (-not $isResponding) {
-        Stop-Setup (Get-DeltaStartupFailureMessage -Reason "DELTA did not respond over HTTP at $url within $($Script:DeltaStartupHttpTimeoutSeconds) seconds.")
-    }
-    Write-Success "    DELTA responded successfully at $url."
-}
+# Get-DeltaStartupLogPaths, Start-DeltaRuntimeForValidation,
+# Test-DeltaHttpEndpoint, Get-DeltaStartupFailureMessage, and
+# Confirm-DeltaRuntimeStarted now live in lib\DeltaInstaller.Common.ps1
+# (dot-sourced above) - promoted there together (they only ever call each
+# other) once setup-nginx.ps1/setup-iis.ps1 needed the identical DELTA
+# stop/start/verify sequence to restart DELTA after a successful reverse
+# proxy configuration, so a freshly-synchronized PUBLIC_URL (or any other
+# future runtime .env change) actually takes effect - Node only reads
+# .env at startup. See that file's own section header for the full
+# rationale; behavior here is unchanged.
 
 function Initialize-Setup {
     Show-Section -Title 'DELTA Windows Installer' -Subtitle "Version $Script:DeltaInstallerVersion"

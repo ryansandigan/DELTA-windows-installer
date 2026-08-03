@@ -40,6 +40,17 @@ $Script:BannerWidth = 40
 # with no handover involved must still be able to check this flag safely.
 $Script:DeltaReverseProxyHandoverOccurred = $false
 
+# Confirm-DeltaRuntimeNotRunning/Start-DeltaRuntimeForValidation/
+# Confirm-DeltaRuntimeStarted (further down this file) all read this
+# unconditionally - only ever set $true by setup.ps1's own
+# Resolve-DeltaApplicationPort, when the operator declines to restart an
+# already-running managed instance. setup-nginx.ps1/setup-iis.ps1 (via
+# Restart-DeltaRuntimeForReverseProxy) never set it at all, so it must
+# still be initialized here - same Set-StrictMode reasoning as
+# $Script:DeltaReverseProxyHandoverOccurred just above - for their own
+# restart to read it safely and always take the "not skipped" branch.
+$Script:DeltaSkipManagedInstanceRestart = $false
+
 # The DEFAULT DELTA *runtime* application directory - offered as the
 # bare-Enter default when Read-DeltaAppRoot prompts for where DELTA
 # should actually be deployed. Deliberately separate from
@@ -1055,6 +1066,405 @@ The installer cannot safely continue while the previous DELTA instance is still 
 }
 
 # ---------------------------------------------------------------------------
+# DELTA runtime start / verify (Restart)
+# ---------------------------------------------------------------------------
+#
+# Originally setup.ps1's own "installer validation step" (an interim
+# convenience until Phase 5's Windows Service supersedes it - see
+# Start-DeltaRuntimeForValidation's own header) - promoted here, alongside
+# Stop-RunningDeltaInstance above, once setup-nginx.ps1/setup-iis.ps1
+# needed the exact same stop -> start -> verify sequence for their own
+# "Restart DELTA backend" management menu action (Restart-DeltaRuntimeForReverseProxy,
+# below - the only new thing this section adds on top of setup.ps1's own
+# unmodified functions). The DELTA (Node.js) process only ever reads .env
+# at startup, so a PUBLIC_URL just synchronized into .env
+# (Sync-DeltaPublicUrlEnvironment, above) has no effect on an
+# already-running process until it is restarted - but that restart is a
+# deliberate, administrator-triggered menu choice, never an automatic
+# side effect of the sync itself (see Restart-DeltaRuntimeForReverseProxy's
+# own header for why). Every function here below it is reused completely
+# unmodified from setup.ps1's own implementation - none of it has any
+# DELTA-installer-vs-reverse-proxy-script-specific knowledge, so there is
+# exactly one implementation of "start DELTA and prove it actually came
+# up," not two.
+#
+# All four still key off $Script:DeltaRuntimeRoot (setup.ps1's own name
+# for the resolved DELTA application directory) exactly as before -
+# setup-nginx.ps1/setup-iis.ps1 use $Script:DeltaInstallPath
+# (Resolve-DeltaInstallation) for the identical value under a different
+# name; Restart-DeltaRuntimeForReverseProxy is the one place that bridges
+# the two names, so neither script's own menu action needs to set it
+# manually before calling in.
+
+function Show-Section {
+    <#
+      The full-width '====' banner used for setup.ps1's own major
+      screens - the installer banner, each phase, DELTA Runtime
+      Deployment, Registry Registration, and the final summary. Reused
+      as-is by Start-DeltaRuntimeForValidation/Confirm-DeltaRuntimeStarted
+      below for their own "Starting DELTA"/"Verifying DELTA Startup"
+      screens - the identical banner style setup-nginx.ps1/setup-iis.ps1
+      now show for the same two steps during a reverse proxy restart.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [string]$Subtitle
+    )
+    $rule = '=' * $Script:BannerWidth
+    Write-Host ''
+    Write-Host $rule
+    Write-Host $Title
+    if ($Subtitle) {
+        Write-Host $Subtitle
+    }
+    Write-Host $rule
+    Write-Host ''
+}
+
+function Test-TcpPortAvailable {
+    <#
+      Reports whether $Port is free to listen on and, if not, a
+      human-readable description (process name + PID) of whatever
+      already owns it, for display to the operator, plus the raw owning
+      process ID itself (OwningProcessId). Uses Get-NetTCPConnection
+      (built into Windows Server's NetTCPIP module) rather than a raw
+      socket bind, since it also identifies the owner.
+
+      Originally Test-PostgresPort (Resolve-PostgresPort's own helper,
+      setup.ps1) - generalized and renamed once Resolve-DeltaApplicationPort
+      needed the identical "is this port free, and who owns it if not"
+      check for DELTA's own application port; Confirm-DeltaRuntimeStarted
+      below is its other caller.
+    #>
+    param([Parameter(Mandatory)][int]$Port)
+
+    $connection = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $connection) {
+        return [PSCustomObject]@{ Available = $true; OwnerDescription = $null; OwningProcessId = $null }
+    }
+
+    $owner = Get-Process -Id $connection.OwningProcess -ErrorAction SilentlyContinue
+    $description = if ($owner) { "$($owner.ProcessName).exe (PID $($owner.Id))" } else { "PID $($connection.OwningProcess)" }
+    return [PSCustomObject]@{ Available = $false; OwnerDescription = $description; OwningProcessId = $connection.OwningProcess }
+}
+
+# $Script:DeltaStartupPortTimeoutSeconds/DeltaStartupHttpTimeoutSeconds -
+# how long Confirm-DeltaRuntimeStarted waits for the just-(re)started
+# process to bind $Script:DeltaBackendPort, and then to answer an HTTP
+# request, before treating startup as failed rather than merely slow.
+$Script:DeltaStartupPortTimeoutSeconds = 60
+$Script:DeltaStartupHttpTimeoutSeconds = 20
+
+function Confirm-DeltaRuntimeNotRunning {
+    <#
+      Ensures no DELTA instance already running is still bound to the
+      application port before (re)starting a fresh one. Deliberately does
+      not start anything itself - Start-DeltaRuntimeForValidation (called
+      right after this by every caller) owns that, so this function's
+      only job is guaranteeing a clean start: nothing already bound to
+      $Script:DeltaBackendPort when it runs.
+
+      A no-op when $Script:DeltaSkipManagedInstanceRestart is set - only
+      ever true in setup.ps1's own flow (Resolve-DeltaApplicationPort,
+      recording that the operator chose to leave the existing managed
+      instance running); setup-nginx.ps1/setup-iis.ps1 never set this
+      variable, so for their own "Restart DELTA backend" menu action
+      this check is always $false/unset and the stop always runs.
+    #>
+    Show-Section -Title 'DELTA Runtime Status'
+
+    if ($Script:DeltaSkipManagedInstanceRestart) {
+        Write-Detail "Leaving the existing DELTA instance running, per the operator's choice above."
+        return
+    }
+
+    Write-Step 'Checking for an already-running DELTA instance...'
+    Stop-RunningDeltaInstance -DeltaRuntimeRoot $Script:DeltaRuntimeRoot
+}
+
+function Get-DeltaStartupLogPaths {
+    <#
+      The two fixed log file paths Start-DeltaRuntimeForValidation
+      redirects DELTA's stdout/stderr into, and Get-DeltaStartupFailureMessage
+      reads back from on a verification failure - one place computing
+      both so they can never drift apart between the two call sites.
+      Lives under <AppRoot>\logs - already created and proven writable by
+      setup.ps1's own Initialize-DeltaRuntimeDirectories during the
+      original install, so nothing here needs to create or permission it
+      again, on a restart triggered from setup-nginx.ps1/setup-iis.ps1 any
+      more than on setup.ps1's own original call.
+    #>
+    $logsDirectory = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath 'logs'
+    return [PSCustomObject]@{
+        StdOut = Join-Path -Path $logsDirectory -ChildPath 'delta-startup-stdout.log'
+        StdErr = Join-Path -Path $logsDirectory -ChildPath 'delta-startup-stderr.log'
+    }
+}
+
+function Start-DeltaRuntimeForValidation {
+    <#
+      Starts DELTA so the caller can hand the operator a working URL
+      immediately - an interim convenience standing in for the eventual
+      Windows Service (Phase 5, see docs/08-development-roadmap.md).
+      Deliberately does none of what a real service would: no restart
+      policy, no crash supervision, no watchdog. It starts the process
+      once; Confirm-DeltaRuntimeStarted (called right after, from the
+      caller's own orchestration) either confirms it came up cleanly or
+      stops the script outright. Whichever happens, this function's own
+      job ends the moment the process has been launched.
+
+      Runs the exact command start.bat itself wraps - `dotenv -e .env --
+      yarn start` - rather than invoking start.bat directly: start.bat's
+      own trailing `pause` is documented (docs/02 - Windows Service
+      installation) as something that hangs a non-interactive caller
+      indefinitely, which is exactly why the NSSM example there already
+      bypasses start.bat and invokes the underlying command directly
+      instead of wrapping it. This reuses that same lesson rather than
+      re-learning it.
+
+      Launched detached (Start-Process, no -Wait) with its console window
+      hidden and stdout/stderr redirected to <AppRoot>\logs\
+      (Get-DeltaStartupLogPaths) - the only place a run's startup
+      diagnostics go, reused as-is rather than standing up a separate
+      logging mechanism. Confirm-DeltaRuntimeNotRunning must already have
+      run before this - never called from here - so this is always a
+      clean start, never a restart racing a not-yet-stopped previous
+      instance.
+
+      A no-op when $Script:DeltaSkipManagedInstanceRestart is set - see
+      Confirm-DeltaRuntimeNotRunning's own header for why this is only
+      ever true in setup.ps1's own flow, never setup-nginx.ps1/setup-iis.ps1's.
+    #>
+    Show-Section -Title 'Starting DELTA'
+
+    if ($Script:DeltaSkipManagedInstanceRestart) {
+        Write-Detail 'Skipping automatic startup - the existing DELTA instance was left running untouched.'
+        return
+    }
+
+    Write-Step 'Starting DELTA...'
+
+    $logPaths = Get-DeltaStartupLogPaths
+    Write-Detail "Standard output: $($logPaths.StdOut)"
+    Write-Detail "Standard error : $($logPaths.StdErr)"
+
+    try {
+        Start-Process -FilePath 'cmd.exe' `
+            -ArgumentList $Script:DeltaLauncherCommandArguments `
+            -WorkingDirectory $Script:DeltaRuntimeRoot `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $logPaths.StdOut `
+            -RedirectStandardError $logPaths.StdErr `
+            | Out-Null
+    }
+    catch {
+        Stop-Setup "Failed to launch DELTA: $($_.Exception.Message)"
+    }
+
+    Write-Success '    DELTA start requested.'
+}
+
+function Test-DeltaHttpEndpoint {
+    <#
+      A single HTTP probe against $Url - returns $true for any response
+      the server actually sent (status < 500), $false for a connection-
+      level failure (nothing listening yet, connection refused/reset) or
+      a server error. Invoke-WebRequest throws on a non-2xx status in
+      Windows PowerShell 5.1, so a thrown exception that still carries a
+      real HTTP response is treated as "responded", not as a failure -
+      DELTA answering with, say, a redirect or a 404 already proves the
+      HTTP server itself is up, which is all this specific check is
+      responsible for confirming.
+    #>
+    param([Parameter(Mandatory)][string]$Url)
+
+    try {
+        $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        return ($response.StatusCode -lt 500)
+    }
+    catch {
+        $webResponse = $_.Exception.Response
+        if ($webResponse -and $webResponse.StatusCode) {
+            return ([int]$webResponse.StatusCode -lt 500)
+        }
+        return $false
+    }
+}
+
+function Get-DeltaStartupFailureMessage {
+    <#
+      Builds a Stop-Setup message that always points at the two startup
+      log files (Get-DeltaStartupLogPaths) and, when the stderr log
+      actually has content, includes its last few lines inline - so a
+      failed verification is diagnosable straight from the console
+      output that already stopped the script, not just from a path the
+      operator still has to go open themselves.
+    #>
+    param([Parameter(Mandatory)][string]$Reason)
+
+    $logPaths = Get-DeltaStartupLogPaths
+    $message = "$Reason`n`nStartup logs:`n$($logPaths.StdOut)`n$($logPaths.StdErr)"
+
+    if (Test-Path -LiteralPath $logPaths.StdErr) {
+        $tail = @(Get-Content -LiteralPath $logPaths.StdErr -Tail 15 -ErrorAction SilentlyContinue)
+        if ($tail.Count -gt 0) {
+            $message += "`n`nLast lines of stderr:`n$($tail -join "`n")"
+        }
+    }
+
+    return $message
+}
+
+function Confirm-DeltaRuntimeStarted {
+    <#
+      Layered startup verification, in the order Test-DeltaNginxStartupHealth
+      (setup-nginx.ps1) already established for the same problem: a
+      running process alone is never reported as success, and neither is
+      a bound port on its own - only escalating through process, then
+      port, then a real HTTP round-trip proves DELTA actually came up.
+
+      Each wait loop re-checks Get-RunningDeltaProcesses on every
+      iteration, not just once at the start, so a process that starts and
+      then crashes mid-wait (e.g. a bad DATABASE_URL) fails fast with a
+      real diagnostic instead of running out the full timeout first.
+
+      The port-wait loop specifically tracks whether it has EVER observed
+      the managed process before treating "not found" as a failure -
+      confirmed directly (real captured launch, dotenv-cli -> yarn.js ->
+      the react-router-serve .bin shim -> the final node.exe actually
+      running build/server/index.js) that this multi-hop chain takes
+      real, measurable time to reach its last hop, which is the only one
+      Get-RunningDeltaProcesses can ever match. On the loop's first
+      iteration - which runs immediately, since Start-Process returns as
+      soon as the top-level cmd.exe exists, not once the whole chain has
+      - "not found yet" is the normal, expected state, not evidence of a
+      crash; only a transition from "was found" to "no longer found"
+      means it actually exited. Without this, a perfectly healthy
+      startup that simply takes a moment to descend through that chain
+      gets reported as failed while the real process goes on to start
+      successfully in the background, unaware the caller already gave up
+      on it.
+
+      A no-op when $Script:DeltaSkipManagedInstanceRestart is set - see
+      Confirm-DeltaRuntimeNotRunning's own header for why this is only
+      ever true in setup.ps1's own flow. setup-nginx.ps1/setup-iis.ps1
+      never set it, so for their own "Restart DELTA backend" menu action
+      this always runs the full verification and calls Stop-Setup - the
+      menu action fails outright, rather than silently claiming DELTA
+      restarted successfully - if DELTA does not come all the way up.
+    #>
+    Show-Section -Title 'Verifying DELTA Startup'
+
+    if ($Script:DeltaSkipManagedInstanceRestart) {
+        Write-Host ''
+        Write-Host ('-' * $Script:BannerWidth)
+        Write-Host ''
+        Write-Host 'Deployment completed.'
+        Write-Host ''
+        Write-Host 'The existing DELTA instance was left running.'
+        Write-Host ''
+        Write-Host 'The updated deployment will become active after DELTA is restarted manually.'
+        Write-Host ''
+        Write-Host 'Current running instance may still be the previous deployment.'
+        Write-Host ''
+        Write-Host ('-' * $Script:BannerWidth)
+        return
+    }
+
+    Write-Step 'Waiting for DELTA to start listening on its configured port...'
+    $portDeadline = (Get-Date).AddSeconds($Script:DeltaStartupPortTimeoutSeconds)
+    $isListening = $false
+    $hasBeenObservedRunning = $false
+    while ((Get-Date) -lt $portDeadline) {
+        if (Get-RunningDeltaProcesses -DeltaRuntimeRoot $Script:DeltaRuntimeRoot) {
+            $hasBeenObservedRunning = $true
+        }
+        elseif ($hasBeenObservedRunning) {
+            Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it finished starting.')
+        }
+        if (-not (Test-TcpPortAvailable -Port $Script:DeltaBackendPort).Available) {
+            $isListening = $true
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $isListening) {
+        Stop-Setup (Get-DeltaStartupFailureMessage -Reason "DELTA did not start listening on port $($Script:DeltaBackendPort) within $($Script:DeltaStartupPortTimeoutSeconds) seconds.")
+    }
+    Write-Success "    DELTA is listening on port $($Script:DeltaBackendPort)."
+
+    Write-Step 'Confirming DELTA responds over HTTP...'
+    $url = "http://localhost:$($Script:DeltaBackendPort)/"
+    $httpDeadline = (Get-Date).AddSeconds($Script:DeltaStartupHttpTimeoutSeconds)
+    $isResponding = $false
+    while ((Get-Date) -lt $httpDeadline) {
+        if (-not (Get-RunningDeltaProcesses -DeltaRuntimeRoot $Script:DeltaRuntimeRoot)) {
+            Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it responded over HTTP.')
+        }
+        if (Test-DeltaHttpEndpoint -Url $url) {
+            $isResponding = $true
+            break
+        }
+        Start-Sleep -Milliseconds 1000
+    }
+    if (-not $isResponding) {
+        Stop-Setup (Get-DeltaStartupFailureMessage -Reason "DELTA did not respond over HTTP at $url within $($Script:DeltaStartupHttpTimeoutSeconds) seconds.")
+    }
+    Write-Success "    DELTA responded successfully at $url."
+}
+
+function Restart-DeltaRuntimeForReverseProxy {
+    <#
+      The single shared "restart DELTA and reload .env" action - the
+      implementation behind both setup-nginx.ps1's and setup-iis.ps1's
+      own "Restart DELTA backend" management menu option. Deliberately a
+      standalone, operator-triggered action, not something either script
+      calls automatically after writing PUBLIC_URL: reverse proxy
+      configuration changes (reload NGINX, update IIS bindings) and
+      restarting the DELTA (Node.js) process are two independent
+      operations with two independent blast radii, and an administrator
+      who only wants to validate or manage the reverse proxy should never
+      pay for an unrequested DELTA restart as a side effect. Synchronizing
+      PUBLIC_URL (Sync-DeltaPublicUrlEnvironment) still only ever writes
+      .env - it never calls this function itself; the administrator picks
+      this menu option explicitly, whenever they actually want the
+      running DELTA process to pick up whatever is currently in .env.
+
+      Composes the exact same three functions, in the exact same order,
+      setup.ps1's own orchestration block already calls for its own
+      post-install validation start (Confirm-DeltaRuntimeNotRunning ->
+      Start-DeltaRuntimeForValidation -> Confirm-DeltaRuntimeStarted) -
+      not a new implementation, and not a subset: a failed verification
+      still calls Stop-Setup exactly as it does for setup.ps1, which
+      throws out to the caller's own top-level try/catch, reporting a
+      genuine failure rather than a successful restart.
+
+      Resolves $Script:DeltaBackendPort itself (Resolve-DeltaBackendPort)
+      before doing anything else - unlike setup.ps1's own three calls,
+      which rely on Resolve-DeltaApplicationPort having already set it
+      earlier in that script's own flow, this function's only callers are
+      interactive management-menu actions with no equivalent earlier
+      step, and the whole point of this action is to pick up whatever
+      PORT is CURRENTLY in .env, not a stale value from whenever the menu
+      was first entered.
+
+      Also sets $Script:DeltaRuntimeRoot from $Script:DeltaInstallPath
+      first - setup-nginx.ps1/setup-iis.ps1 resolve the DELTA installation
+      into $Script:DeltaInstallPath (Resolve-DeltaInstallation), while
+      every function below still keys off $Script:DeltaRuntimeRoot,
+      setup.ps1's own name for the identical path. This is the one place
+      that bridges the two names, so neither script needs to set it
+      manually before calling here.
+    #>
+    $Script:DeltaRuntimeRoot = $Script:DeltaInstallPath
+    Resolve-DeltaBackendPort
+
+    Confirm-DeltaRuntimeNotRunning
+    Start-DeltaRuntimeForValidation
+    Confirm-DeltaRuntimeStarted
+}
+
+# ---------------------------------------------------------------------------
 # .env file reading
 # ---------------------------------------------------------------------------
 
@@ -1115,6 +1525,95 @@ function Get-EnvFileValue {
     }
 
     return $null
+}
+
+function Backup-DeltaEnvironmentFile {
+    <#
+      Timestamped backup of an existing .env before this installer writes
+      to it - originally setup.ps1's own, promoted here once
+      setup-nginx.ps1/setup-iis.ps1 needed the identical "back up before
+      writing" behavior for PUBLIC_URL (Sync-DeltaPublicUrlEnvironment,
+      below) that setup.ps1's own New-DeltaEnvironmentFile (DATABASE_URL)
+      and Update-DeltaApplicationPortEnvironment (PORT) already relied on -
+      rather than either script growing its own copy. A no-op if $Path
+      doesn't exist yet - there's nothing to protect.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    $backupPath = "$Path.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    Copy-Item -LiteralPath $Path -Destination $backupPath -Force
+    Write-Detail "Existing .env backed up to: $backupPath"
+}
+
+function Update-ManagedEnvironmentLines {
+    <#
+      The generic mechanism setup.ps1's own New-DeltaEnvironmentFile
+      architecture depends on: given the lines of a .env/.env.example file
+      and an ordered table of installer-managed KEY = value pairs, returns
+      the same lines with only those specific keys' lines replaced (or
+      appended, for a key not already present in the source at all) -
+      every other line passed through byte-for-byte unmodified, including
+      its original quoting style, comments, and blank lines. Deliberately
+      the only place in this installer that ever decides "which .env
+      lines am I allowed to change" - no caller matches or replaces a
+      variable itself, so there is exactly one mechanism to audit for
+      that guarantee, not one per variable.
+
+      Originally setup.ps1's own, promoted here once
+      setup-nginx.ps1/setup-iis.ps1 needed the identical mechanism for
+      PUBLIC_URL (Sync-DeltaPublicUrlEnvironment, below) - both scripts
+      already dot-source this file, so this is the one place a future
+      installer-managed value can be added without a second .env
+      parser/writer growing anywhere else.
+    #>
+    param(
+        [AllowEmptyCollection()][string[]]$SourceLines,
+        [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$ManagedValues
+    )
+
+    # Which managed keys were actually found (and replaced) in the source
+    # file - tracked with a plain hashtable rather than removing from a
+    # copy of $ManagedValues.Keys, since OrderedDictionary's Keys
+    # collection is only a non-generic ICollection and isn't something
+    # PowerShell can hand straight to a typed generic collection.
+    $foundKeys = @{}
+
+    $updatedLines = foreach ($line in $SourceLines) {
+        $matchedKey = $null
+        foreach ($key in $ManagedValues.Keys) {
+            if ($line -match "^\s*$([regex]::Escape($key))\s*=") {
+                $matchedKey = $key
+                break
+            }
+        }
+
+        if ($matchedKey) {
+            $foundKeys[$matchedKey] = $true
+            "$matchedKey=`"$($ManagedValues[$matchedKey])`""
+        }
+        else {
+            $line
+        }
+    }
+
+    # Any managed key never found in the source file at all (a brand new
+    # installer-managed variable that .env.example doesn't define yet, or
+    # an existing .env predating it) is appended rather than silently
+    # dropped - matches the original single-variable behavior this
+    # generalizes, just for however many managed keys there are now.
+    # $ManagedValues.Keys (not $foundKeys) drives this loop so append
+    # order always matches the table's own declared, stable order.
+    foreach ($key in $ManagedValues.Keys) {
+        if (-not $foundKeys.ContainsKey($key)) {
+            $updatedLines = @($updatedLines) + "$key=`"$($ManagedValues[$key])`""
+        }
+    }
+
+    return $updatedLines
 }
 
 # ---------------------------------------------------------------------------
@@ -1388,7 +1887,19 @@ function Resolve-DeltaWebsiteDomain {
       than silently modifying or falling back on invalid input. A blank
       entry is the one case NOT re-prompted: it's this function's own
       documented default, not an invalid answer.
+
+      -DefaultDomain overrides the bare-Enter default (still
+      $Script:DefaultDeltaWebsiteDomain, "localhost", when omitted) -
+      added for setup-nginx.ps1/setup-iis.ps1's own PUBLIC_URL mismatch
+      repair, which re-prompts for the domain on an ALREADY-configured
+      installation: defaulting a careless Enter to "localhost" there
+      would silently downgrade a real, working domain, exactly the
+      footgun Repair-DeltaIisManagedWebsite (lib\DeltaDoctor.IIS.ps1)
+      already avoids by not re-prompting at all when a domain exists.
+      Passing the domain already configured on the reverse proxy as
+      -DefaultDomain keeps this one shared prompt safe for that case too.
     #>
+    param([string]$DefaultDomain = $Script:DefaultDeltaWebsiteDomain)
 
     Write-Host ''
     Write-Host ('-' * $Script:BannerWidth)
@@ -1402,16 +1913,16 @@ function Resolve-DeltaWebsiteDomain {
     Write-Host '    delta.example.org'
     Write-Host '    delta.ncscm.gov.jo'
     Write-Host ''
-    Write-Host "Leave blank to use $Script:DefaultDeltaWebsiteDomain."
+    Write-Host "Leave blank to use $DefaultDomain."
     Write-Host ''
     Write-Host ('-' * $Script:BannerWidth)
     Write-Host ''
 
     while ($true) {
-        $entered = Read-Host -Prompt "Domain [$Script:DefaultDeltaWebsiteDomain]"
+        $entered = Read-Host -Prompt "Domain [$DefaultDomain]"
 
         if ([string]::IsNullOrWhiteSpace($entered)) {
-            return $Script:DefaultDeltaWebsiteDomain
+            return $DefaultDomain
         }
 
         $domain = $entered.Trim()
@@ -1518,6 +2029,106 @@ Correct the PORT value in the DELTA .env file, then re-run this script.
         $Script:DeltaBackendPort = [int]$rawPort
         Write-Success "    Backend port detected: $($Script:DeltaBackendPort)"
     }
+}
+
+# ---------------------------------------------------------------------------
+# PUBLIC_URL synchronization
+# ---------------------------------------------------------------------------
+#
+# After initial installation, setup-nginx.ps1/setup-iis.ps1 - not
+# setup.ps1 - are the authoritative owners of the deployed PUBLIC_URL
+# value: whichever reverse proxy is actually configured determines the
+# real public URL, so every successful configuration run keeps .env in
+# sync with it. Shared here, not duplicated between the two scripts,
+# since neither the URL shape nor the comparison/write mechanics have any
+# NGINX- or IIS-specific knowledge at all.
+
+function Get-DeltaPublicUrl {
+    <#
+      Builds the canonical PUBLIC_URL string for a domain/scheme pair -
+      "<scheme>://<domain>", deliberately never a trailing slash. The one
+      place this construction happens, so Sync-DeltaPublicUrlEnvironment's
+      own writes and each script's own "what does the reverse proxy
+      actually say" mismatch check always agree on the exact same shape.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Domain,
+        [Parameter(Mandatory)][bool]$Https
+    )
+
+    $scheme = if ($Https) { 'https' } else { 'http' }
+    return "$($scheme)://$($Domain)"
+}
+
+function Test-DeltaPublicUrlsMatch {
+    <#
+      Compares two PUBLIC_URL-shaped strings the way an operator would
+      read them as "the same URL" - a trailing slash is ignored, the
+      scheme is compared as-is, and the host is compared case-
+      insensitively - rather than a byte-for-byte string comparison that
+      would flag "https://Delta.Example.org/" and "https://delta.example.org"
+      as a mismatch for no meaningful reason. Either side missing/blank is
+      never a match - a caller with no PUBLIC_URL to compare against
+      should treat that as "nothing to compare", not silently pass.
+    #>
+    param(
+        [AllowNull()][string]$First,
+        [AllowNull()][string]$Second
+    )
+
+    if ([string]::IsNullOrWhiteSpace($First) -or [string]::IsNullOrWhiteSpace($Second)) {
+        return $false
+    }
+
+    $normalize = {
+        param($url)
+        $trimmed = $url.Trim().TrimEnd('/')
+        if ($trimmed -match '^([a-zA-Z][a-zA-Z0-9+.-]*)://(.+)$') {
+            return "$($Matches[1].ToLowerInvariant())://$($Matches[2].ToLowerInvariant())"
+        }
+        return $trimmed.ToLowerInvariant()
+    }
+
+    return (& $normalize $First) -eq (& $normalize $Second)
+}
+
+function Sync-DeltaPublicUrlEnvironment {
+    <#
+      Writes PUBLIC_URL = "<scheme>://<domain>" into the deployed .env
+      ($Script:DeltaEnvPath) via the exact same Update-ManagedEnvironmentLines
+      mechanism setup.ps1's own DATABASE_URL/PORT writers use - never a
+      second .env parser/writer. The single call site both
+      setup-nginx.ps1 and setup-iis.ps1 use once their own reverse proxy
+      configuration is written, validated, and actually running -
+      PUBLIC_URL is treated as installer-managed from here on, the same
+      way PORT and DATABASE_URL already are, though an operator may still
+      hand-edit it; rerunning either script simply synchronizes it back.
+
+      A no-op (not an error) if $Script:DeltaEnvPath doesn't exist yet -
+      neither script should ever be the reason a missing .env is reported,
+      that belongs to setup.ps1's own earlier checks.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Domain,
+        [Parameter(Mandatory)][bool]$Https
+    )
+
+    if (-not (Test-Path -LiteralPath $Script:DeltaEnvPath)) {
+        return
+    }
+
+    $publicUrl = Get-DeltaPublicUrl -Domain $Domain -Https $Https
+
+    Write-Step 'Synchronizing PUBLIC_URL with the configured reverse proxy...'
+
+    Backup-DeltaEnvironmentFile -Path $Script:DeltaEnvPath
+
+    $sourceLines = Get-Content -LiteralPath $Script:DeltaEnvPath
+    $managedValues = [ordered]@{ PUBLIC_URL = $publicUrl }
+    $updatedLines = Update-ManagedEnvironmentLines -SourceLines $sourceLines -ManagedValues $managedValues
+    Set-Content -LiteralPath $Script:DeltaEnvPath -Value $updatedLines -Encoding utf8
+
+    Write-Success "    .env updated (PUBLIC_URL=`"$publicUrl`")."
 }
 
 function Test-DeltaTcpPortListening {
