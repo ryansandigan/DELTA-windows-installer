@@ -87,7 +87,7 @@ function Get-DeltaIisReverseProxyProviderState {
 
     $installed = (Get-DeltaIisDetectionResult).Installed
 
-    if (-not $installed -or -not (Test-DeltaWebAdministrationModuleAvailable)) {
+    if (-not $installed -or -not (Test-DeltaIisManagementAssemblyAvailable)) {
         return [PSCustomObject]@{
             Name                 = 'IIS'
             Installed            = $installed
@@ -97,7 +97,6 @@ function Get-DeltaIisReverseProxyProviderState {
             Detail               = $null
         }
     }
-    Import-Module WebAdministration -ErrorAction Stop
 
     $portInfo = Resolve-DeltaDoctorBackendPortInfo -EnvPath $Script:DeltaEnvPath
     $expectedPort = if ($portInfo.Valid) { $portInfo.Port } else { -1 }
@@ -112,7 +111,7 @@ function Get-DeltaIisReverseProxyProviderState {
         $detail = $failingLabels -join '; '
     }
 
-    $active = [bool]($managedByDelta -and $websiteChecks.ManagedSite.state -eq 'Started')
+    $active = [bool]($managedByDelta -and (Get-DeltaIisSiteState -Site $websiteChecks.ManagedSite) -eq 'Started')
 
     return [PSCustomObject]@{
         Name                 = 'IIS'

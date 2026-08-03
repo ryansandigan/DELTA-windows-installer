@@ -40,9 +40,10 @@
     of the two Windows Feature APIs applies (ServerManager/Get-WindowsFeature
     on Windows Server, DISM/Get-WindowsOptionalFeature on Windows 11/10
     client SKUs - detected, never assumed), the installed/missing state of
-    every IIS role service/feature later phases depend on, and whether the
-    WebAdministration PowerShell module is available (never imported here -
-    only its availability is reported). Detection only: nothing in this
+    every IIS role service/feature later phases depend on, and whether
+    Microsoft.Web.Administration - the assembly every later phase manages
+    sites/bindings/application pools through - can actually be loaded.
+    Detection only: nothing in this
     phase installs, enables, or configures IIS in any way, regardless of
     what it finds. Displays a detailed summary and exits successfully
     either way - IIS not being installed is not an error, it is simply a
@@ -283,7 +284,7 @@ function Show-DeltaIisDetectionSummary {
     Write-Host ''
     Write-Host 'Management Module'
     Write-Host ''
-    Write-Detail $(if ($Detection.WebAdministrationAvailable) { 'Available' } else { 'Missing' })
+    Write-Detail $(if ($Detection.ManagementAssemblyAvailable) { 'Available' } else { 'Missing' })
     Write-Host ''
     Write-Host 'Required Features'
     Write-Host ''
@@ -460,10 +461,11 @@ function Show-DeltaIisRestartRequiredNotice {
       installation API just reported a restart is needed - per this
       phase's own requirement, the orchestration block exits (0) right
       after this, without ever reaching Confirm-DeltaIisPostInstallState
-      or Show-DeltaIisInstallationSummary: querying WebAdministration/role
-      service state before the pending restart completes could report a
-      false failure (or a false success) for a module that genuinely does
-      not finish registering until reboot, and this phase must never
+      or Show-DeltaIisInstallationSummary: querying Microsoft.Web.
+      Administration/role service state before the pending restart
+      completes could report a false failure (or a false success) for an
+      assembly that genuinely does not finish registering until reboot,
+      and this phase must never
       claim IIS is fully ready in that state. Windows is never restarted
       automatically here or anywhere else in this script - the
       administrator always does that themselves.
@@ -501,17 +503,16 @@ function Confirm-DeltaIisPostInstallState {
         - Any required feature still reporting Missing - listed by name,
           per this phase's own "list the features still missing"
           requirement, never summarized as a single count.
-        - WebAdministration still unavailable even though every required
-          feature (including the two that ship it,
-          Web-Scripting-Tools/IIS-ManagementScriptingTools) now reports
-          Installed - a real, observed Windows behavior where the module
-          does not always finish registering until a reboot even when
-          neither installation API flagged one as required. Never imports
-          WebAdministration here to check this more directly - per this
-          phase's own "do not import WebAdministration yet unless needed
-          strictly for verification" instruction, Get-Module -ListAvailable
-          (Test-DeltaWebAdministrationModuleAvailable, Phase 2) is already
-          sufficient and never imports anything either.
+        - Microsoft.Web.Administration still unable to load even though
+          every required feature (including the two that ship IIS's own
+          management assemblies, Web-Scripting-Tools/
+          IIS-ManagementScriptingTools) now reports Installed - a real,
+          observed Windows behavior where the assembly does not always
+          finish registering until a reboot even when neither
+          installation API flagged one as required.
+          Test-DeltaIisManagementAssemblyAvailable (lib\DeltaDoctor.IIS.ps1)
+          is the same check Get-DeltaIisDetectionResult itself already
+          used to populate $Detection.ManagementAssemblyAvailable.
     #>
     param([Parameter(Mandatory)][PSCustomObject]$Detection)
 
@@ -529,11 +530,11 @@ No further IIS setup will be attempted. Review any errors above and re-run this 
 "@
     }
 
-    if (-not $Detection.WebAdministrationAvailable) {
+    if (-not $Detection.ManagementAssemblyAvailable) {
         Stop-Setup @'
-Every required Microsoft IIS role service/feature now reports Installed, but the WebAdministration PowerShell module is still unavailable.
+Every required Microsoft IIS role service/feature now reports Installed, but Microsoft.Web.Administration could not be loaded.
 
-If Windows reported that a restart was required, restart the server and re-run this script - the module can fail to register until after reboot even when the role service itself already shows Installed.
+If Windows reported that a restart was required, restart the server and re-run this script - the management assemblies can fail to register until after reboot even when the role service itself already shows Installed.
 
 If no restart was reported, verify the Web-Scripting-Tools (Server) / IIS-ManagementScriptingTools (Client) role service manually before proceeding to a later phase.
 '@
@@ -591,7 +592,7 @@ function Show-DeltaIisInstallationSummary {
     Write-Host ''
     Write-Host 'Management Module'
     Write-Host ''
-    Write-Detail $(if ($Detection.WebAdministrationAvailable) { 'WebAdministration available' } else { 'WebAdministration unavailable' })
+    Write-Detail $(if ($Detection.ManagementAssemblyAvailable) { 'Microsoft.Web.Administration available' } else { 'Microsoft.Web.Administration unavailable' })
     Write-Host ''
     Write-Host 'Restart Required'
     Write-Host ''
@@ -606,13 +607,13 @@ function Show-DeltaIisInstallationSummary {
 #
 # Prepares IIS for reverse-proxy usage: ensures URL Rewrite and Application
 # Request Routing (ARR) are installed, then enables the machine-wide
-# system.webServer/proxy setting. Unlike Phase 2/3, this section DOES
-# import WebAdministration - Phase 2/3's own "do not import it unless
-# needed strictly for verification" guidance stops applying once a phase
-# actually needs to configure something, and enabling server-wide proxying
-# is exactly that. Still never creates, modifies, or deletes any IIS
-# website, application pool, binding, or certificate - those remain later
-# phases.
+# system.webServer/proxy setting via Microsoft.Web.Administration
+# (lib\DeltaDoctor.IIS.ps1's own Get-DeltaIisServerManager/
+# Get-DeltaIisApplicationHostConfiguration/Get-DeltaIisConfigurationSection/
+# Save-DeltaIisConfiguration) - never the WebAdministration module, which
+# this project no longer has any runtime dependency on anywhere. Still
+# never creates, modifies, or deletes any IIS website, application pool,
+# binding, or certificate - those remain later phases.
 
 function Show-DeltaArrDetectionSummary {
     <#
@@ -1433,54 +1434,72 @@ function Confirm-DeltaIisHttpsBinding {
       binding), so any OTHER HTTPS binding an administrator added by hand
       is left completely untouched, per this phase's own "Do not disturb
       unrelated HTTPS bindings" / "Do not remove administrator-created
-      bindings" requirements. SNI (-SslFlags 1) is always enabled -
+      bindings" requirements. SNI (sslFlags = 1) is always enabled -
       required for a host-header-based HTTPS binding to coexist with any
       other HTTPS site already on the same IP/port.
 
-      The certificate is associated by thumbprint via the binding
-      object's own AddSslCertificate method - confirmed directly against
-      a real IIS binding that calling it again on an already-bound
-      binding with a DIFFERENT thumbprint correctly replaces the
-      association in place (certificateHash updates, no duplicate
-      binding created), so this same call handles both "no certificate
-      yet" and "replace the existing certificate" without needing to
-      branch on which case this run is in.
+      Uses lib\DeltaDoctor.IIS.ps1's own Microsoft.Web.Administration
+      site/binding primitives (Get-DeltaIisServerManager/
+      Get-DeltaIisSiteByName/Get-DeltaIisSiteBindingByProtocolAndPort/
+      Save-DeltaIisConfiguration/Add-DeltaIisCertificateToBinding), never
+      WebAdministration - the binding must actually be COMMITTED before
+      the certificate can be associated with it, so this creates/updates
+      the binding and commits first, then gets a completely FRESH
+      ServerManager to re-resolve the binding before calling
+      Add-DeltaIisCertificateToBinding - mirroring the original
+      WebAdministration-era "re-fetch via Get-WebBinding before
+      AddSslCertificate" step exactly, just with a fresh ServerManager
+      instead of a fresh cmdlet call.
+
+      The certificate is associated by thumbprint via
+      Add-DeltaIisCertificateToBinding (which wraps the binding object's
+      own native AddSslCertificate method) - confirmed directly against a
+      real IIS binding that calling it again on an already-bound binding
+      with a DIFFERENT thumbprint correctly replaces the association in
+      place (certificateHash updates, no duplicate binding created), so
+      this same call handles both "no certificate yet" and "replace the
+      existing certificate" without needing to branch on which case this
+      run is in.
     #>
     param([Parameter(Mandatory)][string]$Thumbprint)
 
     Write-Step 'Configuring the HTTPS binding...'
 
     $desiredBindingInformation = "*:443:$($Script:DeltaWebsiteDomain)"
-    $existingHttpsBinding = Get-WebBinding -Name $Script:DeltaIisSiteName -Protocol 'https' -ErrorAction SilentlyContinue |
-        Where-Object { $_.bindingInformation -match '^\*:443:' } | Select-Object -First 1
+
+    $serverManager = Get-DeltaIisServerManager
+    $site = Get-DeltaIisSiteByName -ServerManager $serverManager -Name $Script:DeltaIisSiteName
+    $existingHttpsBinding = Get-DeltaIisSiteBindingByProtocolAndPort -Site $site -Protocol 'https' -Port 443
 
     if (-not $existingHttpsBinding) {
-        New-WebBinding -Name $Script:DeltaIisSiteName -Protocol 'https' -Port 443 -HostHeader $Script:DeltaWebsiteDomain -SslFlags 1 | Out-Null
+        $newBinding = $site.Bindings.Add($desiredBindingInformation, 'https')
+        $newBinding.SetAttributeValue('sslFlags', 1)
+        Save-DeltaIisConfiguration -ServerManager $serverManager -SectionName 'Sites' -PropertyDescription "create HTTPS binding for '$($Script:DeltaIisSiteName)'"
         Write-Detail "Binding created: $desiredBindingInformation"
     }
-    elseif ($existingHttpsBinding.bindingInformation -ne $desiredBindingInformation) {
-        Set-WebBinding -Name $Script:DeltaIisSiteName -BindingInformation $existingHttpsBinding.bindingInformation -PropertyName 'bindingInformation' -Value $desiredBindingInformation | Out-Null
-        Write-Detail "Binding updated: $($existingHttpsBinding.bindingInformation) -> $desiredBindingInformation"
+    elseif ($existingHttpsBinding.BindingInformation -ne $desiredBindingInformation) {
+        $existingHttpsBinding.BindingInformation = $desiredBindingInformation
+        Save-DeltaIisConfiguration -ServerManager $serverManager -SectionName 'Sites' -PropertyDescription "update HTTPS binding for '$($Script:DeltaIisSiteName)'"
+        Write-Detail "Binding updated: $($existingHttpsBinding.BindingInformation) -> $desiredBindingInformation"
     }
     else {
         Write-Detail "Binding already correct: $desiredBindingInformation"
     }
 
-    $binding = Get-WebBinding -Name $Script:DeltaIisSiteName -Protocol 'https' -ErrorAction SilentlyContinue |
-        Where-Object { $_.bindingInformation -eq $desiredBindingInformation } | Select-Object -First 1
-    if (-not $binding) {
+    # A brand new ServerManager - never the one used to create/update the
+    # binding above - so the certificate is associated against a binding
+    # freshly re-read from applicationHost.config, never an in-memory
+    # object whose own commit might not have taken effect.
+    $verifyServerManager = Get-DeltaIisServerManager
+    $verifySite = Get-DeltaIisSiteByName -ServerManager $verifyServerManager -Name $Script:DeltaIisSiteName
+    $binding = Get-DeltaIisSiteBindingByProtocolAndPort -Site $verifySite -Protocol 'https' -Port 443
+    if (-not $binding -or $binding.BindingInformation -ne $desiredBindingInformation) {
         Stop-Setup 'Failed to configure the HTTPS binding - the binding could not be found immediately after creation/update.'
     }
 
     try {
-        # [void], not | Out-Null - confirmed directly this .NET method call's
-        # own return value (even when $null) is exactly what leaked into
-        # this function's caller's output stream when left unsuppressed,
-        # silently corrupting Invoke-DeltaIisSslCertificateSetup's own
-        # returned PSCustomObject into a multi-element array further up
-        # the call chain (caught during real validation: "$result" ended
-        # up not being the plain object it should have been).
-        [void]$binding.AddSslCertificate($Thumbprint, 'my')
+        Add-DeltaIisCertificateToBinding -Binding $binding -Thumbprint $Thumbprint -StoreName 'my'
+        Save-DeltaIisConfiguration -ServerManager $verifyServerManager -SectionName 'Sites' -PropertyDescription "associate certificate with HTTPS binding for '$($Script:DeltaIisSiteName)'"
     }
     catch {
         Stop-Setup "Failed to associate the certificate with the HTTPS binding: $($_.Exception.Message)"
@@ -1492,12 +1511,13 @@ function Confirm-DeltaIisHttpsBinding {
 function Confirm-DeltaIisSslConfigurationResult {
     <#
       Verification (this phase's own dedicated section) - never trusts
-      Import-PfxCertificate/New-WebBinding/AddSslCertificate's own lack of
-      a thrown error as proof of anything; re-reads the certificate store
-      and IIS from scratch and independently checks every fact this phase
-      claims to have configured, collecting every failure at once (the
-      same shape Confirm-DeltaIisWebsiteConfigurationResult, Phase 6,
-      already established) rather than stopping at the first.
+      Import-PfxCertificate/Confirm-DeltaIisHttpsBinding's own lack of a
+      thrown error as proof of anything; re-reads the certificate store
+      and IIS from scratch (a brand new ServerManager, never one already
+      used elsewhere in this phase) and independently checks every fact
+      this phase claims to have configured, collecting every failure at
+      once (the same shape Confirm-DeltaIisWebsiteConfigurationResult,
+      Phase 6, already established) rather than stopping at the first.
     #>
     param([Parameter(Mandatory)][string]$ExpectedThumbprint)
 
@@ -1509,21 +1529,23 @@ function Confirm-DeltaIisSslConfigurationResult {
         $failures.Add("No certificate with thumbprint $ExpectedThumbprint exists in Cert:\LocalMachine\My.")
     }
 
-    $binding = Get-WebBinding -Name $Script:DeltaIisSiteName -Protocol 'https' -ErrorAction SilentlyContinue |
-        Where-Object { $_.bindingInformation -eq "*:443:$($Script:DeltaWebsiteDomain)" } | Select-Object -First 1
+    $serverManager = Get-DeltaIisServerManager
+    $site = Get-DeltaIisSiteByName -ServerManager $serverManager -Name $Script:DeltaIisSiteName
+    $binding = if ($site) { Get-DeltaIisSiteBindingByProtocolAndPort -Site $site -Protocol 'https' -Port 443 } else { $null }
 
     if (-not $binding) {
         $failures.Add("No HTTPS binding exists for '$($Script:DeltaWebsiteDomain)' on port 443.")
     }
     else {
-        if ($binding.certificateHash -ne $ExpectedThumbprint) {
-            $failures.Add("The HTTPS binding references thumbprint '$($binding.certificateHash)', expected '$ExpectedThumbprint'.")
+        $bindingThumbprint = Get-DeltaIisBindingCertificateThumbprint -Binding $binding
+        if ($bindingThumbprint -ne $ExpectedThumbprint) {
+            $failures.Add("The HTTPS binding references thumbprint '$bindingThumbprint', expected '$ExpectedThumbprint'.")
         }
-        if (-not ([int]$binding.sslFlags -band 1)) {
+        if (-not ([int]$binding.GetAttributeValue('sslFlags') -band 1)) {
             $failures.Add('SNI (Server Name Indication) is not enabled on the HTTPS binding.')
         }
 
-        $hostHeaderPart = ($binding.bindingInformation -split ':')[2]
+        $hostHeaderPart = ($binding.BindingInformation -split ':')[2]
         if ($hostHeaderPart -ne $Script:DeltaWebsiteDomain) {
             $failures.Add("HTTPS binding host header is '$hostHeaderPart', expected '$($Script:DeltaWebsiteDomain)'.")
         }
@@ -1601,10 +1623,9 @@ function Invoke-DeltaIisSslCertificateSetup {
       Cancel case - its wording is already completely generic.
     #>
 
-    if (-not (Test-DeltaWebAdministrationModuleAvailable)) {
-        Stop-Setup 'The WebAdministration PowerShell module is unavailable, so SSL certificate setup cannot proceed. Re-run Phase 3 (Microsoft IIS Installation) first.'
+    if (-not (Test-DeltaIisManagementAssemblyAvailable)) {
+        Stop-Setup 'Microsoft.Web.Administration is unavailable, so SSL certificate setup cannot proceed. Re-run Phase 3 (Microsoft IIS Installation) first.'
     }
-    Import-Module WebAdministration -ErrorAction Stop
 
     Write-PhaseBanner 'SSL Certificate'
 
@@ -2095,13 +2116,31 @@ function Restart-DeltaIisManagedAppPool {
     <#
       Management menu action ("Restart Application Pool") - unlike
       website restart, IIS genuinely does provide a single, direct
-      cmdlet for this (Restart-WebAppPool), so no composition is needed.
+      primitive for this (ApplicationPool.Recycle(), wrapped by
+      Restart-DeltaIisApplicationPool), so no composition is needed.
       Recycles the DELTA application pool's own worker process(es)
       without affecting the website's own started/stopped state.
+
+      Unlike the original WebAdministration-based Restart-WebAppPool
+      call, this reports a clear failure (rather than letting an
+      exception propagate uncaught to the top-level orchestration catch
+      block) both when the pool cannot be found at all and when
+      Recycle() itself throws.
     #>
 
+    $serverManager = Get-DeltaIisServerManager
+    $pool = Get-DeltaIisApplicationPoolByName -ServerManager $serverManager -Name $Script:DeltaIisAppPoolName
+    if (-not $pool) {
+        Stop-Setup "Application pool '$($Script:DeltaIisAppPoolName)' does not exist - it cannot be restarted."
+    }
+
     Write-Step 'Restarting the application pool...'
-    Restart-WebAppPool -Name $Script:DeltaIisAppPoolName
+    try {
+        Restart-DeltaIisApplicationPool -Pool $pool
+    }
+    catch {
+        Stop-Setup "Failed to restart the application pool '$($Script:DeltaIisAppPoolName)': $($_.Exception.Message)"
+    }
     Write-Success '    Application pool restarted.'
 }
 
@@ -2292,9 +2331,11 @@ function Show-DeltaIisManagementMenu {
       .env or re-derived.
 
       Unlike setup-nginx.ps1's own Running/Stopped/Broken/NotInstalled
-      branching menu, this always offers the same eight options - IIS's
-      own Start-Website/Stop-Website/Restart-WebAppPool cmdlets are
-      idempotent no-ops to call against an already-matching state (and
+      branching menu, this always offers the same eight options - Site.
+      Start()/Site.Stop()/ApplicationPool.Recycle() (via
+      lib\DeltaDoctor.IIS.ps1's own Start-DeltaIisSite/Stop-DeltaIisSite/
+      Restart-DeltaIisApplicationPool) are idempotent no-ops to call
+      against an already-matching state (and
       Start-DeltaIisManagedWebsite/Stop-DeltaIisManagedWebsite each still
       check first and report a no-op plainly rather than calling them
       needlessly), so there is no meaningful "wrong state to offer this
@@ -2337,13 +2378,16 @@ function Show-DeltaIisManagementMenu {
     #>
     param()
 
-    if (-not (Test-DeltaWebAdministrationModuleAvailable)) {
-        Stop-Setup 'The WebAdministration PowerShell module is unavailable, so website management cannot proceed. Re-run Phase 3 (Microsoft IIS Installation) first.'
+    if (-not (Test-DeltaIisManagementAssemblyAvailable)) {
+        Stop-Setup 'Microsoft.Web.Administration is unavailable, so website management cannot proceed. Re-run Phase 3 (Microsoft IIS Installation) first.'
     }
-    Import-Module WebAdministration -ErrorAction Stop
 
     while ($true) {
-        $currentSite = Get-Website -Name $Script:DeltaIisSiteName -ErrorAction SilentlyContinue
+        # A fresh ServerManager every iteration, not just a fresh site
+        # lookup - see this function's own header for the real bug this
+        # fixes (a stale snapshot reused across menu actions).
+        $serverManager = Get-DeltaIisServerManager
+        $currentSite = Get-DeltaIisSiteByName -ServerManager $serverManager -Name $Script:DeltaIisSiteName
         if (-not $currentSite) {
             Write-Host ''
             Write-Detail 'The DELTA website no longer appears to exist.'
@@ -2362,22 +2406,22 @@ function Show-DeltaIisManagementMenu {
         Write-Host ''
         Write-Host 'Website'
         Write-Host ''
-        Write-Detail $currentSite.name
+        Write-Detail $currentSite.Name
         Write-Host ''
         Write-Host 'Status'
         Write-Host ''
-        # $currentSite.state is only resolvable while W3SVC is actually
-        # running - IIS reports it as an empty string (never $null,
-        # never a thrown error), unlike name/applicationPool/physicalPath,
-        # which read straight from applicationHost.config regardless of
-        # service state. Defensive fallback, matching the exact same
-        # $(if (...) {...} else {'Unknown'}) idiom Binding/Backend already
-        # use two blocks below - Start-DeltaIisManagedWebsite (the
-        # orchestration block's own caller, and this menu's own "Start
-        # Website"/"Restart Website" actions) is what actually keeps
-        # W3SVC/the site running; this only ever keeps the display itself
-        # from crashing if it somehow isn't, for whatever reason, right now.
-        Write-Detail $(if ($currentSite.state) { "$($currentSite.state)" } else { 'Unknown' })
+        # Reading .State on a Microsoft.Web.Administration Site can THROW
+        # while W3SVC isn't running, unlike Name/PhysicalPath/the root
+        # application's own ApplicationPoolName, which read straight from
+        # applicationHost.config regardless of service state -
+        # Get-DeltaIisSiteState (lib\DeltaDoctor.IIS.ps1) wraps that in a
+        # try/catch and reports 'Unknown' rather than letting this menu
+        # crash. Start-DeltaIisManagedWebsite (the orchestration block's
+        # own caller, and this menu's own "Start Website"/"Restart
+        # Website" actions) is what actually keeps W3SVC/the site
+        # running; this only ever keeps the display itself from crashing
+        # if it somehow isn't, for whatever reason, right now.
+        Write-Detail (Get-DeltaIisSiteState -Site $currentSite)
         Write-Host ''
         Write-Host 'Binding'
         Write-Host ''
@@ -2389,7 +2433,7 @@ function Show-DeltaIisManagementMenu {
         Write-Host ''
         Write-Host 'Application Pool'
         Write-Host ''
-        Write-Detail $currentSite.applicationPool
+        Write-Detail (Get-DeltaIisSiteApplicationPoolName -Site $currentSite)
         Write-Host ''
         Write-Host ('=' * $Script:BannerWidth)
         Write-Host ''
@@ -2592,8 +2636,9 @@ try {
     # binding) - it never starts it, so without this call the website could
     # be left Healthy but never Active (Doctor's own
     # Get-DeltaIisReverseProxyProviderState reads Active straight from the
-    # site's own .state -eq 'Started', a genuine runtime fact New-Website
-    # does not always leave true on its own). Start-DeltaIisManagedWebsite
+    # site's own state (Get-DeltaIisSiteState -eq 'Started'), a genuine
+    # runtime fact site creation does not always leave true on its own).
+    # Start-DeltaIisManagedWebsite
     # (lib\DeltaDoctor.IIS.ps1) is the same idempotent, ownership-checked
     # primitive the management menu's own "Start Website" action already
     # uses - a no-op, reported plainly, if the site is already running -

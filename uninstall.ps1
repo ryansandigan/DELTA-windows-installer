@@ -984,9 +984,10 @@ function Get-DeltaIisCertificateRemovalPlan {
         return $null
     }
 
-    $sharedElsewhere = @(Get-Website -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne $SiteName } | ForEach-Object {
-        Get-WebBinding -Name $_.Name -Protocol 'https' -ErrorAction SilentlyContinue
-    } | Where-Object { $_.certificateHash -eq $httpsState.Thumbprint })
+    $serverManager = Get-DeltaIisServerManager
+    $sharedElsewhere = @((Get-DeltaIisAllSites -ServerManager $serverManager) | Where-Object { $_.Name -ne $SiteName } | ForEach-Object {
+        $_.Bindings | Where-Object { $_.Protocol -eq 'https' }
+    } | Where-Object { (Get-DeltaIisBindingCertificateThumbprint -Binding $_) -eq $httpsState.Thumbprint })
 
     return [PSCustomObject]@{
         Thumbprint   = $httpsState.Thumbprint
@@ -1014,8 +1015,8 @@ function Uninstall-DeltaIis {
       Detected via the exact same ownership rule every other consumer of
       Get-DeltaIisManagedWebsiteResult (lib\DeltaDoctor.IIS.ps1) already
       trusts: a site named exactly $Script:DeltaIisSiteName ('DELTA')
-      whose PhysicalPath matches the resolved DELTA installation. A
-      no-op, reported plainly, whenever: the WebAdministration module
+      whose physical path matches the resolved DELTA installation. A
+      no-op, reported plainly, whenever: Microsoft.Web.Administration
       isn't even available (IIS was never installed, or is only partially
       present - nothing DELTA-specific could exist in that state either),
       no DELTA installation can currently be located (Get-DeltaInstallPath)
@@ -1046,16 +1047,15 @@ function Uninstall-DeltaIis {
     #>
     Write-PhaseBanner 'Phase 0.6 - IIS'
 
-    if (-not (Test-DeltaWebAdministrationModuleAvailable)) {
+    if (-not (Test-DeltaIisManagementAssemblyAvailable)) {
         Write-Detail 'Microsoft IIS is not installed on this machine - nothing to remove.'
         $Script:IisResult = 'Not installed'
         return
     }
-    Import-Module WebAdministration -ErrorAction Stop
 
     $Script:DeltaInstallPath = Get-DeltaInstallPath
     if (-not $Script:DeltaInstallPath) {
-        $orphanSite = Get-Website -Name $Script:DeltaIisSiteName -ErrorAction SilentlyContinue
+        $orphanSite = Get-DeltaIisSiteByName -ServerManager (Get-DeltaIisServerManager) -Name $Script:DeltaIisSiteName
         if ($orphanSite) {
             Write-Detail "An IIS website named '$($Script:DeltaIisSiteName)' exists, but the DELTA installation it would belong to could not be located (it may already have been removed) - it cannot be safely verified as DELTA-owned, so it will be left untouched."
         }
@@ -1068,7 +1068,7 @@ function Uninstall-DeltaIis {
 
     $websiteResult = Get-DeltaIisManagedWebsiteResult
     if ($websiteResult.CollidingSite) {
-        Write-Detail "A website named '$($Script:DeltaIisSiteName)' exists, but does not belong to this DELTA installation (physical path: $($websiteResult.CollidingSite.physicalPath)). It will be left untouched."
+        Write-Detail "A website named '$($Script:DeltaIisSiteName)' exists, but does not belong to this DELTA installation (physical path: $(Get-DeltaIisSitePhysicalPath -Site $websiteResult.CollidingSite)). It will be left untouched."
         $Script:IisResult = 'Not installed'
         return
     }
@@ -1080,9 +1080,9 @@ function Uninstall-DeltaIis {
         return
     }
 
-    $siteName     = $site.name
-    $appPoolName  = $site.applicationPool
-    $physicalPath = $site.physicalPath
+    $siteName     = $site.Name
+    $appPoolName  = Get-DeltaIisSiteApplicationPoolName -Site $site
+    $physicalPath = Get-DeltaIisSitePhysicalPath -Site $site
     $webConfigPath = Join-Path -Path $physicalPath -ChildPath 'web.config'
 
     Write-Host ''
@@ -1123,8 +1123,8 @@ function Uninstall-DeltaIis {
 
     # Captured before the website is touched - Get-DeltaIisExistingHttpsCertificateState
     # (inside Get-DeltaIisCertificateRemovalPlan) reads the HTTPS binding off
-    # the live site, which Remove-Website below deletes along with everything
-    # else the site owns.
+    # the live site, which the site removal below deletes along with
+    # everything else the site owns.
     $certificatePlan = Get-DeltaIisCertificateRemovalPlan -SiteName $siteName
 
     Write-Host ''
@@ -1133,19 +1133,26 @@ function Uninstall-DeltaIis {
 
     Write-Step "Removing the IIS website ('$siteName')..."
     try {
-        Remove-Website -Name $siteName -ErrorAction Stop
+        # A brand new ServerManager, re-resolving the site by name - never
+        # the $site object above, which came from Get-DeltaIisManagedWebsiteResult's
+        # own (by-now-stale) ServerManager, and never one already used by
+        # Stop-DeltaIisManagedWebsite either.
+        $removeServerManager = Get-DeltaIisServerManager
+        $siteToRemove = Get-DeltaIisSiteByName -ServerManager $removeServerManager -Name $siteName
+        Remove-DeltaIisSite -ServerManager $removeServerManager -Site $siteToRemove
     }
     catch {
         Stop-Setup "Failed to remove the IIS website '$siteName': $($_.Exception.Message)"
     }
     Write-Success "    Removed: $siteName"
 
-    $appPoolPath = "IIS:\AppPools\$appPoolName"
-    $appPoolStillUsed = [bool](Get-Website -ErrorAction SilentlyContinue | Where-Object { $_.applicationPool -eq $appPoolName })
-    if ((Test-Path -LiteralPath $appPoolPath) -and -not $appPoolStillUsed) {
+    $appPoolServerManager = Get-DeltaIisServerManager
+    $appPool = Get-DeltaIisApplicationPoolByName -ServerManager $appPoolServerManager -Name $appPoolName
+    $appPoolStillUsed = [bool]((Get-DeltaIisAllSites -ServerManager $appPoolServerManager) | Where-Object { (Get-DeltaIisSiteApplicationPoolName -Site $_) -eq $appPoolName })
+    if ($appPool -and -not $appPoolStillUsed) {
         Write-Step "Removing the application pool ('$appPoolName')..."
         try {
-            Remove-WebAppPool -Name $appPoolName -ErrorAction Stop
+            Remove-DeltaIisApplicationPool -ServerManager $appPoolServerManager -Pool $appPool
         }
         catch {
             Stop-Setup "Failed to remove the application pool '$appPoolName': $($_.Exception.Message)"
@@ -1189,7 +1196,13 @@ function Uninstall-DeltaIis {
 
     Write-Step 'Verifying removal...'
     $removed = Wait-Until -TimeoutSeconds 10 -Condition {
-        -not (Get-Website -Name $siteName -ErrorAction SilentlyContinue)
+        # A brand new ServerManager on EVERY poll, never one captured via
+        # closure - a ServerManager's own Sites collection is a point-in-
+        # time snapshot and would never observe the removal committed
+        # above, the same "poll with fresh reads, not a cached snapshot"
+        # requirement this project's own NSIS uninstaller validation
+        # already depends on.
+        -not (Get-DeltaIisSiteByName -ServerManager (Get-DeltaIisServerManager) -Name $siteName)
     }
     if (-not $removed) {
         Stop-Setup "IIS website '$siteName' still exists after removal."

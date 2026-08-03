@@ -263,17 +263,6 @@ function Get-DeltaIisVersion {
     return ($versionString -replace '^Version\s+', '').Trim()
 }
 
-function Test-DeltaWebAdministrationModuleAvailable {
-    <#
-      Whether the WebAdministration PowerShell module - the prerequisite
-      every New-Website/New-WebBinding/Get-Website/etc. call in this file
-      depends on - is available to be imported. Get-Module -ListAvailable
-      never actually imports it: nothing here (or anywhere else in this
-      section) ever calls Import-Module on its own initiative.
-    #>
-    return [bool](Get-Module -ListAvailable -Name 'WebAdministration' -ErrorAction SilentlyContinue)
-}
-
 function Get-DeltaIisDetectionResult {
     <#
       The orchestrator for this whole section - collects every fact IIS
@@ -320,7 +309,7 @@ function Get-DeltaIisDetectionResult {
         OperatingSystemType        = $osInfo.Type
         OperatingSystemCaption     = $osInfo.Caption
         DetectionMechanism         = $osInfo.DetectionMechanism
-        WebAdministrationAvailable = Test-DeltaWebAdministrationModuleAvailable
+        ManagementAssemblyAvailable = Test-DeltaIisManagementAssemblyAvailable
         Features                   = $features
     }
 }
@@ -347,9 +336,15 @@ function Get-DeltaIisDetectionResult {
 # those same three settings (immediately below) do too, so a single
 # ServerManager transaction's own writes are never re-verified through a
 # different, still-broken backend. Website/application-pool/binding
-# management (New-Website, Get-WebBinding, Restart-WebAppPool, etc.) still
-# uses the WebAdministration module and is unaffected - only the
-# *-WebConfiguration* cmdlet family is replaced here.
+# management (New-Website, Get-WebBinding, Restart-WebAppPool, etc.) was
+# initially left on the WebAdministration module, on the assumption that
+# only the *-WebConfiguration* cmdlet family was affected - that assumption
+# was wrong: every WebAdministration cmdlet goes through the same broken
+# provider registration, so website/application-pool/binding management
+# was later ported to Microsoft.Web.Administration too (see the "site/
+# binding/application-pool primitives" section further below,
+# Get-DeltaIisSiteByName/New-DeltaIisSite/etc.) - there is no remaining
+# WebAdministration dependency anywhere in this project.
 
 function Import-DeltaIisManagementAssembly {
     <#
@@ -470,6 +465,347 @@ function Save-DeltaIisConfiguration {
         }
         throw "Failed to commit IIS configuration changes to section '$SectionName' (property: $PropertyDescription). Original exception ($($originalException.GetType().FullName)): $($originalException.Message).$innerText"
     }
+}
+
+# ---------------------------------------------------------------------------
+# Microsoft.Web.Administration - site/binding/application-pool primitives
+# ---------------------------------------------------------------------------
+#
+# The direct Microsoft.Web.Administration replacement for every remaining
+# WebAdministration module cmdlet this project used to depend on
+# (Get-Website/New-Website/Start-Website/Stop-Website/Get-WebBinding/
+# New-WebBinding/Set-WebBinding/New-WebAppPool/Restart-WebAppPool/
+# Remove-Website/Remove-WebAppPool) and the IIS:\ provider
+# (Get-ItemProperty/Set-ItemProperty/Test-Path against IIS:\AppPools/
+# IIS:\Sites) - see this project's own CLAUDE.md-adjacent history: the exact
+# same REGDB_E_CLASSNOTREG COM failure that broke the *-WebConfiguration*
+# cmdlets (see the section above) is not actually scoped to configuration
+# cmdlets alone; every WebAdministration cmdlet goes through the identical
+# broken provider registration. These helpers are the ONLY way any function
+# in this project now touches a site, binding, or application pool.
+#
+# A ServerManager instance's own Sites/ApplicationPools collections only
+# ever reflect what existed at the moment it was created - it does not
+# observe changes committed by a DIFFERENT ServerManager instance,
+# including ones this same process just committed moments earlier. Every
+# helper below that MUTATES something therefore takes an already-created
+# $ServerManager from its caller (so a single repair/removal pass shares
+# one instance across its own several mutations, then commits once) rather
+# than creating its own - but no function anywhere in this project ever
+# reuses a Site/ApplicationPool object obtained from one ServerManager
+# after a DIFFERENT ServerManager has since committed a change; the correct
+# pattern is always: commit, then get a brand new ServerManager, then
+# re-resolve by name before reading or mutating again.
+
+function Get-DeltaIisSiteByName {
+    <#
+      $ServerManager.Sites[$Name] - the direct replacement for
+      Get-Website -Name <name> -ErrorAction SilentlyContinue. The
+      SiteCollection's own string-keyed indexer returns $null when no site
+      by that name exists; it does not throw, so no try/catch is needed
+      here (unlike Get-DeltaIisSiteState below, which reads a different,
+      genuinely throwing property).
+    #>
+    param(
+        [Parameter(Mandatory)]$ServerManager,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    return $ServerManager.Sites[$Name]
+}
+
+function Get-DeltaIisAllSites {
+    <#
+      Every site currently known to $ServerManager - the direct replacement
+      for a bare Get-Website (no -Name) call. Comma-protected so a
+      zero- or one-site result crossing the return boundary stays a real
+      array, never unwrapped to $null/a bare scalar (this project's own
+      established return-boundary discipline - see
+      Get-DeltaIisMissingFeatures in setup-iis.ps1 for the canonical
+      explanation of why).
+    #>
+    param([Parameter(Mandatory)]$ServerManager)
+
+    return ,@($ServerManager.Sites)
+}
+
+function Get-DeltaIisApplicationPoolByName {
+    <#
+      $ServerManager.ApplicationPools[$Name] - the direct replacement for
+      Test-Path/Get-ItemProperty against IIS:\AppPools\<name>. Same
+      null-on-miss, never-throws indexer behavior as Get-DeltaIisSiteByName.
+    #>
+    param(
+        [Parameter(Mandatory)]$ServerManager,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    return $ServerManager.ApplicationPools[$Name]
+}
+
+function Get-DeltaIisSiteState {
+    <#
+      $Site.State, defensively - confirmed directly that reading .State on
+      a Microsoft.Web.Administration Site can THROW (a COMException) while
+      the World Wide Web Publishing Service (W3SVC)/WAS isn't running,
+      unlike the WebAdministration module's own .state convenience
+      property, which simply reads back an empty string in that case and
+      never throws. Every caller that used to do a plain
+      $(if ($site.state) {...} else {'Unknown'}) falsy-check now goes
+      through this instead - the one place that defensive fallback lives.
+      Never throws; returns 'Unknown' (not $null) on any failure, matching
+      what every caller already displayed for a blank WebAdministration
+      .state.
+    #>
+    param([Parameter(Mandatory)]$Site)
+
+    try {
+        return "$($Site.State)"
+    }
+    catch {
+        return 'Unknown'
+    }
+}
+
+function Get-DeltaIisSitePhysicalPath {
+    <#
+      A site's own physical path, read the CORRECT Microsoft.Web.Administration
+      way - unlike WebAdministration's Get-Website, which flattens this
+      onto the site object directly as .physicalPath, the native Site
+      object has no such property at all: physical path genuinely lives on
+      the root application's own root virtual directory. Confirmed
+      directly against Microsoft.Web.Administration's own object model -
+      every site this project ever creates or inspects has exactly one
+      application ("/") with exactly one virtual directory ("/"), the same
+      assumption Confirm-DeltaIisWebsite's own New-DeltaIisSite call below
+      always creates.
+    #>
+    param([Parameter(Mandatory)]$Site)
+
+    return $Site.Applications['/'].VirtualDirectories['/'].PhysicalPath
+}
+
+function Get-DeltaIisSiteApplicationPoolName {
+    <#
+      A site's own associated application pool name - like
+      Get-DeltaIisSitePhysicalPath immediately above, WebAdministration's
+      Get-Website flattens this onto the site object as .applicationPool,
+      but the native Site object has no such property: it genuinely lives
+      on the root application, not the site itself.
+    #>
+    param([Parameter(Mandatory)]$Site)
+
+    return $Site.Applications['/'].ApplicationPoolName
+}
+
+function Set-DeltaIisSiteApplicationPoolName {
+    <#
+      The corresponding setter - the direct replacement for
+      Set-ItemProperty -Path "IIS:\Sites\<name>" -Name applicationPool
+      -Value <pool>. Does not itself call CommitChanges - callers batch
+      this alongside whatever else a single repair pass is changing and
+      commit once via Save-DeltaIisConfiguration.
+    #>
+    param(
+        [Parameter(Mandatory)]$Site,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    $Site.Applications['/'].ApplicationPoolName = $Name
+}
+
+function Get-DeltaIisBindingCertificateThumbprint {
+    <#
+      A binding's own associated certificate thumbprint, as an uppercase
+      hex string - the direct replacement for WebAdministration's
+      Get-WebBinding, whose .certificateHash convenience property already
+      comes back as a hex string. The native Microsoft.Web.Administration
+      Binding.CertificateHash property is instead a raw byte[], so this is
+      the one place that byte[] -> hex-string conversion happens; every
+      other function in this project that needs a binding's own
+      thumbprint goes through this rather than re-implementing the
+      conversion. Returns $null (never throws) if the binding has no
+      certificate hash at all (an HTTP binding, or an HTTPS binding never
+      associated with a certificate).
+    #>
+    param([Parameter(Mandatory)]$Binding)
+
+    $hashBytes = $Binding.CertificateHash
+    if (-not $hashBytes -or $hashBytes.Length -eq 0) {
+        return $null
+    }
+
+    return -join ($hashBytes | ForEach-Object { $_.ToString('X2') })
+}
+
+function Get-DeltaIisSiteBindingByProtocolAndPort {
+    <#
+      Finds a single binding on $Site matching $Protocol and $Port,
+      parsed from the binding's own BindingInformation
+      ("*:80:delta.example.org" -> port 80) - the direct replacement for
+      every Get-WebBinding -Name <site> -Protocol <protocol> |
+      Where-Object { bindingInformation -match/-eq ... } | Select-Object
+      -First 1 call this project used to make. $Port is optional -
+      omitted, this returns the first binding matching $Protocol alone
+      (matching Get-DeltaIisExistingHttpsCertificateState's own original
+      "first HTTPS binding, regardless of port" behavior). Returns $null
+      if nothing matches.
+    #>
+    param(
+        [Parameter(Mandatory)]$Site,
+        [Parameter(Mandatory)][string]$Protocol,
+        [int]$Port
+    )
+
+    foreach ($binding in $Site.Bindings) {
+        if ($binding.Protocol -ne $Protocol) { continue }
+        if (-not $PSBoundParameters.ContainsKey('Port')) { return $binding }
+
+        $parts = $binding.BindingInformation -split ':'
+        if ($parts.Count -ge 2) {
+            $parsedPort = 0
+            if ([int]::TryParse($parts[1], [ref]$parsedPort) -and $parsedPort -eq $Port) {
+                return $binding
+            }
+        }
+    }
+
+    return $null
+}
+
+function New-DeltaIisSite {
+    <#
+      $ServerManager.Sites.Add(...) - the direct replacement for
+      New-Website -Name -PhysicalPath -ApplicationPool -Port -HostHeader.
+      Sites.Add's own 4-argument overload (name/protocol/bindingInformation/
+      physicalPath) creates the site with exactly one binding and one
+      application ("/"); the application pool association is set
+      immediately afterward on that same root application, exactly the
+      shape Get-DeltaIisSiteApplicationPoolName/Get-DeltaIisSitePhysicalPath
+      above always assume every site this project manages has. Does not
+      itself call CommitChanges - the caller commits once after this and
+      any other change in the same repair pass.
+    #>
+    param(
+        [Parameter(Mandatory)]$ServerManager,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$PhysicalPath,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$HostHeader,
+        [Parameter(Mandatory)][string]$ApplicationPoolName
+    )
+
+    $bindingInformation = "*:${Port}:${HostHeader}"
+    $site = $ServerManager.Sites.Add($Name, 'http', $bindingInformation, $PhysicalPath)
+    $site.Applications['/'].ApplicationPoolName = $ApplicationPoolName
+
+    return $site
+}
+
+function New-DeltaIisApplicationPool {
+    <#
+      $ServerManager.ApplicationPools.Add($Name) - the direct replacement
+      for New-WebAppPool -Name <name>. Does not itself call
+      CommitChanges - see New-DeltaIisSite's own header for why.
+    #>
+    param(
+        [Parameter(Mandatory)]$ServerManager,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    return $ServerManager.ApplicationPools.Add($Name)
+}
+
+function Start-DeltaIisSite {
+    <#
+      $Site.Start() - the direct replacement for Start-Website -Name
+      <name>. A live runtime action mediated by WAS, exactly like the
+      WebAdministration cmdlet it replaces - never requires
+      CommitChanges, and never touches applicationHost.config.
+    #>
+    param([Parameter(Mandatory)]$Site)
+
+    $Site.Start() | Out-Null
+}
+
+function Stop-DeltaIisSite {
+    <#
+      $Site.Stop() - the direct counterpart to Start-DeltaIisSite, the
+      direct replacement for Stop-Website -Name <name>.
+    #>
+    param([Parameter(Mandatory)]$Site)
+
+    $Site.Stop() | Out-Null
+}
+
+function Restart-DeltaIisApplicationPool {
+    <#
+      $Pool.Recycle() - the direct replacement for Restart-WebAppPool
+      -Name <name>. Like Start/Stop-DeltaIisSite, a live runtime action -
+      never requires CommitChanges.
+    #>
+    param([Parameter(Mandatory)]$Pool)
+
+    $Pool.Recycle() | Out-Null
+}
+
+function Add-DeltaIisCertificateToBinding {
+    <#
+      $Binding.AddSslCertificate($Thumbprint, $StoreName) - a native
+      method on Microsoft.Web.Administration.Binding itself (added for IIS
+      8's SNI support), not something WebAdministration's Get-WebBinding
+      merely bolted on - so this carries over unchanged from
+      setup-iis.ps1's own original call, now reached with a binding
+      obtained via ServerManager instead. [void], never | Out-Null -
+      confirmed directly (setup-iis.ps1's own Confirm-DeltaIisHttpsBinding,
+      the only caller) that this method's own return value, left
+      unsuppressed, leaks into and corrupts the caller's own returned
+      object further up the call chain - see that call site's own comment
+      for the full story. Requires the change to already be committed
+      (the binding must genuinely exist in applicationHost.config) before
+      this is called, exactly like the WebAdministration-based version
+      always required a fresh Get-WebBinding re-fetch first.
+    #>
+    param(
+        [Parameter(Mandatory)]$Binding,
+        [Parameter(Mandatory)][string]$Thumbprint,
+        [Parameter(Mandatory)][string]$StoreName
+    )
+
+    [void]$Binding.AddSslCertificate($Thumbprint, $StoreName)
+}
+
+function Remove-DeltaIisSite {
+    <#
+      $ServerManager.Sites.Remove($Site) + commit - the direct replacement
+      for Remove-Website -Name <name>. Removing a site this way also
+      removes every one of its own bindings and its application's own
+      pool ASSOCIATION in the same step (never the pool itself - a shared
+      pool may still be legitimately used by another site, exactly the
+      distinction uninstall.ps1's own Uninstall-DeltaIis already relies
+      on), matching Remove-Website's own documented behavior.
+    #>
+    param(
+        [Parameter(Mandatory)]$ServerManager,
+        [Parameter(Mandatory)]$Site
+    )
+
+    $ServerManager.Sites.Remove($Site)
+    Save-DeltaIisConfiguration -ServerManager $ServerManager -SectionName 'Sites' -PropertyDescription "remove site '$($Site.Name)'"
+}
+
+function Remove-DeltaIisApplicationPool {
+    <#
+      $ServerManager.ApplicationPools.Remove($Pool) + commit - the direct
+      replacement for Remove-WebAppPool -Name <name>.
+    #>
+    param(
+        [Parameter(Mandatory)]$ServerManager,
+        [Parameter(Mandatory)]$Pool
+    )
+
+    $ServerManager.ApplicationPools.Remove($Pool)
+    Save-DeltaIisConfiguration -ServerManager $ServerManager -SectionName 'ApplicationPools' -PropertyDescription "remove application pool '$($Pool.Name)'"
 }
 
 # ---------------------------------------------------------------------------
@@ -709,29 +1045,26 @@ function Get-DeltaArrDetectionResult {
 function Get-DeltaIisSiteHostHeader {
     <#
       Reads the host header off $Site's own first binding
-      (bindingInformation, e.g. "*:80:delta.example.org" -> the third
+      (BindingInformation, e.g. "*:80:delta.example.org" -> the third
       colon-delimited segment) - the actual, already-configured value,
-      never re-prompted. Returns $null (never throws) if the site has no
-      binding, or a binding with an empty host header segment (e.g.
-      "*:80:") - reported as "Unknown" by callers, the same shape
-      Get-DeltaNginxVHostSummary's own $result.ServerName uses in
-      setup-nginx.ps1 for a vhost file that doesn't match its expected
-      shape.
+      never re-prompted. $Site's own Bindings collection is read directly
+      (it is already a live part of the same in-memory ServerManager tree
+      $Site itself came from - no second fetch needed, unlike
+      WebAdministration's Get-WebBinding, which had to re-query by name).
+      Returns $null (never throws) if the site has no binding, or a
+      binding with an empty host header segment (e.g. "*:80:") - reported
+      as "Unknown" by callers, the same shape Get-DeltaNginxVHostSummary's
+      own $result.ServerName uses in setup-nginx.ps1 for a vhost file that
+      doesn't match its expected shape.
     #>
     param([Parameter(Mandatory)]$Site)
 
-    try {
-        $binding = Get-WebBinding -Name $Site.Name -ErrorAction Stop | Select-Object -First 1
-    }
-    catch {
+    $binding = $Site.Bindings | Select-Object -First 1
+    if (-not $binding -or -not $binding.BindingInformation) {
         return $null
     }
 
-    if (-not $binding -or -not $binding.bindingInformation) {
-        return $null
-    }
-
-    $bindingParts = $binding.bindingInformation -split ':'
+    $bindingParts = $binding.BindingInformation -split ':'
     if ($bindingParts.Count -ge 3 -and $bindingParts[2]) {
         return $bindingParts[2]
     }
@@ -745,14 +1078,17 @@ function Get-DeltaIisManagedWebsiteResult {
       analogue of setup-nginx.ps1's own Get-DeltaNginxManagedProcesses
       (which matches by executable path, never by process name alone).
       Primary signal: a site named exactly $Script:DeltaIisSiteName exists
-      at all (Get-Website). Secondary, defense-in-depth signal: that
-      site's own PhysicalPath matches the DELTA installation path already
-      resolved ($Script:DeltaInstallPath). PhysicalPath is compared after
-      expanding any environment-variable tokens IIS may have stored it
-      with (confirmed directly: IIS's own Default Web Site stores
-      "%SystemDrive%\inetpub\wwwroot" unexpanded) and trimming a trailing
-      backslash, so formatting differences alone never cause a false
-      negative.
+      at all (Get-DeltaIisSiteByName, against a fresh ServerManager - never
+      cached, per this file's own "Microsoft.Web.Administration - site/
+      binding/application-pool primitives" section header). Secondary,
+      defense-in-depth signal: that site's own physical path
+      (Get-DeltaIisSitePhysicalPath) matches the DELTA installation path
+      already resolved ($Script:DeltaInstallPath). Physical path is
+      compared after expanding any environment-variable tokens IIS may
+      have stored it with (confirmed directly: IIS's own Default Web Site
+      stores "%SystemDrive%\inetpub\wwwroot" unexpanded) and trimming a
+      trailing backslash, so formatting differences alone never cause a
+      false negative.
 
       A name collision with something an administrator happened to
       independently name "DELTA" is unlikely but not impossible, and this
@@ -764,18 +1100,14 @@ function Get-DeltaIisManagedWebsiteResult {
       found").
     #>
 
-    try {
-        $siteByName = Get-Website -Name $Script:DeltaIisSiteName -ErrorAction Stop
-    }
-    catch {
-        $siteByName = $null
-    }
+    $serverManager = Get-DeltaIisServerManager
+    $siteByName = Get-DeltaIisSiteByName -ServerManager $serverManager -Name $Script:DeltaIisSiteName
 
     if (-not $siteByName) {
         return [PSCustomObject]@{ ManagedSite = $null; CollidingSite = $null }
     }
 
-    $expandedPhysicalPath = [System.Environment]::ExpandEnvironmentVariables($siteByName.physicalPath).TrimEnd('\')
+    $expandedPhysicalPath = [System.Environment]::ExpandEnvironmentVariables((Get-DeltaIisSitePhysicalPath -Site $siteByName)).TrimEnd('\')
     $expectedInstallPath  = $Script:DeltaInstallPath.TrimEnd('\')
 
     if ($expandedPhysicalPath -eq $expectedInstallPath) {
@@ -802,7 +1134,7 @@ function Get-DeltaIisSiteBackendPort {
     #>
     param([Parameter(Mandatory)]$Site)
 
-    $webConfigPath = Join-Path -Path $Site.physicalPath -ChildPath 'web.config'
+    $webConfigPath = Join-Path -Path (Get-DeltaIisSitePhysicalPath -Site $Site) -ChildPath 'web.config'
     if (-not (Test-Path -LiteralPath $webConfigPath)) {
         return $null
     }
@@ -830,18 +1162,24 @@ function Get-DeltaIisExistingHttpsCertificateState {
       "genuinely existing."
 
       Returns $null if there is no HTTPS binding at all. Otherwise a
-      [PSCustomObject]: Binding (the raw Get-WebBinding result),
-      Thumbprint (from the binding's own certificateHash - may be
-      $null/empty), CertificateExists (bool, true only once both halves
-      agree).
+      [PSCustomObject]: Binding (the raw Microsoft.Web.Administration
+      Binding), Thumbprint (via Get-DeltaIisBindingCertificateThumbprint -
+      may be $null/empty), CertificateExists (bool, true only once both
+      halves agree).
     #>
 
-    $httpsBinding = Get-WebBinding -Name $Script:DeltaIisSiteName -Protocol 'https' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $serverManager = Get-DeltaIisServerManager
+    $site = Get-DeltaIisSiteByName -ServerManager $serverManager -Name $Script:DeltaIisSiteName
+    if (-not $site) {
+        return $null
+    }
+
+    $httpsBinding = Get-DeltaIisSiteBindingByProtocolAndPort -Site $site -Protocol 'https'
     if (-not $httpsBinding) {
         return $null
     }
 
-    $thumbprint = $httpsBinding.certificateHash
+    $thumbprint = Get-DeltaIisBindingCertificateThumbprint -Binding $httpsBinding
     $certificateExists = $false
     if ($thumbprint) {
         $certificateExists = [bool](Get-Item -LiteralPath "Cert:\LocalMachine\My\$thumbprint" -ErrorAction SilentlyContinue)
@@ -872,78 +1210,64 @@ function Get-DeltaIisExistingHttpsCertificateState {
 # other settings an administrator added by hand) is left completely
 # untouched.
 
-function Get-DeltaIisAppPoolAttributeValue {
-    <#
-      A single scalar Application Pool attribute, read via the IIS:\
-      provider (Get-ItemProperty "IIS:\AppPools\<name>" -Name <attr>), can
-      come back two different shapes depending on the attribute's own IIS
-      schema type - confirmed directly against a real machine: string-
-      enum-backed attributes like managedPipelineMode come back as a
-      plain System.String, while managedRuntimeVersion/autoStart come
-      back wrapped in a Microsoft.IIs.PowerShell.Framework.ConfigurationAttribute
-      object whose actual value is under its own .Value property. Rather
-      than hardcode which attributes need unwrapping (fragile if a future
-      caller reads a different attribute this project hasn't tested yet),
-      this checks for a .Value property generically and falls back to the
-      raw result otherwise - the same defensive shape
-      Get-RegistryPropertyValue already uses for the analogous "sometimes
-      wrapped, sometimes not" problem with registry results.
-    #>
-    param([Parameter(Mandatory)][AllowNull()]$Result)
-
-    if ($null -eq $Result) {
-        return $null
-    }
-
-    $valueProperty = $Result.PSObject.Properties['Value']
-    if ($valueProperty) {
-        return $valueProperty.Value
-    }
-
-    return $Result
-}
-
 function Confirm-DeltaIisAppPool {
     <#
       Creates the dedicated DELTA application pool if it does not already
       exist, or reconciles just the three settings this installer owns
-      (managedRuntimeVersion/managedPipelineMode/autoStart) if it does -
-      never recreated. "No Managed Code" (an empty managedRuntimeVersion)
+      (ManagedRuntimeVersion/ManagedPipelineMode/AutoStart) if it does -
+      never recreated. "No Managed Code" (an empty ManagedRuntimeVersion)
       is correct here since this pool only ever proxies to the Node.js
       backend via ARR, never runs managed application code itself -
       mirroring setup-nginx.ps1's own equivalent reasoning for why NGINX
       needs no application-level runtime of its own either.
+
+      Unlike the IIS:\ provider's Get-ItemProperty (which could return
+      either a plain value or a wrapped ConfigurationAttribute depending
+      on the attribute's own schema type - see this project's own history
+      for the unwrap helper that used to exist here), Microsoft.Web.
+      Administration's ApplicationPool exposes these three settings as
+      plain, strongly-typed properties - no unwrapping needed. A single
+      ServerManager is used for both the create-if-missing step and the
+      attribute reconciliation, and CommitChanges is only called once, at
+      the end, and only if something actually changed - never
+      unconditionally.
     #>
 
     Write-Step "Configuring application pool '$($Script:DeltaIisAppPoolName)'..."
 
-    $appPoolPath = "IIS:\AppPools\$($Script:DeltaIisAppPoolName)"
+    $serverManager = Get-DeltaIisServerManager
+    $pool = Get-DeltaIisApplicationPoolByName -ServerManager $serverManager -Name $Script:DeltaIisAppPoolName
+    $changed = $false
 
-    if (-not (Test-Path -LiteralPath $appPoolPath)) {
-        New-WebAppPool -Name $Script:DeltaIisAppPoolName | Out-Null
+    if (-not $pool) {
+        $pool = New-DeltaIisApplicationPool -ServerManager $serverManager -Name $Script:DeltaIisAppPoolName
         Write-Detail "Created: $($Script:DeltaIisAppPoolName)"
+        $changed = $true
     }
     else {
         Write-Detail "Already exists: $($Script:DeltaIisAppPoolName)"
     }
 
-    # Ordered so console output (when something needs correcting) always
-    # reports in the same sequence run to run, rather than whatever order
-    # a hashtable happens to enumerate in.
-    $desiredSettings = [ordered]@{
-        managedRuntimeVersion = ''
-        managedPipelineMode   = 'Integrated'
-        autoStart             = $true
+    if ($pool.ManagedRuntimeVersion -ne '') {
+        $pool.ManagedRuntimeVersion = ''
+        Write-Detail "Updated managedRuntimeVersion -> ''"
+        $changed = $true
     }
 
-    foreach ($settingName in $desiredSettings.Keys) {
-        $desiredValue = $desiredSettings[$settingName]
-        $currentValue = Get-DeltaIisAppPoolAttributeValue -Result (Get-ItemProperty -Path $appPoolPath -Name $settingName)
+    if ($pool.ManagedPipelineMode -ne [Microsoft.Web.Administration.ManagedPipelineMode]::Integrated) {
+        $pool.ManagedPipelineMode = [Microsoft.Web.Administration.ManagedPipelineMode]::Integrated
+        Write-Detail "Updated managedPipelineMode -> 'Integrated'"
+        $changed = $true
+    }
 
-        if ("$currentValue" -ne "$desiredValue") {
-            Set-ItemProperty -Path $appPoolPath -Name $settingName -Value $desiredValue
-            Write-Detail "Updated $settingName -> '$desiredValue'"
-        }
+    if (-not $pool.AutoStart) {
+        $pool.AutoStart = $true
+        Write-Detail "Updated autoStart -> 'True'"
+        $changed = $true
+    }
+
+    if ($changed) {
+        Save-DeltaIisConfiguration -ServerManager $serverManager -SectionName 'ApplicationPools' -PropertyDescription "application pool '$($Script:DeltaIisAppPoolName)'"
     }
 
     Write-Success '    Application pool configured.'
@@ -989,81 +1313,124 @@ function New-DeltaIisWebConfig {
 function Confirm-DeltaIisWebsiteBinding {
     <#
       Creates or updates ONLY this installer's own single HTTP binding on
-      port 80 for $SiteName - matched by protocol and port (the fixed
-      values this installer always uses), never by replacing the site's
-      entire bindings collection. Confirmed directly (a throwaway test
-      site with a second, unrelated binding added alongside this
-      installer's own) that Set-WebBinding -BindingInformation <old>
-      -PropertyName bindingInformation -Value <new> updates exactly the
-      one matched binding object and leaves every other binding on the
-      site completely untouched.
+      port 80 for $Site - matched by protocol and port (the fixed values
+      this installer always uses), never by replacing the site's entire
+      bindings collection. Confirmed directly (a throwaway test site with
+      a second, unrelated binding added alongside this installer's own)
+      that updating just the matched Binding object's own
+      BindingInformation property leaves every other binding on the site
+      completely untouched - the direct Microsoft.Web.Administration
+      equivalent of the WebAdministration-era Set-WebBinding
+      -PropertyName bindingInformation call this replaces.
+
+      Takes $ServerManager and the live $Site object explicitly (both from
+      the SAME ServerManager instance the caller - Confirm-DeltaIisWebsite
+      - is already using for its own single repair-pass commit) rather
+      than resolving its own: this function has no external callers
+      outside this file, so its signature is free to reflect that shared-
+      transaction shape directly. Does not itself call CommitChanges - the
+      caller commits once, after every change in the same pass.
 
       Only ever called for an EXISTING managed site (Confirm-DeltaIisWebsite
       below) - a fresh site's own initial binding is already created
-      correctly by New-Website's own -Port/-HostHeader parameters in one
-      step, so calling this again immediately afterward would be
+      correctly by New-DeltaIisSite's own -Port/-HostHeader parameters in
+      one step, so calling this again immediately afterward would be
       redundant, not incorrect, but is skipped anyway for clarity.
+
+      Returns $true if the binding was created or updated, $false if it
+      was already correct - so the caller (Confirm-DeltaIisWebsite) knows
+      whether its own single CommitChanges at the end of the repair pass
+      is actually needed, without having to independently re-derive
+      "did anything change" itself.
     #>
     param(
-        [Parameter(Mandatory)][string]$SiteName,
+        [Parameter(Mandatory)]$ServerManager,
+        [Parameter(Mandatory)]$Site,
         [Parameter(Mandatory)][string]$Domain
     )
 
     $desiredBindingInformation = "*:80:$Domain"
-    $existingBinding = Get-WebBinding -Name $SiteName -Protocol 'http' -ErrorAction SilentlyContinue |
-        Where-Object { $_.bindingInformation -match '^\*:80:' } | Select-Object -First 1
+    $existingBinding = Get-DeltaIisSiteBindingByProtocolAndPort -Site $Site -Protocol 'http' -Port 80
 
     if (-not $existingBinding) {
-        New-WebBinding -Name $SiteName -Protocol 'http' -Port 80 -HostHeader $Domain | Out-Null
+        $Site.Bindings.Add($desiredBindingInformation, 'http') | Out-Null
         Write-Detail "Binding created: $desiredBindingInformation"
-        return
+        return $true
     }
 
-    if ($existingBinding.bindingInformation -ne $desiredBindingInformation) {
-        Set-WebBinding -Name $SiteName -BindingInformation $existingBinding.bindingInformation -PropertyName 'bindingInformation' -Value $desiredBindingInformation | Out-Null
-        Write-Detail "Binding updated: $($existingBinding.bindingInformation) -> $desiredBindingInformation"
+    if ($existingBinding.BindingInformation -ne $desiredBindingInformation) {
+        $existingBinding.BindingInformation = $desiredBindingInformation
+        Write-Detail "Binding updated: $($existingBinding.BindingInformation) -> $desiredBindingInformation"
+        return $true
     }
-    else {
-        Write-Detail "Binding already correct: $desiredBindingInformation"
-    }
+
+    Write-Detail "Binding already correct: $desiredBindingInformation"
+    return $false
 }
 
 function Confirm-DeltaIisWebsite {
     <#
-      The one place this file ever calls New-Website, and only when
+      The one place this file ever calls New-DeltaIisSite, and only when
       $ManagedSite is $null (Get-DeltaIisManagedWebsiteResult found
       nothing genuinely ours). An existing managed site has its
       Application Pool association and its own single HTTP binding
       reconciled - never recreated, and no other site setting is ever
       touched.
+
+      $ManagedSite (as passed in by the caller, Repair-DeltaIisManagedWebsite)
+      is used ONLY as a truthy "does a site already exist" signal - it is
+      never itself read from or mutated, since it was resolved against a
+      DIFFERENT, by-now-possibly-stale ServerManager instance (whatever
+      Get-DeltaIisManagedWebsiteResult used when the caller first checked).
+      This function opens its own single fresh ServerManager for the
+      entire repair pass, re-resolves the site by name inside it when one
+      already exists, performs every mutation (application pool
+      association, binding) against that one instance, and commits once at
+      the end - never mixing objects from two different ServerManager
+      instances, per this file's own "site/binding/application-pool
+      primitives" section header.
     #>
     param([Parameter(Mandatory)][AllowNull()]$ManagedSite)
 
     Write-Step "Configuring website '$($Script:DeltaIisSiteName)'..."
 
+    $serverManager = Get-DeltaIisServerManager
+
     if (-not $ManagedSite) {
-        New-Website -Name $Script:DeltaIisSiteName -PhysicalPath $Script:DeltaInstallPath `
-            -ApplicationPool $Script:DeltaIisAppPoolName -Port 80 -HostHeader $Script:DeltaWebsiteDomain | Out-Null
+        New-DeltaIisSite -ServerManager $serverManager -Name $Script:DeltaIisSiteName -PhysicalPath $Script:DeltaInstallPath `
+            -Port 80 -HostHeader $Script:DeltaWebsiteDomain -ApplicationPoolName $Script:DeltaIisAppPoolName | Out-Null
+        Save-DeltaIisConfiguration -ServerManager $serverManager -SectionName 'Sites' -PropertyDescription "create site '$($Script:DeltaIisSiteName)'"
         Write-Detail "Created: $($Script:DeltaIisSiteName)"
         return
     }
 
     Write-Detail "Already exists: $($Script:DeltaIisSiteName)"
 
-    if ($ManagedSite.applicationPool -ne $Script:DeltaIisAppPoolName) {
-        Set-ItemProperty -Path "IIS:\Sites\$($Script:DeltaIisSiteName)" -Name applicationPool -Value $Script:DeltaIisAppPoolName
+    $site = Get-DeltaIisSiteByName -ServerManager $serverManager -Name $Script:DeltaIisSiteName
+    $changed = $false
+
+    if ((Get-DeltaIisSiteApplicationPoolName -Site $site) -ne $Script:DeltaIisAppPoolName) {
+        Set-DeltaIisSiteApplicationPoolName -Site $site -Name $Script:DeltaIisAppPoolName
         Write-Detail "Application pool association updated -> $($Script:DeltaIisAppPoolName)"
+        $changed = $true
     }
 
-    Confirm-DeltaIisWebsiteBinding -SiteName $Script:DeltaIisSiteName -Domain $Script:DeltaWebsiteDomain
+    $bindingChanged = Confirm-DeltaIisWebsiteBinding -ServerManager $serverManager -Site $site -Domain $Script:DeltaWebsiteDomain
+    $changed = $changed -or $bindingChanged
+
+    if ($changed) {
+        Save-DeltaIisConfiguration -ServerManager $serverManager -SectionName 'Sites' -PropertyDescription "reconcile site '$($Script:DeltaIisSiteName)'"
+    }
 }
 
 function Confirm-DeltaIisWebsiteConfigurationResult {
     <#
-      Never trusts New-WebAppPool/New-Website/Set-WebBinding's own lack of
-      a thrown error as proof of anything; re-reads IIS from scratch via a
-      fresh Get-Website call and independently checks every fact this
-      repair claims to have configured. Collects every failure at once
+      Never trusts Confirm-DeltaIisAppPool/Confirm-DeltaIisWebsite's own
+      lack of a thrown error as proof of anything; re-reads IIS from
+      scratch via a brand new ServerManager (never the one Confirm-
+      DeltaIisWebsite itself just committed through) and independently
+      checks every fact this repair claims to have configured. Collects
+      every failure at once
       rather than stopping at the first, the same shape
       Test-DeltaNginxStartupHealth already uses in setup-nginx.ps1, so a
       failed configuration is explained completely rather than with just
@@ -1088,24 +1455,27 @@ function Confirm-DeltaIisWebsiteConfigurationResult {
 
     Write-Step 'Verifying website configuration...'
 
-    $site = Get-Website -Name $Script:DeltaIisSiteName -ErrorAction SilentlyContinue
+    $serverManager = Get-DeltaIisServerManager
+    $site = Get-DeltaIisSiteByName -ServerManager $serverManager -Name $Script:DeltaIisSiteName
     if (-not $site) {
         Stop-Setup "Verification failed: website '$($Script:DeltaIisSiteName)' does not exist after configuration."
     }
 
     $failures = [System.Collections.Generic.List[string]]::new()
 
-    if (-not (Test-Path -LiteralPath "IIS:\AppPools\$($Script:DeltaIisAppPoolName)")) {
+    if (-not (Get-DeltaIisApplicationPoolByName -ServerManager $serverManager -Name $Script:DeltaIisAppPoolName)) {
         $failures.Add("Application pool '$($Script:DeltaIisAppPoolName)' does not exist.")
     }
 
-    $expandedPhysicalPath = [System.Environment]::ExpandEnvironmentVariables($site.physicalPath).TrimEnd('\')
+    $sitePhysicalPath = Get-DeltaIisSitePhysicalPath -Site $site
+    $expandedPhysicalPath = [System.Environment]::ExpandEnvironmentVariables($sitePhysicalPath).TrimEnd('\')
     if ($expandedPhysicalPath -ne $Script:DeltaInstallPath.TrimEnd('\')) {
-        $failures.Add("Physical path is '$($site.physicalPath)', expected '$($Script:DeltaInstallPath)'.")
+        $failures.Add("Physical path is '$sitePhysicalPath', expected '$($Script:DeltaInstallPath)'.")
     }
 
-    if ($site.applicationPool -ne $Script:DeltaIisAppPoolName) {
-        $failures.Add("Application pool is '$($site.applicationPool)', expected '$($Script:DeltaIisAppPoolName)'.")
+    $siteApplicationPoolName = Get-DeltaIisSiteApplicationPoolName -Site $site
+    if ($siteApplicationPoolName -ne $Script:DeltaIisAppPoolName) {
+        $failures.Add("Application pool is '$siteApplicationPoolName', expected '$($Script:DeltaIisAppPoolName)'.")
     }
 
     $webConfigPath = Join-Path -Path $Script:DeltaInstallPath -ChildPath 'web.config'
@@ -1230,14 +1600,14 @@ function Start-DeltaIisManagedWebsite {
         return
     }
 
-    if ($websiteResult.ManagedSite.state -eq 'Started') {
+    if ((Get-DeltaIisSiteState -Site $websiteResult.ManagedSite) -eq 'Started') {
         Write-Host ''
         Write-Detail 'The website is already running.'
         return
     }
 
     Write-Step 'Starting the website...'
-    Start-Website -Name $websiteResult.ManagedSite.name
+    Start-DeltaIisSite -Site $websiteResult.ManagedSite
     Write-Success '    Website started.'
 }
 
@@ -1246,7 +1616,7 @@ function Stop-DeltaIisManagedWebsite {
       The direct counterpart to Start-DeltaIisManagedWebsite, above - see
       that function's own header for the full rationale (promotion,
       ownership hardening, shared use). Stops ONLY the DELTA-managed
-      website via Stop-Website -Name <site> - never Stop-Service W3SVC,
+      website via Stop-DeltaIisSite - never Stop-Service W3SVC,
       never IIS Management, never ARR/URL Rewrite, and never any other
       site on the box. This is the exact function the Manual Reverse
       Proxy Handover feature's own setup-nginx.ps1 side calls when the
@@ -1260,14 +1630,14 @@ function Stop-DeltaIisManagedWebsite {
         return
     }
 
-    if ($websiteResult.ManagedSite.state -eq 'Stopped') {
+    if ((Get-DeltaIisSiteState -Site $websiteResult.ManagedSite) -eq 'Stopped') {
         Write-Host ''
         Write-Detail 'The website is already stopped.'
         return
     }
 
     Write-Step 'Stopping the website...'
-    Stop-Website -Name $websiteResult.ManagedSite.name
+    Stop-DeltaIisSite -Site $websiteResult.ManagedSite
     Write-Success '    Website stopped.'
 }
 
@@ -1325,7 +1695,7 @@ function Get-DeltaIisRequiredPorts {
 # Planning only - nothing here stops anything. Get-DeltaIisReverseProxyHandoverPlan
 # returns a plain data object describing what WOULD need to happen and
 # whether doing so automatically is even safe; Invoke-DeltaIisReverseProxyHandoverPlan
-# (the one function here that actually calls Stop-Website) only ever runs
+# (the one function here that actually stops a site) only ever runs
 # when a provisioning script's own Invoke-DeltaReverseProxyHandover
 # (lib\DeltaInstaller.Common.ps1) has already shown the plan to the
 # administrator and received explicit confirmation - this file never
@@ -1334,20 +1704,22 @@ function Get-DeltaIisRequiredPorts {
 function Get-DeltaIisSiteBoundPorts {
     <#
       Every port $Site is bound to, parsed from its own live
-      bindingInformation (e.g. "*:80:delta.example.org" -> 80) - the
+      BindingInformation (e.g. "*:80:delta.example.org" -> 80) - the
       second colon-delimited segment, mirroring
       Get-DeltaIisSiteHostHeader's own parsing of the third. Protocol-
       agnostic (an http OR https binding on a given port both count) -
       the handover plan cares only about which ports are reserved, not
-      which scheme reserved them. Returns a real, possibly-empty [int[]]
-      array, never $null.
+      which scheme reserved them. Reads $Site's own Bindings collection
+      directly (already live, part of the same ServerManager tree $Site
+      itself came from). Returns a real, possibly-empty [int[]] array,
+      never $null.
     #>
     param([Parameter(Mandatory)]$Site)
 
     $ports = [System.Collections.Generic.List[int]]::new()
-    foreach ($binding in @(Get-WebBinding -Name $Site.name -ErrorAction SilentlyContinue)) {
-        if (-not $binding.bindingInformation) { continue }
-        $parts = $binding.bindingInformation -split ':'
+    foreach ($binding in $Site.Bindings) {
+        if (-not $binding.BindingInformation) { continue }
+        $parts = $binding.BindingInformation -split ':'
         if ($parts.Count -ge 2) {
             $parsedPort = 0
             if ([int]::TryParse($parts[1], [ref]$parsedPort)) {
@@ -1383,11 +1755,11 @@ function Test-DeltaIisStockDefaultWebSite {
     #>
     param([Parameter(Mandatory)]$Site)
 
-    if ($Site.name -ne 'Default Web Site') {
+    if ($Site.Name -ne 'Default Web Site') {
         return $false
     }
 
-    $expandedPhysicalPath = [System.Environment]::ExpandEnvironmentVariables($Site.physicalPath).TrimEnd('\')
+    $expandedPhysicalPath = [System.Environment]::ExpandEnvironmentVariables((Get-DeltaIisSitePhysicalPath -Site $Site)).TrimEnd('\')
     $stockPhysicalPath = [System.Environment]::ExpandEnvironmentVariables('%SystemDrive%\inetpub\wwwroot').TrimEnd('\')
 
     return $expandedPhysicalPath -eq $stockPhysicalPath
@@ -1414,7 +1786,7 @@ function Get-DeltaIisPortBindingOwnership {
       attributed to PID 4 ("System") by Windows, which resolves to no
       Win32_Service entry at all, so a `ServiceName -eq 'W3SVC'` check can
       never actually match on a real machine. IIS's own binding
-      configuration (Get-WebBinding, via Get-DeltaIisSiteBoundPorts) is
+      configuration (read via Get-DeltaIisSiteBoundPorts) is
       the only authoritative source for "does IIS itself already own this
       port," regardless of which PID or process name the OS attributes
       the underlying kernel-mode listener to.
@@ -1452,6 +1824,7 @@ function Get-DeltaIisPortBindingOwnership {
     param([Parameter(Mandatory)][int]$Port)
 
     $websiteResult = Get-DeltaIisManagedWebsiteResult
+    $serverManager = Get-DeltaIisServerManager
 
     # Get-DeltaIisSiteBoundPorts's own return already crosses its own
     # comma-protected return boundary correctly shaped (see that
@@ -1461,8 +1834,8 @@ function Get-DeltaIisPortBindingOwnership {
     # single element of a new 1-element array (`[ [80, 443] ]`, not
     # `[80, 443]`), so `-contains $Port` could never match. Called
     # directly, with no extra @() at this call site.
-    $occupyingSites = @(Get-Website | Where-Object {
-        $_.state -eq 'Started' -and ((Get-DeltaIisSiteBoundPorts -Site $_) -contains $Port)
+    $occupyingSites = @((Get-DeltaIisAllSites -ServerManager $serverManager) | Where-Object {
+        (Get-DeltaIisSiteState -Site $_) -eq 'Started' -and ((Get-DeltaIisSiteBoundPorts -Site $_) -contains $Port)
     })
 
     if ($occupyingSites.Count -eq 0) {
@@ -1471,25 +1844,25 @@ function Get-DeltaIisPortBindingOwnership {
 
     $isSafeSite = {
         param($Site)
-        ($websiteResult.ManagedSite -and $Site.name -eq $websiteResult.ManagedSite.name) -or (Test-DeltaIisStockDefaultWebSite -Site $Site)
+        ($websiteResult.ManagedSite -and $Site.Name -eq $websiteResult.ManagedSite.Name) -or (Test-DeltaIisStockDefaultWebSite -Site $Site)
     }
 
     $unsafeSite = $occupyingSites | Where-Object { -not (& $isSafeSite $_) } | Select-Object -First 1
     if ($unsafeSite) {
-        return [PSCustomObject]@{ SiteName = $unsafeSite.name; Classification = 'Other' }
+        return [PSCustomObject]@{ SiteName = $unsafeSite.Name; Classification = 'Other' }
     }
 
     # Every occupant is safe - prefer naming the DELTA site itself when
     # it's one of them (the more useful diagnostic identity), falling
     # back to whichever verified stock Default Web Site occupant matched
     # otherwise.
-    $deltaSite = $occupyingSites | Where-Object { $websiteResult.ManagedSite -and $_.name -eq $websiteResult.ManagedSite.name } | Select-Object -First 1
+    $deltaSite = $occupyingSites | Where-Object { $websiteResult.ManagedSite -and $_.Name -eq $websiteResult.ManagedSite.Name } | Select-Object -First 1
     if ($deltaSite) {
-        return [PSCustomObject]@{ SiteName = $deltaSite.name; Classification = 'Delta' }
+        return [PSCustomObject]@{ SiteName = $deltaSite.Name; Classification = 'Delta' }
     }
 
     $defaultSite = $occupyingSites | Select-Object -First 1
-    return [PSCustomObject]@{ SiteName = $defaultSite.name; Classification = 'DefaultWebSite' }
+    return [PSCustomObject]@{ SiteName = $defaultSite.Name; Classification = 'DefaultWebSite' }
 }
 
 function Get-DeltaIisReverseProxyHandoverPlan {
@@ -1527,7 +1900,7 @@ function Get-DeltaIisReverseProxyHandoverPlan {
 
       Execute carries a scriptblock reference to
       Invoke-DeltaIisReverseProxyHandoverPlan (this file, below) - the
-      only function that actually calls Stop-Website - so a caller
+      only function that actually stops a site - so a caller
       (Invoke-DeltaReverseProxyHandover, lib\DeltaInstaller.Common.ps1)
       can carry out an already-confirmed plan without needing any
       IIS-specific knowledge of its own.
@@ -1535,23 +1908,24 @@ function Get-DeltaIisReverseProxyHandoverPlan {
     param([Parameter(Mandatory)][int[]]$RequiredPorts)
 
     $websiteResult = Get-DeltaIisManagedWebsiteResult
+    $serverManager = Get-DeltaIisServerManager
 
-    $occupyingSites = @(Get-Website | Where-Object {
+    $occupyingSites = @((Get-DeltaIisAllSites -ServerManager $serverManager) | Where-Object {
         $boundPorts    = Get-DeltaIisSiteBoundPorts -Site $_
         $matchingPorts = @($boundPorts | Where-Object { $RequiredPorts -contains $_ })
-        $_.state -eq 'Started' -and $matchingPorts.Count -gt 0
+        (Get-DeltaIisSiteState -Site $_) -eq 'Started' -and $matchingPorts.Count -gt 0
     })
 
     $safeSiteNames   = [System.Collections.Generic.List[string]]::new()
     $unsafeSiteNames = [System.Collections.Generic.List[string]]::new()
 
     foreach ($site in $occupyingSites) {
-        $isDeltaManaged = $websiteResult.ManagedSite -and ($site.name -eq $websiteResult.ManagedSite.name)
+        $isDeltaManaged = $websiteResult.ManagedSite -and ($site.Name -eq $websiteResult.ManagedSite.Name)
         if ($isDeltaManaged -or (Test-DeltaIisStockDefaultWebSite -Site $site)) {
-            $safeSiteNames.Add($site.name)
+            $safeSiteNames.Add($site.Name)
         }
         else {
-            $unsafeSiteNames.Add($site.name)
+            $unsafeSiteNames.Add($site.Name)
         }
     }
 
@@ -1597,17 +1971,22 @@ function Invoke-DeltaIisReverseProxyHandoverPlan {
     param([Parameter(Mandatory)][PSCustomObject]$Plan)
 
     foreach ($siteName in $Plan.SiteNames) {
-        $site = Get-Website -Name $siteName -ErrorAction SilentlyContinue
+        # A fresh ServerManager per site - state can genuinely change
+        # between planning and execution, and between one site in this
+        # same loop and the next, so each iteration re-resolves rather
+        # than trusting an earlier snapshot.
+        $serverManager = Get-DeltaIisServerManager
+        $site = Get-DeltaIisSiteByName -ServerManager $serverManager -Name $siteName
         if (-not $site) {
             continue
         }
-        if ($site.state -eq 'Stopped') {
+        if ((Get-DeltaIisSiteState -Site $site) -eq 'Stopped') {
             Write-Host ''
             Write-Detail "Website '$siteName' is already stopped."
             continue
         }
         Write-Step "Stopping website '$siteName'..."
-        Stop-Website -Name $siteName
+        Stop-DeltaIisSite -Site $site
         Write-Success "    Website '$siteName' stopped."
     }
 }
@@ -1776,28 +2155,28 @@ function Get-DeltaDoctorWebsiteChecks {
       Repair-DeltaIisManagedWebsite genuinely cannot act on safely: the
       fixed site name already belongs to an unrelated website (a real
       collision, never silently touched - see
-      Get-DeltaIisManagedWebsiteResult's own header), or WebAdministration
-      itself isn't available (IIS installation is not this function's job
-      to fix). $NeedsRepair is true whenever at least one Error-severity
-      check below actually failed - HTTPS state is always Warning-severity
-      (see Get-DeltaIisExistingHttpsCertificateState's own header for why
-      an orphaned certificate is reported, not auto-replaced: doing so
-      needs a certificate file the Doctor is never handed).
+      Get-DeltaIisManagedWebsiteResult's own header), or
+      Microsoft.Web.Administration itself isn't available (IIS
+      installation is not this function's job to fix). $NeedsRepair is
+      true whenever at least one Error-severity check below actually
+      failed - HTTPS state is always Warning-severity (see
+      Get-DeltaIisExistingHttpsCertificateState's own header for why an
+      orphaned certificate is reported, not auto-replaced: doing so needs
+      a certificate file the Doctor is never handed).
     #>
     param([Parameter(Mandatory)][int]$ExpectedBackendPort)
 
     $checks = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-    if (-not (Test-DeltaWebAdministrationModuleAvailable)) {
-        $checks.Add((New-DeltaDoctorCheck -Label 'Website exists.' -Passed $false -Detail 'The WebAdministration PowerShell module is unavailable. Run setup-iis.ps1 to install IIS first.'))
+    if (-not (Test-DeltaIisManagementAssemblyAvailable)) {
+        $checks.Add((New-DeltaDoctorCheck -Label 'Website exists.' -Passed $false -Detail 'Microsoft.Web.Administration is unavailable. Run setup-iis.ps1 to install IIS first.'))
         return [PSCustomObject]@{ ManagedSite = $null; CanRepair = $false; NeedsRepair = $false; Checks = $checks }
     }
-    Import-Module WebAdministration -ErrorAction Stop
 
     $websiteResult = Get-DeltaIisManagedWebsiteResult
 
     if ($websiteResult.CollidingSite) {
-        $checks.Add((New-DeltaDoctorCheck -Label 'Website exists.' -Passed $false -Detail "A website named '$($Script:DeltaIisSiteName)' already exists, but its physical path ($($websiteResult.CollidingSite.physicalPath)) does not match this DELTA installation. Resolve this by hand before re-running the Doctor."))
+        $checks.Add((New-DeltaDoctorCheck -Label 'Website exists.' -Passed $false -Detail "A website named '$($Script:DeltaIisSiteName)' already exists, but its physical path ($(Get-DeltaIisSitePhysicalPath -Site $websiteResult.CollidingSite)) does not match this DELTA installation. Resolve this by hand before re-running the Doctor."))
         return [PSCustomObject]@{ ManagedSite = $null; CanRepair = $false; NeedsRepair = $false; Checks = $checks }
     }
 
@@ -1808,11 +2187,11 @@ function Get-DeltaDoctorWebsiteChecks {
         return [PSCustomObject]@{ ManagedSite = $null; CanRepair = $true; NeedsRepair = $true; Checks = $checks }
     }
 
-    $appPoolExists = Test-Path -LiteralPath "IIS:\AppPools\$($site.applicationPool)"
+    $serverManager = Get-DeltaIisServerManager
+    $appPoolExists = [bool](Get-DeltaIisApplicationPoolByName -ServerManager $serverManager -Name (Get-DeltaIisSiteApplicationPoolName -Site $site))
     $checks.Add((New-DeltaDoctorCheck -Label 'Application Pool exists.' -Passed $appPoolExists))
 
-    $httpBinding = Get-WebBinding -Name $site.name -Protocol 'http' -ErrorAction SilentlyContinue |
-        Where-Object { $_.bindingInformation -match '^\*:80:' } | Select-Object -First 1
+    $httpBinding = Get-DeltaIisSiteBindingByProtocolAndPort -Site $site -Protocol 'http' -Port 80
     $checks.Add((New-DeltaDoctorCheck -Label 'HTTP binding.' -Passed ([bool]$httpBinding)))
 
     $httpsState = Get-DeltaIisExistingHttpsCertificateState
@@ -1826,7 +2205,7 @@ function Get-DeltaDoctorWebsiteChecks {
         $checks.Add((New-DeltaDoctorCheck -Label 'HTTPS binding.' -Passed $false -Severity 'Warning' -Detail "The certificate for thumbprint '$($httpsState.Thumbprint)' is no longer present in the certificate store. Run setup-iis.ps1 to reconfigure SSL."))
     }
 
-    $webConfigPath = Join-Path -Path $site.physicalPath -ChildPath 'web.config'
+    $webConfigPath = Join-Path -Path (Get-DeltaIisSitePhysicalPath -Site $site) -ChildPath 'web.config'
     $webConfigExists = Test-Path -LiteralPath $webConfigPath
     $checks.Add((New-DeltaDoctorCheck -Label 'web.config exists.' -Passed $webConfigExists -Detail $(if (-not $webConfigExists) { "Expected: $webConfigPath" })))
 
