@@ -887,8 +887,15 @@ function Confirm-DeltaArrPostInstallState {
           verification fails" requirement. This re-check is a FRESH
           Get-DeltaArrDetectionResult taken after the restart, never a
           re-read of $Detection or a bare trust in
-          Set-WebConfigurationProperty/Add-WebConfigurationProperty's
-          own lack of a thrown error.
+          Save-DeltaIisConfiguration's own lack of a thrown error.
+
+      Writes go through Microsoft.Web.Administration
+      (Get-DeltaIisServerManager/Get-DeltaIisApplicationHostConfiguration/
+      Get-DeltaIisConfigurationSection/Save-DeltaIisConfiguration,
+      lib\DeltaDoctor.IIS.ps1), never the WebAdministration module's own
+      Set-WebConfigurationProperty/Add-WebConfigurationProperty - see that
+      file's own "Microsoft.Web.Administration configuration backend"
+      section header for why.
     #>
     param([Parameter(Mandatory)][PSCustomObject]$Detection)
 
@@ -912,8 +919,10 @@ No further IIS setup will be attempted. Review any errors above and re-run this 
 
     # Only the specific names still missing from the machine-wide
     # allowedServerVariables collection - never re-adds a name already
-    # present (Add-WebConfigurationProperty would throw "item already
-    # exists" for a duplicate add).
+    # present. Duplicates are avoided by construction (only names
+    # Get-DeltaIisAllowedServerVariableNames doesn't already report ever
+    # reach the collection.Add() call below), not by relying on
+    # Microsoft.Web.Administration itself to reject a duplicate add.
     $missingServerVariableNames = @()
     if (-not $Detection.ForwardedServerVariablesAllowed) {
         $configuredNames = Get-DeltaIisAllowedServerVariableNames
@@ -924,22 +933,37 @@ No further IIS setup will be attempted. Review any errors above and re-run this 
         return
     }
 
-    if (-not (Test-DeltaWebAdministrationModuleAvailable)) {
-        Stop-Setup 'The WebAdministration PowerShell module is unavailable, so system.webServer/proxy cannot be configured. Re-run Phase 3 (Microsoft IIS Installation) first.'
+    if (-not (Test-DeltaIisManagementAssemblyAvailable)) {
+        Stop-Setup 'Microsoft.Web.Administration is unavailable, so system.webServer/proxy cannot be configured. Re-run Phase 3 (Microsoft IIS Installation) first.'
     }
-    Import-Module WebAdministration -ErrorAction Stop
 
     Write-Step 'Configuring the IIS reverse proxy (system.webServer/proxy)...'
+
+    $changedProperties = [System.Collections.Generic.List[string]]::new()
+    $changedProperties.AddRange([string[]]$propertiesToSet)
+    foreach ($name in $missingServerVariableNames) {
+        $changedProperties.Add("allowedServerVariables:$name")
+    }
+    $propertyDescription = $changedProperties -join ', '
+
     try {
-        if ($propertiesToSet.Contains('enabled')) {
-            Set-WebConfigurationProperty -Filter 'system.webServer/proxy' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'enabled' -Value $true -ErrorAction Stop
-            Write-Detail 'enabled -> True'
+        $serverManager = Get-DeltaIisServerManager
+        $configuration = Get-DeltaIisApplicationHostConfiguration -ServerManager $serverManager
+
+        if ($propertiesToSet.Count -gt 0) {
+            $proxySection = Get-DeltaIisConfigurationSection -Configuration $configuration -SectionPath 'system.webServer/proxy'
+
+            if ($propertiesToSet.Contains('enabled')) {
+                $proxySection.SetAttributeValue('enabled', $true)
+                Write-Detail 'enabled -> True'
+            }
+            if ($propertiesToSet.Contains('preserveHostHeader')) {
+                $proxySection.SetAttributeValue('preserveHostHeader', $true)
+                Write-Detail 'preserveHostHeader -> True'
+            }
         }
-        if ($propertiesToSet.Contains('preserveHostHeader')) {
-            Set-WebConfigurationProperty -Filter 'system.webServer/proxy' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'preserveHostHeader' -Value $true -ErrorAction Stop
-            Write-Detail 'preserveHostHeader -> True'
-        }
-        foreach ($name in $missingServerVariableNames) {
+
+        if ($missingServerVariableNames.Count -gt 0) {
             # allowedServerVariables, not templates\iis\web.config's own
             # site-level rewrite rule - confirmed directly (real IIS
             # testing) that this section is locked (overrideModeDefault=
@@ -947,9 +971,17 @@ No further IIS setup will be attempted. Review any errors above and re-run this 
             # declaration fails EVERY request with HTTP 500.52 instead of
             # merely omitting the header. See
             # Test-DeltaIisForwardedServerVariablesAllowed's own header.
-            Add-WebConfigurationProperty -Filter 'system.webServer/rewrite/allowedServerVariables' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name '.' -Value @{name = $name } -ErrorAction Stop
-            Write-Detail "allowedServerVariables += $name"
+            $allowedServerVariablesSection = Get-DeltaIisConfigurationSection -Configuration $configuration -SectionPath 'system.webServer/rewrite/allowedServerVariables'
+            $allowedServerVariablesCollection = $allowedServerVariablesSection.GetCollection()
+            foreach ($name in $missingServerVariableNames) {
+                $addElement = $allowedServerVariablesCollection.CreateElement('add')
+                $addElement.SetAttributeValue('name', $name)
+                $allowedServerVariablesCollection.Add($addElement) | Out-Null
+                Write-Detail "allowedServerVariables += $name"
+            }
         }
+
+        Save-DeltaIisConfiguration -ServerManager $serverManager -SectionName 'system.webServer/proxy, system.webServer/rewrite/allowedServerVariables' -PropertyDescription $propertyDescription
     }
     catch {
         Stop-Setup "Failed to configure system.webServer/proxy: $($_.Exception.Message)"

@@ -326,6 +326,153 @@ function Get-DeltaIisDetectionResult {
 }
 
 # ---------------------------------------------------------------------------
+# Microsoft.Web.Administration configuration backend
+# ---------------------------------------------------------------------------
+#
+# The WebAdministration PowerShell module's own configuration cmdlets
+# (Get/Set/Add/Remove/Clear-WebConfiguration*) go through a COM class that
+# has been observed, on an otherwise fully updated and functional IIS
+# installation (Windows Server 2022, Build 20348.5386 - IIS/URL Rewrite/ARR
+# all installed, appcmd.exe working), to fail EVERY call with a COMException
+# (REGDB_E_CLASSNOTREG, 0x80040154) - a broken WebAdministration PowerShell
+# provider registration, not a broken IIS. Microsoft.Web.Administration.dll
+# (the same .NET API appcmd.exe itself is built on) was confirmed working on
+# that same machine - ServerManager, GetApplicationHostConfiguration,
+# GetSection, and CommitChanges all succeed. Every configuration WRITE this
+# project makes to system.webServer/proxy (enabled/preserveHostHeader) and
+# system.webServer/rewrite/allowedServerVariables - all machine-wide
+# (MACHINE/WEBROOT/APPHOST) settings, never scoped to a single site - goes
+# through Microsoft.Web.Administration via the four helpers below instead of
+# the WebAdministration module's own configuration cmdlets, and reads of
+# those same three settings (immediately below) do too, so a single
+# ServerManager transaction's own writes are never re-verified through a
+# different, still-broken backend. Website/application-pool/binding
+# management (New-Website, Get-WebBinding, Restart-WebAppPool, etc.) still
+# uses the WebAdministration module and is unaffected - only the
+# *-WebConfiguration* cmdlet family is replaced here.
+
+function Import-DeltaIisManagementAssembly {
+    <#
+      Loads Microsoft.Web.Administration.dll exactly once per session.
+      Add-Type -AssemblyName resolves it from the GAC on a normal IIS
+      installation; the explicit System32\inetsrv\ fallback covers a
+      machine where it is present but not GAC-registered. Safe to call
+      repeatedly - Add-Type against an already-loaded assembly is a no-op,
+      never a duplicate-type error.
+    #>
+    try {
+        Add-Type -AssemblyName 'Microsoft.Web.Administration' -ErrorAction Stop
+        return
+    }
+    catch {
+        # Fall through to the explicit path below.
+    }
+
+    $assemblyPath = Join-Path -Path $env:WINDIR -ChildPath 'System32\inetsrv\Microsoft.Web.Administration.dll'
+    if (-not (Test-Path -LiteralPath $assemblyPath)) {
+        throw "Microsoft.Web.Administration.dll could not be loaded and was not found at '$assemblyPath'. Verify Microsoft IIS is installed."
+    }
+
+    try {
+        Add-Type -Path $assemblyPath -ErrorAction Stop
+    }
+    catch {
+        throw "Failed to load Microsoft.Web.Administration.dll from '$assemblyPath': $($_.Exception.Message)"
+    }
+}
+
+function Test-DeltaIisManagementAssemblyAvailable {
+    <#
+      Whether Microsoft.Web.Administration.dll can actually be loaded - the
+      prerequisite every read/write in this section depends on now, the
+      same "never throws, reports the safe/negative state" convention
+      Test-DeltaWebAdministrationModuleAvailable itself established for the
+      module it replaces here.
+    #>
+    try {
+        Import-DeltaIisManagementAssembly
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-DeltaIisServerManager {
+    <#
+      A fresh Microsoft.Web.Administration.ServerManager - never cached or
+      reused across calls. A ServerManager instance does not observe
+      configuration changes made by a DIFFERENT instance (including ones
+      already committed by this same process moments earlier) until it is
+      recreated, so every read/write in this section starts from its own
+      new instance rather than risking a stale in-memory config tree.
+    #>
+    Import-DeltaIisManagementAssembly
+    return New-Object -TypeName 'Microsoft.Web.Administration.ServerManager'
+}
+
+function Get-DeltaIisApplicationHostConfiguration {
+    <#
+      applicationHost.config - the machine-wide configuration root every
+      section this project reads/writes here lives under, equivalent to
+      the WebAdministration cmdlets' own MACHINE/WEBROOT/APPHOST -PSPath.
+    #>
+    param([Parameter(Mandatory)]$ServerManager)
+
+    return $ServerManager.GetApplicationHostConfiguration()
+}
+
+function Get-DeltaIisConfigurationSection {
+    <#
+      $Configuration.GetSection($SectionPath) - equivalent to the
+      WebAdministration cmdlets' own -Filter parameter. Never scoped to a
+      specific site/location: every call site here only ever reads/writes
+      the machine-wide section (no $Location argument to GetSection),
+      matching the MACHINE/WEBROOT/APPHOST scope the cmdlets this replaces
+      were always called with.
+    #>
+    param(
+        [Parameter(Mandatory)]$Configuration,
+        [Parameter(Mandatory)][string]$SectionPath
+    )
+
+    return $Configuration.GetSection($SectionPath)
+}
+
+function Save-DeltaIisConfiguration {
+    <#
+      $ServerManager.CommitChanges() - equivalent to a WebAdministration
+      configuration cmdlet returning without throwing. On failure, wraps
+      the original exception (and its own InnerException, when present -
+      CommitChanges failures are frequently a wrapped COMException) with
+      exactly which section/property this caller was trying to change,
+      rather than letting a bare "Exception calling CommitChanges" surface
+      with no indication of which of possibly several in-memory changes on
+      $ServerManager actually caused it.
+    #>
+    param(
+        [Parameter(Mandatory)]$ServerManager,
+        [Parameter(Mandatory)][string]$SectionName,
+        [Parameter(Mandatory)][string]$PropertyDescription
+    )
+
+    try {
+        $ServerManager.CommitChanges()
+    }
+    catch {
+        $originalException = $_.Exception
+        $innerException = $originalException.InnerException
+        $innerText = if ($innerException) {
+            " Inner exception ($($innerException.GetType().FullName)): $($innerException.Message)"
+        }
+        else {
+            ''
+        }
+        throw "Failed to commit IIS configuration changes to section '$SectionName' (property: $PropertyDescription). Original exception ($($originalException.GetType().FullName)): $($originalException.Message).$innerText"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Application Request Routing Detection
 # ---------------------------------------------------------------------------
 #
@@ -401,23 +548,26 @@ function Test-DeltaIisProxyEnabled {
     <#
       Whether system.webServer/proxy is currently enabled machine-wide
       (MACHINE/WEBROOT/APPHOST - applicationHost.config, not any single
-      site's own web.config). Returns $false (never throws) if
-      WebAdministration is unavailable or the property can't be read -
-      matching Test-DeltaIisFeatureInstalled's own "a query failure
-      reports the safe/negative state, not an exception" convention.
-      Safe to call before ARR is even installed: system.webServer/proxy
-      is a real, queryable configuration section regardless of whether
-      ARR's own proxy engine is present to act on it, and reading a
-      config property never modifies anything.
+      site's own web.config), read via Microsoft.Web.Administration - see
+      this section's own header for why, not the WebAdministration
+      module's own Get-WebConfigurationProperty. Returns $false (never
+      throws) if Microsoft.Web.Administration is unavailable or the
+      property can't be read - matching Test-DeltaIisFeatureInstalled's
+      own "a query failure reports the safe/negative state, not an
+      exception" convention. Safe to call before ARR is even installed:
+      system.webServer/proxy is a real, queryable configuration section
+      regardless of whether ARR's own proxy engine is present to act on
+      it, and reading a config property never modifies anything.
     #>
-    if (-not (Test-DeltaWebAdministrationModuleAvailable)) {
+    if (-not (Test-DeltaIisManagementAssemblyAvailable)) {
         return $false
     }
 
     try {
-        Import-Module WebAdministration -ErrorAction Stop
-        $property = Get-WebConfigurationProperty -Filter 'system.webServer/proxy' -Name 'enabled' -PSPath 'MACHINE/WEBROOT/APPHOST' -ErrorAction Stop
-        return [bool]$property.Value
+        $serverManager = Get-DeltaIisServerManager
+        $configuration = Get-DeltaIisApplicationHostConfiguration -ServerManager $serverManager
+        $section = Get-DeltaIisConfigurationSection -Configuration $configuration -SectionPath 'system.webServer/proxy'
+        return [bool]$section.GetAttributeValue('enabled')
     }
     catch {
         return $false
@@ -427,25 +577,27 @@ function Test-DeltaIisProxyEnabled {
 function Test-DeltaIisPreserveHostHeaderEnabled {
     <#
       Whether system.webServer/proxy's own preserveHostHeader is currently
-      enabled machine-wide - same MACHINE/WEBROOT/APPHOST scope and
-      "never throws, reports the safe/negative state" convention
-      Test-DeltaIisProxyEnabled (immediately above) already establishes,
-      just reading a different property of the same configuration
-      section. Required alongside ProxyEnabled, never merged into a
-      single "reverse proxy enabled" boolean: ARR's own default for this
-      property is False, and DELTA depends on the original Host header
-      surviving the proxy hop (sessions, CSRF, Remix action routing) - a
-      real, confirmed cause of a DELTA login failure on a machine where
-      only `enabled` had been set.
+      enabled machine-wide - same MACHINE/WEBROOT/APPHOST scope,
+      Microsoft.Web.Administration backend, and "never throws, reports the
+      safe/negative state" convention Test-DeltaIisProxyEnabled
+      (immediately above) already establishes, just reading a different
+      property of the same configuration section. Required alongside
+      ProxyEnabled, never merged into a single "reverse proxy enabled"
+      boolean: ARR's own default for this property is False, and DELTA
+      depends on the original Host header surviving the proxy hop
+      (sessions, CSRF, Remix action routing) - a real, confirmed cause of
+      a DELTA login failure on a machine where only `enabled` had been
+      set.
     #>
-    if (-not (Test-DeltaWebAdministrationModuleAvailable)) {
+    if (-not (Test-DeltaIisManagementAssemblyAvailable)) {
         return $false
     }
 
     try {
-        Import-Module WebAdministration -ErrorAction Stop
-        $property = Get-WebConfigurationProperty -Filter 'system.webServer/proxy' -Name 'preserveHostHeader' -PSPath 'MACHINE/WEBROOT/APPHOST' -ErrorAction Stop
-        return [bool]$property.Value
+        $serverManager = Get-DeltaIisServerManager
+        $configuration = Get-DeltaIisApplicationHostConfiguration -ServerManager $serverManager
+        $section = Get-DeltaIisConfigurationSection -Configuration $configuration -SectionPath 'system.webServer/proxy'
+        return [bool]$section.GetAttributeValue('preserveHostHeader')
     }
     catch {
         return $false
@@ -462,21 +614,26 @@ $Script:DeltaIisRequiredForwardedServerVariables = @('HTTP_X_FORWARDED_PROTO', '
 function Get-DeltaIisAllowedServerVariableNames {
     <#
       The names currently present in system.webServer/rewrite/allowedServerVariables
-      machine-wide (MACHINE/WEBROOT/APPHOST) - always a real array, never
-      $null, matching this project's own established convention (see e.g.
-      Get-DeltaIisMissingFeatures's own header for the return-boundary
-      unwrapping gotcha this guards against). Returns an empty array
-      (never throws) if WebAdministration is unavailable, the section
-      can't be read, or nothing is configured yet.
+      machine-wide (MACHINE/WEBROOT/APPHOST), read via
+      Microsoft.Web.Administration - see this section's own header for why,
+      not the WebAdministration module's own Get-WebConfigurationProperty.
+      Always a real array, never $null, matching this project's own
+      established convention (see e.g. Get-DeltaIisMissingFeatures's own
+      header for the return-boundary unwrapping gotcha this guards
+      against). Returns an empty array (never throws) if
+      Microsoft.Web.Administration is unavailable, the section can't be
+      read, or nothing is configured yet.
     #>
-    if (-not (Test-DeltaWebAdministrationModuleAvailable)) {
+    if (-not (Test-DeltaIisManagementAssemblyAvailable)) {
         return ,@()
     }
 
     try {
-        Import-Module WebAdministration -ErrorAction Stop
-        $collection = Get-WebConfigurationProperty -Filter 'system.webServer/rewrite/allowedServerVariables' -PSPath 'MACHINE/WEBROOT/APPHOST' -Name 'Collection' -ErrorAction Stop
-        return ,@($collection | ForEach-Object { $_.name })
+        $serverManager = Get-DeltaIisServerManager
+        $configuration = Get-DeltaIisApplicationHostConfiguration -ServerManager $serverManager
+        $section = Get-DeltaIisConfigurationSection -Configuration $configuration -SectionPath 'system.webServer/rewrite/allowedServerVariables'
+        $collection = $section.GetCollection()
+        return ,@($collection | ForEach-Object { [string]$_.GetAttributeValue('name') })
     }
     catch {
         return ,@()

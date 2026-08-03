@@ -113,6 +113,19 @@ Both directories are excluded from GitHub release packages and from version cont
 - Internet connectivity, to download runtime components during installation
 - PowerShell 5.1 or later
 - A supported Windows version (see [Supported Platforms](#supported-platforms))
+- **Windows Server fully updated via Windows Update** (see below)
+
+### Windows Update
+
+Before running the installer, fully update Windows Server using Windows Update. DELTA is tested against supported and fully serviced Windows Server installations, and an installation that is missing updates may also be missing IIS or Windows servicing components that PowerShell or the IIS management APIs depend on. Keeping Windows fully updated avoids these compatibility issues.
+
+Recommended steps:
+
+1. Run Windows Update.
+2. Install all available updates.
+3. Restart if required.
+4. Repeat until Windows reports that no further updates are available.
+5. Only then run the DELTA installer.
 
 ## Installation Workflow
 
