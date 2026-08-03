@@ -107,10 +107,14 @@ $Script:ChecksumPath = "$Script:ZipPath.sha256"
 # dts_shared_binary\, release\ itself - is never copied, by construction.
 $Script:RequiredFiles = @(
     'setup.ps1',
+    'setup-iis.ps1',
+    'setup-nginx.ps1',
+    'doctor.ps1',
     'init_db.ps1',
     'upgrade_database.ps1',
     'uninstall.ps1',
-    '.env.example'
+    '.env.example',
+    '.env.installer'
 )
 
 $Script:OptionalFiles = @(
@@ -119,7 +123,8 @@ $Script:OptionalFiles = @(
 )
 
 $Script:RequiredDirectories = @(
-    'lib'
+    'lib',
+    'templates'
 )
 
 # ---------------------------------------------------------------------------
