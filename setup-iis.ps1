@@ -2189,6 +2189,17 @@ function Resolve-DeltaIisPublicUrlSync {
 
       DELTA itself is never restarted here, in any of the four outcomes -
       see this section's own header for why.
+
+      Does NOT itself ensure the website ends up Active/Started - the
+      orchestration block's own caller does that exactly once, via
+      Start-DeltaIisManagedWebsite, immediately after this function
+      returns (see that call site's own comment), regardless of which of
+      the four outcomes above actually ran. Ensuring "the site is running
+      by the time the management menu opens" is that ONE call's job,
+      not this function's - duplicating it into just one of the four
+      branches here previously left the other three (in particular the
+      overwhelmingly common "already matching, nothing to do" case) with
+      no such guarantee at all.
     #>
     param([Parameter(Mandatory)]$ManagedSite)
 
@@ -2323,7 +2334,18 @@ function Show-DeltaIisManagementMenu {
         Write-Host ''
         Write-Host 'Status'
         Write-Host ''
-        Write-Detail "$($currentSite.state)"
+        # $currentSite.state is only resolvable while W3SVC is actually
+        # running - IIS reports it as an empty string (never $null,
+        # never a thrown error), unlike name/applicationPool/physicalPath,
+        # which read straight from applicationHost.config regardless of
+        # service state. Defensive fallback, matching the exact same
+        # $(if (...) {...} else {'Unknown'}) idiom Binding/Backend already
+        # use two blocks below - Start-DeltaIisManagedWebsite (the
+        # orchestration block's own caller, and this menu's own "Start
+        # Website"/"Restart Website" actions) is what actually keeps
+        # W3SVC/the site running; this only ever keeps the display itself
+        # from crashing if it somehow isn't, for whatever reason, right now.
+        Write-Detail $(if ($currentSite.state) { "$($currentSite.state)" } else { 'Unknown' })
         Write-Host ''
         Write-Host 'Binding'
         Write-Host ''
@@ -2498,6 +2520,26 @@ try {
         # script cannot yet vouch for.
         if ($checkup.Healthy) {
             Resolve-DeltaIisPublicUrlSync -ManagedSite $websiteResult.ManagedSite
+
+            # Start the managed reverse proxy - the exact same call, in
+            # the exact same "Repair/Configure -> Start -> hand off" order,
+            # as the fresh-install path below (see that call site's own
+            # comment for the full rationale). Invoke-DeltaIisConfigurationCheckup
+            # above only ever validates/repairs CONFIGURATION (application
+            # pool settings, web.config, the HTTP binding) - it has no
+            # opinion on whether the site is actually Started, so an
+            # existing site reported Healthy is not the same thing as one
+            # that is Active. Previously this was only reached from inside
+            # Resolve-DeltaIisPublicUrlSync's own PUBLIC_URL-mismatch
+            # branch, leaving every other, far more common outcome of that
+            # function (in particular "already in sync, nothing to do") to
+            # reach the management menu below with no such guarantee -
+            # exactly the gap that let the menu open, and then crash on an
+            # empty Status, while W3SVC was not actually running. Calling
+            # it once here, unconditionally, closes that gap for every
+            # path into this branch, not just the mismatch one.
+            Start-DeltaIisManagedWebsite
+
             Show-DeltaIisManagementMenu
         }
         exit 0
@@ -2510,6 +2552,29 @@ try {
         exit 1
     }
 
+    # Start the managed reverse proxy - the direct IIS analogue of
+    # setup-nginx.ps1's own Start-DeltaNginx call, in the same position in
+    # the lifecycle (Repair/Configure -> Start -> Validate deployment).
+    # Invoke-DeltaIisConfigurationCheckup above only ever creates/reconciles
+    # the site's own configuration (application pool, web.config, HTTP
+    # binding) - it never starts it, so without this call the website could
+    # be left Healthy but never Active (Doctor's own
+    # Get-DeltaIisReverseProxyProviderState reads Active straight from the
+    # site's own .state -eq 'Started', a genuine runtime fact New-Website
+    # does not always leave true on its own). Start-DeltaIisManagedWebsite
+    # (lib\DeltaDoctor.IIS.ps1) is the same idempotent, ownership-checked
+    # primitive the management menu's own "Start Website" action already
+    # uses - a no-op, reported plainly, if the site is already running -
+    # so calling it unconditionally here is always safe, never a
+    # duplicate/second implementation of "start the site."
+    Start-DeltaIisManagedWebsite
+
+    # Deployment Validation - only ever prints Doctor's own re-detection
+    # when a Manual Reverse Proxy Handover actually occurred earlier in
+    # this run (see this function's own header) - identical, in both
+    # placement (immediately after the reverse proxy actually starts) and
+    # behavior, to setup-nginx.ps1's own equivalent check inside
+    # Start-DeltaNginx.
     Show-DeltaIisPostHandoverValidation
 
     # The Certificate Wizard. Cancel exits immediately here, before the
