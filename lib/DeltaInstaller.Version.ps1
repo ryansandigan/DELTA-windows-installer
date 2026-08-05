@@ -40,4 +40,4 @@
     when bumping the installer version.
 #>
 
-$Script:DeltaInstallerVersion = '1.0.9'
+$Script:DeltaInstallerVersion = '1.0.10'
