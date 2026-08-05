@@ -487,6 +487,13 @@ function Get-InstalledProgramInfo {
       throw just because a given subkey doesn't happen to have every
       field.
 
+      Returned objects also carry RegistryKeyPath (the matched subkey's own
+      PSPath) alongside the registry values themselves - added for
+      uninstall.ps1's own orphaned-uninstall-entry cleanup, which needs to
+      reliably Remove-Item the EXACT subkey a caller just matched, never a
+      name re-derived from DisplayName (not guaranteed to equal the
+      subkey's own name).
+
       $DisplayNamePattern is a -like wildcard pattern (e.g. '*PostgreSQL*'),
       matched case-insensitively (the default for -like) against each
       entry's DisplayName. ALWAYS returns a real array - never $null, and
@@ -531,6 +538,17 @@ function Get-InstalledProgramInfo {
             UninstallString      = Get-RegistryPropertyValue -InputObject $entry -Name 'UninstallString'
             QuietUninstallString = Get-RegistryPropertyValue -InputObject $entry -Name 'QuietUninstallString'
             InstallLocation      = Get-RegistryPropertyValue -InputObject $entry -Name 'InstallLocation'
+            # $entry.PSPath - unlike every property above, this is a
+            # pseudo-property the registry provider itself always attaches
+            # to every Get-ItemProperty result (never a value that could be
+            # absent under this project's own Set-StrictMode, so dot-notation
+            # is safe here, unlike the Get-RegistryPropertyValue reads above) -
+            # the one thing a caller needs to reliably target THIS EXACT
+            # subkey for removal later (uninstall.ps1's own orphaned-entry
+            # cleanup), rather than re-deriving/guessing a subkey name from
+            # DisplayName, which is not guaranteed to match the key's own
+            # name.
+            RegistryKeyPath      = $entry.PSPath
         }
     })
 
