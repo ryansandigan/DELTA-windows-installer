@@ -1004,12 +1004,53 @@ function Read-ExistingSslCertificateChoice {
       Read-SslCertificateChoice's "[2]") - a decision this consequential
       (silently keeping vs. silently discarding a possibly-production
       certificate) is deliberately never made by a stray Enter keypress.
+
+      Subject/Thumbprint/Expiration are read fresh, purely for display,
+      by loading $Script:NginxCertificatePath itself as an
+      X509Certificate2 - the certificate file already sitting at the
+      fixed installed location, never a second copy or a store lookup
+      (NGINX's own certificates are plain files, not machine-store
+      entries the way IIS's are). "if available" per this feature's own
+      requirement: the file existing (already confirmed by
+      Test-DeltaSslCertificateFilesExist) does not guarantee it parses
+      as a valid X.509 certificate, so a load failure shows "Unknown"
+      for all three rather than failing this prompt outright.
+
+      -ForActivation is UX wording only - never changes the Replace/
+      Keep/Cancel branching or return values below. Passed by
+      Install-DeltaSslCertificate's own activation callers
+      (Resolve-DeltaNginxPublicUrlSync's Manual Reverse Proxy Handover
+      branch, Invoke-DeltaNginxActivationSslReview) - both only ever
+      reached against an ALREADY-installed NGINX being switched to
+      Active, where "Cancel activation" is accurate; the fresh-install
+      orchestration path (where this same Existing Certificate Handling
+      prompt can also be reached, if certificate files happen to already
+      exist at this fixed location before NGINX itself has even started
+      once) omits it, keeping the original "Cancel setup" wording, since
+      "activation" would not be accurate there - NGINX has not been
+      installed at all yet in that case.
     #>
+    param([switch]$ForActivation)
+
+    $certificateSubject    = 'Unknown'
+    $certificateThumbprint = 'Unknown'
+    $certificateExpiration = 'Unknown'
+    try {
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($Script:NginxCertificatePath)
+        $certificateSubject    = $certificate.Subject
+        $certificateThumbprint = $certificate.Thumbprint
+        $certificateExpiration = $certificate.NotAfter.ToString('yyyy-MM-dd')
+    }
+    catch {
+        # Left as 'Unknown' - see this function's own header.
+    }
 
     Write-Host ''
     Write-Host ('-' * $Script:BannerWidth)
     Write-Host ''
-    Write-Host 'Existing SSL certificate detected.'
+    Write-Host 'SSL Certificate Review'
+    Write-Host ''
+    Write-Host $(if ($ForActivation) { 'An SSL certificate is already configured. Review it before NGINX is activated.' } else { 'Existing SSL certificate detected.' })
     Write-Host ''
     Write-Host 'Certificate'
     Write-Host ''
@@ -1019,11 +1060,23 @@ function Read-ExistingSslCertificateChoice {
     Write-Host ''
     Write-Detail $Script:NginxCertificateKeyPath
     Write-Host ''
+    Write-Host 'Subject'
+    Write-Host ''
+    Write-Detail $certificateSubject
+    Write-Host ''
+    Write-Host 'Thumbprint'
+    Write-Host ''
+    Write-Detail $certificateThumbprint
+    Write-Host ''
+    Write-Host 'Expires'
+    Write-Host ''
+    Write-Detail $certificateExpiration
+    Write-Host ''
     Write-Host 'Choose an option:'
     Write-Host ''
     Write-Host '1) Replace existing certificate'
     Write-Host '2) Keep existing certificate'
-    Write-Host '3) Cancel setup'
+    Write-Host $(if ($ForActivation) { '3) Cancel activation' } else { '3) Cancel setup' })
     Write-Host ''
     Write-Host ('-' * $Script:BannerWidth)
     Write-Host ''
@@ -1042,26 +1095,33 @@ function Read-ExistingSslCertificateChoice {
 
 function Show-SslCertificateCancelledNotice {
     <#
-      Phase 6. The entire response to the operator choosing "Cancel
-      setup" from Read-ExistingSslCertificateChoice - mirrors
-      Show-ExistingNginxNotice's own philosophy of spelling out that this
-      is intentional, expected behavior (not an error this installer
-      stumbled into), so the operator walks away confident nothing was
-      touched rather than wondering whether something went wrong.
+      Phase 6. The entire response to the operator choosing "Cancel" from
+      Read-ExistingSslCertificateChoice - mirrors Show-ExistingNginxNotice's
+      own philosophy of spelling out that this is intentional, expected
+      behavior (not an error this installer stumbled into), so the
+      operator walks away confident nothing was touched rather than
+      wondering whether something went wrong.
 
-      Note this can only be reached after Install-Nginx has already
-      extracted a fresh NGINX to $Script:NginxHome (see the orchestration
-      block below - the top-level existing-NGINX check already refused to
-      proceed at all if that wasn't true) - "no files were modified" here
-      refers to the certificate files and NGINX configuration this phase
-      itself is responsible for, not to undoing that already-completed,
-      unrelated installation step.
+      -ForActivation is UX wording only ("Activation canceled." instead
+      of "Setup canceled.") - passed through identically from
+      Install-DeltaSslCertificate, never changing what actually happened
+      (nothing was written, NGINX was not started/reloaded, either way).
+      When NOT set, this can only be reached after Install-Nginx has
+      already extracted a fresh NGINX to $Script:NginxHome (see the
+      orchestration block below - the top-level existing-NGINX check
+      already refused to proceed at all if that wasn't true) - "no files
+      were modified" here refers to the certificate files and NGINX
+      configuration this phase itself is responsible for, not to undoing
+      that already-completed, unrelated installation step. When set, this
+      is reached instead against an ALREADY-installed NGINX being
+      switched to Active.
     #>
+    param([switch]$ForActivation)
 
     Write-Host ''
     Write-Host ('=' * $Script:BannerWidth) -ForegroundColor Yellow
     Write-Host ''
-    Write-Host 'Setup canceled.'
+    Write-Host $(if ($ForActivation) { 'Activation canceled.' } else { 'Setup canceled.' })
     Write-Host ''
     Write-Host 'An existing SSL certificate was found and no changes were made to it.'
     Write-Host ''
@@ -1187,12 +1247,22 @@ function Install-DeltaSslCertificate {
           + exit 0), so this exits cleanly with no failure banner and
           none of New-DeltaNginxConfiguration/Test-DeltaNginxConfiguration/
           Start-DeltaNginx/Show-DeltaNginxSummary ever run.
-    #>
 
-    Write-PhaseBanner 'SSL Certificate'
+      -ForActivation is UX wording only, passed straight through to
+      Read-ExistingSslCertificateChoice/Show-SslCertificateCancelledNotice
+      (see each function's own header) - never changes any of the
+      branching or return behavior described above. Set by this
+      function's own activation callers (Resolve-DeltaNginxPublicUrlSync's
+      Manual Reverse Proxy Handover branch, Invoke-DeltaNginxActivationSslReview);
+      omitted by the fresh-install orchestration path, unchanged from
+      before.
+    #>
+    param([switch]$ForActivation)
+
+    Write-PhaseBanner 'SSL Certificate Review'
 
     if (Test-DeltaSslCertificateFilesExist) {
-        $existingChoice = Read-ExistingSslCertificateChoice
+        $existingChoice = Read-ExistingSslCertificateChoice -ForActivation:$ForActivation
 
         switch ($existingChoice) {
             'Replace' {
@@ -1214,7 +1284,7 @@ function Install-DeltaSslCertificate {
                 return
             }
             'Cancel' {
-                Show-SslCertificateCancelledNotice
+                Show-SslCertificateCancelledNotice -ForActivation:$ForActivation
                 exit 0
             }
         }
@@ -1849,6 +1919,47 @@ function Show-DeltaNginxPublicUrlMismatchNotice {
     Write-Host ''
 }
 
+function Show-DeltaNginxActivationSummary {
+    <#
+      UX polish only - shown once, immediately before the SSL Certificate
+      Review, from both code paths that can activate NGINX
+      (Resolve-DeltaNginxPublicUrlSync's own Manual Reverse Proxy
+      Handover branch, and Invoke-DeltaNginxActivationSslReview) - purely
+      explains what is about to happen before the review appears
+      unannounced. Display-only: decides nothing, changes nothing, and
+      does not alter the order, gating, or outcome of any of the steps it
+      lists - those are exactly the same steps, in exactly the same
+      order, this file's own handover branch/menu action already perform
+      (the SSL Certificate Review itself, then the Manual Reverse Proxy
+      Handover/port check, then Start-DeltaNginx, then Doctor's own
+      post-handover validation where applicable, then the caller's own
+      final PUBLIC_URL sync). "Perform reverse-proxy handover (if
+      required)" is listed unconditionally since there is no way to know
+      in advance, before Get-DeltaReverseProxyHandoverPlan/
+      Test-DeltaNginxPortPrerequisites actually run, whether a handover is
+      even needed this time. This is the direct NGINX counterpart of
+      setup-iis.ps1's own Show-DeltaIisActivationSummary - see that
+      function's own header for the full rationale this mirrors.
+    #>
+
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+    Write-Host ''
+    Write-Host 'Activate NGINX'
+    Write-Host ''
+    Write-Host 'The following actions will be performed:'
+    Write-Host ''
+    Write-Host '    - Review the SSL certificate'
+    Write-Host '    - Perform reverse-proxy handover (if required)'
+    Write-Host '    - Start NGINX'
+    Write-Host '    - Validate the deployment'
+    Write-Host '    - Synchronize PUBLIC_URL'
+    Write-Host ''
+    Write-Host 'No changes will be made until all required steps have completed successfully.'
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+}
+
 function Resolve-DeltaNginxPublicUrlSync {
     <#
       Reads the already-generated DELTA vhost's own server_name/scheme
@@ -1873,19 +1984,60 @@ function Resolve-DeltaNginxPublicUrlSync {
           Show-DeltaNginxPublicUrlMismatchNotice, then re-prompts for the
           domain (Resolve-DeltaWebsiteDomain -DefaultDomain, defaulting a
           bare Enter to the domain NGINX is already configured with, not
-          "localhost" - see that function's own header), regenerates and
-          re-validates the configuration exactly like a fresh install
-          (New-DeltaNginxConfiguration/Test-DeltaNginxConfiguration), and
-          only writes the new PUBLIC_URL once Start-DeltaNginx - which
-          itself reloads a Running instance or starts a Stopped one, no
-          separate branch needed here - actually confirms it healthy,
-          matching this feature's own "written, validated, and started/
-          reloaded successfully" gate. Still never restarts DELTA itself.
+          "localhost" - see that function's own header). Whether NGINX is
+          about to take over as the Active Provider right now decides
+          everything from here:
+
+            - NGINX is Standby behind another DELTA-managed Active
+              provider (IIS) - genuinely about to become Active, so the
+              SSL Certificate Review runs FIRST (Install-DeltaSslCertificate,
+              reused verbatim - the same Keep/Replace/Cancel wizard for an
+              existing certificate, or Yes/No for none yet, the
+              fresh-install path already uses; never a second
+              implementation), per this feature's own operational
+              requirement ("the administrator must always be given the
+              opportunity to review or replace the SSL certificate before
+              traffic is switched"). Configuration is regenerated
+              (New-DeltaNginxConfiguration) only AFTER that review, so the
+              vhost actually written reflects whatever it just decided,
+              never a stale pre-decision value. Only THEN is the Manual
+              Reverse Proxy Handover asked (Get-DeltaReverseProxyHandoverPlan/
+              Invoke-DeltaReverseProxyHandover, the exact same pair
+              Test-DeltaNginxPortPrerequisites itself already uses) -
+              deliberately after the SSL review, never before, so a
+              Cancel there (Install-DeltaSslCertificate's own Cancel
+              branch exits 0 directly) can never happen once IIS has
+              already been stopped; `nginx -t`/Start-DeltaNginx must
+              never run here just because a config edit happened to also
+              need to touch the vhost - both would be acting on NGINX as
+              though it were about to take over, which is a decision only
+              the Manual Reverse Proxy Handover confirmation itself may
+              make. A decline there leaves the saved configuration in
+              place and exits cleanly (0), IIS still fully active; an
+              accept IS the administrator's own "activate NGINX now"
+              answer, so validation/start follow immediately, with no
+              further Y/N needed.
+            - Anything else (NGINX already Active, or no other
+              DELTA-managed provider at all) - unchanged from before this
+              fix: no SSL review here (NGINX is not transitioning to
+              Active in this branch), regenerates the configuration
+              (New-DeltaNginxConfiguration) and re-validates
+              (Test-DeltaNginxConfiguration), only writing the new
+              PUBLIC_URL once Start-DeltaNginx - which itself reloads a
+              Running instance or starts a Stopped one, no separate
+              branch needed here - actually confirms it healthy, matching
+              this feature's own "written, validated, and started/
+              reloaded successfully" gate.
+
+          Still never restarts DELTA itself, in either situation.
 
       $Script:SslCertificateConfigured is set from the vhost's own
-      already-configured HTTPS state (IsHttps) rather than re-running the
-      SSL Certificate Wizard - only the domain is being resynchronized
-      here, never the certificate.
+      already-configured HTTPS state (IsHttps) before either branch above
+      runs - the Manual Reverse Proxy Handover branch's own SSL
+      Certificate Review may still update it (Install-DeltaSslCertificate
+      sets it directly), but the other branch leaves it exactly as read
+      from the vhost, since only the domain is being resynchronized
+      there, never the certificate.
     #>
     param([Parameter(Mandatory)][PSCustomObject]$ReverseProxyState)
 
@@ -1915,6 +2067,45 @@ function Resolve-DeltaNginxPublicUrlSync {
     $Script:SslCertificateConfigured = $vhost.IsHttps
     Resolve-DeltaBackendPort
 
+    $handoverPlan = Get-DeltaReverseProxyHandoverPlan -ReverseProxyState $ReverseProxyState -RequestingProviderName 'NGINX'
+    if ($handoverPlan) {
+        # SSL Certificate Review - NGINX is genuinely about to become
+        # Active here, so this runs BEFORE New-DeltaNginxConfiguration
+        # (so the vhost written reflects the decision, never a stale
+        # pre-decision value) and BEFORE the Manual Reverse Proxy
+        # Handover below (so a Cancel here never happens after IIS has
+        # already been stopped) - see this function's own header for the
+        # full rationale. Show-DeltaNginxActivationSummary (UX polish
+        # only) explains what is about to happen immediately before the
+        # review itself, so it never appears unannounced.
+        Show-DeltaNginxActivationSummary
+        Install-DeltaSslCertificate -ForActivation
+
+        New-DeltaNginxConfiguration
+
+        # Manual Reverse Proxy Handover - asked only now, after the SSL
+        # review above: see this function's own header for why a Standby
+        # NGINX must never have `nginx -t`/Start-DeltaNginx run against
+        # it as a side effect of a configuration edit alone.
+        if (-not (Invoke-DeltaReverseProxyHandover -Plan $handoverPlan)) {
+            Write-Host ''
+            Write-Detail 'NGINX configuration saved. NGINX was not validated or started - the current active reverse proxy remains active.'
+            Write-Host ''
+            exit 0
+        }
+
+        # Handover accepted - that acceptance IS the administrator's own
+        # "activate NGINX now" answer, so validation/start follow
+        # immediately; Read-DeltaNginxStartConfirmation below is never
+        # reached in this branch, and Invoke-DeltaReverseProxyHandover has
+        # already confirmed the required ports released, so no further
+        # port re-check is needed either.
+        Test-DeltaNginxConfiguration
+        Start-DeltaNginx
+        Sync-DeltaPublicUrlEnvironment -Domain $Script:DeltaWebsiteDomain -Https:$Script:SslCertificateConfigured
+        return
+    }
+
     New-DeltaNginxConfiguration
     Test-DeltaNginxConfiguration
 
@@ -1939,6 +2130,79 @@ function Resolve-DeltaNginxPublicUrlSync {
     }
 }
 
+function Invoke-DeltaNginxActivationSslReview {
+    <#
+      The shared SSL Certificate Review gate for the management menu's
+      own "Start NGINX" action (below) - the one remaining code path that
+      can transition NGINX from Stopped to Running without ever going
+      through Resolve-DeltaNginxPublicUrlSync's own Manual Reverse Proxy
+      Handover branch (reached whenever PUBLIC_URL already matches the
+      vhost's own configuration, so that function returns early having
+      done nothing). Per this feature's own "consistent... across every
+      code path that activates a reverse proxy" requirement, this closes
+      that gap - "Restart NGINX" (only ever offered from the Running
+      state's own submenu) is deliberately NOT wired to this: restarting
+      an already-Running instance is a restart-in-place, never an
+      activation, so no review applies there either.
+
+      A no-op ($null) whenever NGINX is not currently Stopped, or no
+      DELTA-owned vhost exists at all (IsDeltaOwned/ServerName, exactly
+      the same ownership guard Resolve-DeltaNginxPublicUrlSync itself
+      uses) - this never touches a foreign, non-DELTA-managed NGINX
+      installation the administrator merely pointed this script at.
+
+      Seeds $Script:DeltaWebsiteDomain/$Script:SslCertificateConfigured
+      from the vhost's own current, live state, shows
+      Show-DeltaNginxActivationSummary (UX polish only - see that
+      function's own header) so the review never appears unannounced,
+      then calls Install-DeltaSslCertificate -ForActivation - the exact
+      same Keep/Replace/Cancel (existing certificate) or Yes/No (none
+      yet) wizard the fresh-install path already uses, just with
+      activation-appropriate wording (-ForActivation, itself UX-only);
+      never a second implementation. Only when that
+      review actually changed whether HTTPS is configured (this project
+      never removes a certificate, only adds/replaces one) is the
+      configuration regenerated (New-DeltaNginxConfiguration) and
+      re-validated (Test-DeltaNginxConfiguration) - matching this
+      feature's own "create the HTTPS binding/config before starting"
+      requirement; a Keep/No answer that leaves HTTPS exactly as it
+      already was needs no rewrite at all.
+
+      Returns $null when nothing changed (skipped, or the review ran but
+      changed nothing) or a [PSCustomObject] { Domain; Https } describing
+      the sync the caller should perform once NGINX has actually started
+      successfully.
+    #>
+    param()
+
+    if ((Get-DeltaNginxRuntimeState).State -ne 'Stopped') {
+        return $null
+    }
+
+    $vhost = Get-DeltaNginxVHostSummary
+    if (-not $vhost.IsDeltaOwned -or -not $vhost.ServerName) {
+        return $null
+    }
+
+    $previousHttps = $vhost.IsHttps
+
+    $Script:DeltaWebsiteDomain = $vhost.ServerName
+    $Script:SslCertificateConfigured = $vhost.IsHttps
+    Resolve-DeltaBackendPort
+
+    Show-DeltaNginxActivationSummary
+    Install-DeltaSslCertificate -ForActivation
+
+    if ($Script:SslCertificateConfigured -eq $previousHttps) {
+        return $null
+    }
+
+    New-DeltaNginxConfiguration
+    Test-DeltaNginxConfiguration
+
+    return [PSCustomObject]@{ Domain = $Script:DeltaWebsiteDomain; Https = $Script:SslCertificateConfigured }
+}
+
 function Show-DeltaNginxManagementMenu {
     <#
       Replaces the old informational-only notice shown when
@@ -1949,7 +2213,15 @@ function Show-DeltaNginxManagementMenu {
       reconfigured automatically: nothing here writes nginx.conf/
       delta.conf, installs anything, or runs unless the administrator
       explicitly selects it, and every action reuses an existing helper
-      rather than duplicating it.
+      rather than duplicating it. The one deliberate exception is
+      "Start NGINX" (Stopped state, below): per this feature's own
+      "SSL review whenever a reverse proxy is about to become Active,
+      regardless of entry point" requirement, Invoke-DeltaNginxActivationSslReview
+      may write nginx.conf/delta.conf there - the ONE explicitly
+      administrator-selected action that can transition NGINX from
+      Standby to Active, never automatically, and never for a
+      non-DELTA-owned installation (that function's own header covers
+      the ownership guard).
 
       The options offered change with the runtime state instead of
       always showing the same set:
@@ -2100,7 +2372,21 @@ function Show-DeltaNginxManagementMenu {
                 if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '2' }
 
                 switch ($choice.Trim()) {
-                    '1' { Test-DeltaNginxPortPrerequisites -ReverseProxyState $ReverseProxyState; Start-DeltaNginx }
+                    '1' {
+                        # SSL Certificate Review first (Invoke-DeltaNginxActivationSslReview -
+                        # see that function's own header), then the
+                        # Manual Reverse Proxy Handover/port check, fresh -
+                        # NGINX is genuinely about to become Active here.
+                        # PUBLIC_URL is only resynced once NGINX has
+                        # actually started, and only if the review
+                        # actually changed anything.
+                        $sslReview = Invoke-DeltaNginxActivationSslReview
+                        Test-DeltaNginxPortPrerequisites -ReverseProxyState $ReverseProxyState
+                        Start-DeltaNginx
+                        if ($sslReview) {
+                            Sync-DeltaPublicUrlEnvironment -Domain $sslReview.Domain -Https:$sslReview.Https
+                        }
+                    }
                     '2' { return }
                     default { Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow }
                 }

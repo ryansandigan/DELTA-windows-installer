@@ -1542,6 +1542,18 @@ function Uninstall-PostgreSql {
       under this project's own preserve-the-data-directory design - the
       registry entry is still reported to the operator, but as
       information, not as a validation failure.
+
+      --errortrace must be version-gated the same way Install-
+      PostgresServer (setup.ps1) already gates it: PostgreSQL 17's
+      installer/uninstaller rejects the flag outright with "Unknown
+      option: --errortrace" and exits during argument parsing, before
+      the uninstall itself ever starts - unlike the "confirmed to do
+      nothing" case described above, which only applies to versions that
+      accept the flag. Major version is read from $existing.MajorVersion
+      (Find-PostgresInstallation, via psql.exe --version) with a fallback
+      to the registry's DisplayVersion if psql.exe couldn't be queried;
+      if neither yields a version, the flag is omitted rather than risk
+      passing it to an 17+ installer that would reject it.
     #>
     Write-PhaseBanner 'PostgreSQL'
 
@@ -1588,6 +1600,12 @@ function Uninstall-PostgreSql {
     # actually writes to (see this function's own header comment).
     $realLogPath = Join-Path -Path $existing.InstallDir -ChildPath 'installation_summary.log'
 
+    $majorVersion = $existing.MajorVersion
+    if (-not $majorVersion -and $status.ProgramInfo.DisplayVersion) {
+        $majorVersion = ($status.ProgramInfo.DisplayVersion -split '\.')[0]
+    }
+    $supportsErrorTrace = ($majorVersion -as [int]) -and ([int]$majorVersion -lt 17)
+
     Write-Host ''
     Write-Step 'Uninstalling PostgreSQL (silent, unattended uninstall)...'
     Write-Detail "Installer's own log (if written): $realLogPath"
@@ -1597,7 +1615,7 @@ function Uninstall-PostgreSql {
         '--mode unattended'
         '--unattendedmodeui none'
         "--debugtrace `"$logPath`""
-        "--errortrace `"$errorTracePath`""
+        if ($supportsErrorTrace) { "--errortrace `"$errorTracePath`"" }
     ) -join ' '
     if ($uninstallCommand.Arguments) {
         $argumentString = "$($uninstallCommand.Arguments) $argumentString"

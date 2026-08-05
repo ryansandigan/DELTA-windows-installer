@@ -1140,23 +1140,46 @@ function Read-DeltaIisExistingCertificateChoice {
       own Read-ExistingSslCertificateChoice: a decision this consequential
       (silently keeping vs. silently discarding a possibly-production
       certificate) is never made by a stray Enter keypress.
+
+      Subject/Expiration are read fresh from the certificate itself
+      (Cert:\LocalMachine\My\<Thumbprint> - the same store
+      Get-DeltaIisExistingHttpsCertificateState already confirmed this
+      thumbprint resolves in) purely for display, alongside the
+      thumbprint this function has always shown - read-only, never
+      re-used for any decision this function itself makes. "if available"
+      per this feature's own requirement: a certificate that somehow no
+      longer resolves by the time this displays (a narrow race, since
+      CertificateExists was already confirmed true moments earlier) shows
+      "Unknown" rather than failing this prompt outright.
     #>
     param([Parameter(Mandatory)]$ExistingState)
+
+    $certificate = Get-Item -LiteralPath "Cert:\LocalMachine\My\$($ExistingState.Thumbprint)" -ErrorAction SilentlyContinue
 
     Write-Host ''
     Write-Host ('-' * $Script:BannerWidth)
     Write-Host ''
-    Write-Host 'An SSL certificate is already configured for this website.'
+    Write-Host 'SSL Certificate Review'
+    Write-Host ''
+    Write-Host 'An SSL certificate is already configured for this website. Review it before the website is activated.'
+    Write-Host ''
+    Write-Host 'Subject'
+    Write-Host ''
+    Write-Detail $(if ($certificate) { $certificate.Subject } else { 'Unknown' })
     Write-Host ''
     Write-Host 'Thumbprint'
     Write-Host ''
     Write-Detail $ExistingState.Thumbprint
     Write-Host ''
+    Write-Host 'Expires'
+    Write-Host ''
+    Write-Detail $(if ($certificate) { $certificate.NotAfter.ToString('yyyy-MM-dd') } else { 'Unknown' })
+    Write-Host ''
     Write-Host 'Choose an option:'
     Write-Host ''
     Write-Host '1) Replace existing certificate'
     Write-Host '2) Keep existing certificate'
-    Write-Host '3) Cancel'
+    Write-Host '3) Cancel activation'
     Write-Host ''
     Write-Host ('-' * $Script:BannerWidth)
     Write-Host ''
@@ -1426,40 +1449,51 @@ function Import-DeltaIisSslCertificate {
 
 function Confirm-DeltaIisHttpsBinding {
     <#
-      HTTPS Binding (this phase's own section) - creates or reconciles
-      ONLY this installer's own single HTTPS:443 binding (matched by
-      protocol and port, never by replacing the site's entire bindings
-      collection - the identical discipline Phase 6's own
-      Confirm-DeltaIisWebsiteBinding already established for the HTTP
-      binding), so any OTHER HTTPS binding an administrator added by hand
-      is left completely untouched, per this phase's own "Do not disturb
-      unrelated HTTPS bindings" / "Do not remove administrator-created
-      bindings" requirements. SNI (sslFlags = 1) is always enabled -
-      required for a host-header-based HTTPS binding to coexist with any
-      other HTTPS site already on the same IP/port.
+      HTTPS Binding (this phase's own section) - creates ONLY this
+      installer's own single HTTPS:443 binding (matched by protocol and
+      port, never by replacing the site's entire bindings collection -
+      the identical discipline Phase 6's own Confirm-DeltaIisWebsiteBinding
+      already established for the HTTP binding), so any OTHER HTTPS
+      binding an administrator added by hand is left completely untouched,
+      per this phase's own "Do not disturb unrelated HTTPS bindings" /
+      "Do not remove administrator-created bindings" requirements. SNI
+      is always enabled - required for a host-header-based HTTPS binding
+      to coexist with any other HTTPS site already on the same IP/port.
 
-      Uses lib\DeltaDoctor.IIS.ps1's own Microsoft.Web.Administration
-      site/binding primitives (Get-DeltaIisServerManager/
-      Get-DeltaIisSiteByName/Get-DeltaIisSiteBindingByProtocolAndPort/
-      Save-DeltaIisConfiguration/Add-DeltaIisCertificateToBinding), never
-      WebAdministration - the binding must actually be COMMITTED before
-      the certificate can be associated with it, so this creates/updates
-      the binding and commits first, then gets a completely FRESH
-      ServerManager to re-resolve the binding before calling
-      Add-DeltaIisCertificateToBinding - mirroring the original
-      WebAdministration-era "re-fetch via Get-WebBinding before
-      AddSslCertificate" step exactly, just with a fresh ServerManager
-      instead of a fresh cmdlet call.
+      ARCHITECTURE CORRECTION: this used to create/update the binding
+      first (Site.Bindings.Add(bindingInformation, 'https'), or patching
+      BindingInformation on an already-existing one), commit, then set
+      CertificateHash/CertificateStoreName on that already-committed
+      Binding object afterward as a separate step. Confirmed directly
+      against a real IIS binding that this does NOT persist the
+      certificate association at all - a fresh ServerManager re-read the
+      binding back with an empty CertificateHash even though the property
+      assignment and the following CommitChanges both reported success.
+      Microsoft.Web.Administration's own BindingCollection exposes a
+      dedicated overload - Add(bindingInformation, certificateHash,
+      certificateStoreName, sslFlags) - that is the only way confirmed to
+      actually persist an SNI HTTPS binding's own certificate
+      association; certificate information can only be attached
+      atomically at Add() time, never patched onto an existing Binding
+      object afterward. So: any existing installer-owned HTTPS:443
+      binding is REMOVED first (Site.Bindings.Remove - safe, since this
+      only ever matches this installer's own single binding by protocol
+      and port, exactly like the discipline this function has always
+      followed) and the binding is then always recreated fresh via that
+      one atomic Add overload, never a two-step create-then-attach.
 
-      The certificate is associated by thumbprint via
-      Add-DeltaIisCertificateToBinding (which wraps the binding object's
-      own native AddSslCertificate method) - confirmed directly against a
-      real IIS binding that calling it again on an already-bound binding
-      with a DIFFERENT thumbprint correctly replaces the association in
-      place (certificateHash updates, no duplicate binding created), so
-      this same call handles both "no certificate yet" and "replace the
-      existing certificate" without needing to branch on which case this
-      run is in.
+      The certificate hash is the imported certificate's own
+      GetCertHash() (X509Certificate2, resolved fresh from
+      Cert:\LocalMachine\My by thumbprint) - the exact bytes IIS itself
+      would compute, never a hand-rolled hex decode of $Thumbprint.
+
+      Commits exactly once, then re-reads the site and binding through a
+      completely FRESH ServerManager - never the one just committed
+      through - and verifies the binding's own certificate thumbprint
+      (Get-DeltaIisBindingCertificateThumbprint) genuinely matches
+      $Thumbprint before ever reporting success; a mismatch (or the
+      hash still empty) is treated exactly like a binding that failed to
+      appear at all - Stop-Setup, never a silent "configured" claim.
     #>
     param([Parameter(Mandatory)][string]$Thumbprint)
 
@@ -1467,42 +1501,39 @@ function Confirm-DeltaIisHttpsBinding {
 
     $desiredBindingInformation = "*:443:$($Script:DeltaWebsiteDomain)"
 
+    $certificate = Get-Item -LiteralPath "Cert:\LocalMachine\My\$Thumbprint" -ErrorAction SilentlyContinue
+    if (-not $certificate) {
+        Stop-Setup "Failed to configure the HTTPS binding - no certificate with thumbprint '$Thumbprint' exists in Cert:\LocalMachine\My."
+    }
+    $certificateHash = $certificate.GetCertHash()
+
     $serverManager = Get-DeltaIisServerManager
     $site = Get-DeltaIisSiteByName -ServerManager $serverManager -Name $Script:DeltaIisSiteName
     $existingHttpsBinding = Get-DeltaIisSiteBindingByProtocolAndPort -Site $site -Protocol 'https' -Port 443
 
-    if (-not $existingHttpsBinding) {
-        $newBinding = $site.Bindings.Add($desiredBindingInformation, 'https')
-        $newBinding.SetAttributeValue('sslFlags', 1)
-        Save-DeltaIisConfiguration -ServerManager $serverManager -SectionName 'Sites' -PropertyDescription "create HTTPS binding for '$($Script:DeltaIisSiteName)'"
-        Write-Detail "Binding created: $desiredBindingInformation"
-    }
-    elseif ($existingHttpsBinding.BindingInformation -ne $desiredBindingInformation) {
-        $existingHttpsBinding.BindingInformation = $desiredBindingInformation
-        Save-DeltaIisConfiguration -ServerManager $serverManager -SectionName 'Sites' -PropertyDescription "update HTTPS binding for '$($Script:DeltaIisSiteName)'"
-        Write-Detail "Binding updated: $($existingHttpsBinding.BindingInformation) -> $desiredBindingInformation"
-    }
-    else {
-        Write-Detail "Binding already correct: $desiredBindingInformation"
+    if ($existingHttpsBinding) {
+        $site.Bindings.Remove($existingHttpsBinding)
+        Write-Detail "Existing binding removed: $($existingHttpsBinding.BindingInformation)"
     }
 
-    # A brand new ServerManager - never the one used to create/update the
-    # binding above - so the certificate is associated against a binding
-    # freshly re-read from applicationHost.config, never an in-memory
-    # object whose own commit might not have taken effect.
+    $site.Bindings.Add($desiredBindingInformation, $certificateHash, 'MY', [Microsoft.Web.Administration.SslFlags]::Sni) | Out-Null
+    Save-DeltaIisConfiguration -ServerManager $serverManager -SectionName 'Sites' -PropertyDescription "create HTTPS binding for '$($Script:DeltaIisSiteName)'"
+    Write-Detail "Binding created: $desiredBindingInformation"
+
+    # A brand new ServerManager - never the one just committed through -
+    # so verification reads the binding freshly from applicationHost.config,
+    # never an in-memory object whose own commit might not have taken
+    # effect.
     $verifyServerManager = Get-DeltaIisServerManager
     $verifySite = Get-DeltaIisSiteByName -ServerManager $verifyServerManager -Name $Script:DeltaIisSiteName
     $binding = Get-DeltaIisSiteBindingByProtocolAndPort -Site $verifySite -Protocol 'https' -Port 443
     if (-not $binding -or $binding.BindingInformation -ne $desiredBindingInformation) {
-        Stop-Setup 'Failed to configure the HTTPS binding - the binding could not be found immediately after creation/update.'
+        Stop-Setup 'Failed to configure the HTTPS binding - the binding could not be found immediately after creation.'
     }
 
-    try {
-        Add-DeltaIisCertificateToBinding -Binding $binding -Thumbprint $Thumbprint -StoreName 'my'
-        Save-DeltaIisConfiguration -ServerManager $verifyServerManager -SectionName 'Sites' -PropertyDescription "associate certificate with HTTPS binding for '$($Script:DeltaIisSiteName)'"
-    }
-    catch {
-        Stop-Setup "Failed to associate the certificate with the HTTPS binding: $($_.Exception.Message)"
+    $bindingThumbprint = Get-DeltaIisBindingCertificateThumbprint -Binding $binding
+    if ($bindingThumbprint -ne $Thumbprint) {
+        Stop-Setup "Failed to configure the HTTPS binding - the binding's own certificate thumbprint is '$(if ($bindingThumbprint) { $bindingThumbprint } else { 'empty' })', expected '$Thumbprint'."
     }
 
     Write-Success '    HTTPS binding configured.'
@@ -1608,26 +1639,64 @@ function Show-DeltaIisSslSummary {
     Write-Host ('-' * $Script:BannerWidth)
 }
 
+function Show-DeltaIisSslActivationCancelledNotice {
+    <#
+      UX polish only - the SSL Certificate Review's own dedicated Cancel
+      notice, worded for "activation" rather than reusing the generic,
+      Phase-3-scoped Show-DeltaIisInstallCancelledNotice ("Setup
+      canceled."). Only ever reached via Invoke-DeltaIisSslCertificateSetup's
+      own Cancel branch, which itself is only reachable when a
+      certificate already exists on an ALREADY-configured site - "setup"
+      language would be inaccurate there; the administrator is activating
+      an existing reverse proxy, not installing one. Same shape
+      (dash-rule banner, "no changes made" reassurance) as every other
+      cancellation notice in this project - purely a different choice of
+      words for a genuinely different scenario, never a different
+      outcome.
+    #>
+
+    Write-Host ''
+    Write-Host ('=' * $Script:BannerWidth) -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host 'Activation canceled.'
+    Write-Host ''
+    Write-Host 'No changes have been made.'
+    Write-Host ''
+    Write-Host ('=' * $Script:BannerWidth) -ForegroundColor Yellow
+    Write-Host ''
+}
+
 function Invoke-DeltaIisSslCertificateSetup {
     <#
-      The Phase 7 top-level orchestrator - the Certificate Wizard.
-      Checks Get-DeltaIisExistingHttpsCertificateState first: a genuinely
-      existing certificate branches into Replace/Keep/Cancel
-      (Read-DeltaIisExistingCertificateChoice); an orphaned binding shows
-      its own distinct notice and falls through to the fresh wizard;
-      nothing at all goes straight to the fresh Yes/No wizard
-      (Read-DeltaIisSslCertificateChoice). "No"/"Keep"/"Cancel" all return
-      without ever calling Import-DeltaIisSslCertificate - only "Yes" or
-      "Replace" reach the import/binding/verification steps. Reuses
-      Show-DeltaIisInstallCancelledNotice (Phase 3) verbatim for the
-      Cancel case - its wording is already completely generic.
+      The Phase 7 top-level orchestrator - the Certificate Wizard, now
+      titled "SSL Certificate Review" (UX polish only - see this file's
+      own Activation Summary/wording pass) to make clear this is a
+      review that happens BEFORE the website goes live, not merely an
+      installer step. Checks Get-DeltaIisExistingHttpsCertificateState
+      first: a genuinely existing certificate branches into
+      Replace/Keep/Cancel (Read-DeltaIisExistingCertificateChoice); an
+      orphaned binding shows its own distinct notice and falls through to
+      the fresh wizard; nothing at all goes straight to the fresh Yes/No
+      wizard (Read-DeltaIisSslCertificateChoice). "No"/"Keep"/"Cancel" all
+      return without ever calling Import-DeltaIisSslCertificate - only
+      "Yes" or "Replace" reach the import/binding/verification steps.
+
+      The Cancel case (only ever reachable via the existing-certificate
+      Keep/Replace/Cancel prompt - genuinely unreachable on a truly fresh
+      site, which has no certificate/binding to find yet) shows
+      Show-DeltaIisSslActivationCancelledNotice - its own dedicated
+      notice, worded for "activation," never the shared, Phase-3-generic
+      Show-DeltaIisInstallCancelledNotice this used to reuse; since Cancel
+      can only happen here when reconciling/activating an ALREADY-existing
+      site, "activation" wording is always accurate, unlike "setup" would
+      be.
     #>
 
     if (-not (Test-DeltaIisManagementAssemblyAvailable)) {
         Stop-Setup 'Microsoft.Web.Administration is unavailable, so SSL certificate setup cannot proceed. Re-run Phase 3 (Microsoft IIS Installation) first.'
     }
 
-    Write-PhaseBanner 'SSL Certificate'
+    Write-PhaseBanner 'SSL Certificate Review'
 
     $existingState = Get-DeltaIisExistingHttpsCertificateState
 
@@ -1640,7 +1709,7 @@ function Invoke-DeltaIisSslCertificateSetup {
             return [PSCustomObject]@{ HttpsConfigured = $true; Thumbprint = $existingState.Thumbprint; Source = 'Existing'; Cancelled = $false }
         }
         if ($choice -eq 'Cancel') {
-            Show-DeltaIisInstallCancelledNotice
+            Show-DeltaIisSslActivationCancelledNotice
             return [PSCustomObject]@{ HttpsConfigured = $false; Thumbprint = $null; Source = $null; Cancelled = $true }
         }
         # 'Replace' falls through to the import flow below.
@@ -2261,22 +2330,47 @@ function Resolve-DeltaIisPublicUrlSync {
       DELTA itself is never restarted here, in any of the four outcomes -
       see this section's own header for why.
 
-      Does NOT itself ensure the website ends up Active/Started - the
-      orchestration block's own caller does that exactly once, via
-      Start-DeltaIisManagedWebsite, immediately after this function
-      returns (see that call site's own comment), regardless of which of
-      the four outcomes above actually ran. Ensuring "the site is running
-      by the time the management menu opens" is that ONE call's job,
-      not this function's - duplicating it into just one of the four
-      branches here previously left the other three (in particular the
-      overwhelmingly common "already matching, nothing to do" case) with
-      no such guarantee at all.
+      Does NOT itself ensure the website ends up Active/Started, and (per
+      the ARCHITECTURE CORRECTION below) does NOT itself write PUBLIC_URL
+      for a genuine mismatch either anymore - both are the orchestration
+      block's own job, in that order, after this function returns (see
+      that call site's own comments), regardless of which of the four
+      outcomes above actually ran. Ensuring "the site is running by the
+      time the management menu opens" is that ONE call's job, not this
+      function's - duplicating it into just one of the four branches here
+      previously left the other three (in particular the overwhelmingly
+      common "already matching, nothing to do" case) with no such
+      guarantee at all.
+
+      ARCHITECTURE CORRECTION: the "genuine mismatch" branch used to call
+      Sync-DeltaPublicUrlEnvironment itself, immediately after reconciling
+      IIS's own local configuration - before the orchestrator's own
+      subsequent Start-DeltaIisManagedWebsite call ever ran, and before
+      any Manual Reverse Proxy Handover check existed on this path at
+      all. A real "NGINX Active, IIS Standby" run hit exactly the bug
+      that shape allowed: PUBLIC_URL got resynced to IIS's own URL, and
+      only THEN did starting the site fail (0x80070020 - NGINX still
+      owned the required ports), leaving .env pointing at a URL nothing
+      was actually serving. This branch now only reconciles IIS's own
+      local configuration (matching setup-nginx.ps1's own
+      Resolve-DeltaNginxPublicUrlSync, which always saves NGINX's own
+      configuration regardless of handover) and returns a
+      [PSCustomObject] { Domain; Https } describing the sync that still
+      needs to happen - never $null, since Test-DeltaPublicUrlsMatch
+      above already confirmed a genuine mismatch when this branch is
+      reached at all - for the orchestrator to apply only once
+      Start-DeltaIisManagedWebsite has actually succeeded and the Manual
+      Reverse Proxy Handover (if NGINX was Active) has already been
+      confirmed or was never needed. The other three outcomes above
+      return $null - nothing pending, either because nothing needed
+      changing or because the immediate backfill (PUBLIC_URL absent
+      entirely, nothing to conflict with) already fully handled itself.
     #>
     param([Parameter(Mandatory)]$ManagedSite)
 
     $hostHeader = Get-DeltaIisSiteHostHeader -Site $ManagedSite
     if (-not $hostHeader) {
-        return
+        return $null
     }
 
     $httpsState = Get-DeltaIisExistingHttpsCertificateState
@@ -2287,11 +2381,11 @@ function Resolve-DeltaIisPublicUrlSync {
 
     if (-not $envUrl) {
         Sync-DeltaPublicUrlEnvironment -Domain $hostHeader -Https:$isHttps
-        return
+        return $null
     }
 
     if (Test-DeltaPublicUrlsMatch -First $configuredUrl -Second $envUrl) {
-        return
+        return $null
     }
 
     Show-DeltaIisPublicUrlMismatchNotice -ConfiguredUrl $configuredUrl -EnvUrl $envUrl
@@ -2312,7 +2406,104 @@ function Resolve-DeltaIisPublicUrlSync {
 
     Confirm-DeltaIisWebsiteConfigurationResult | Out-Null
 
-    Sync-DeltaPublicUrlEnvironment -Domain $Script:DeltaWebsiteDomain -Https:$isHttps
+    return [PSCustomObject]@{ Domain = $Script:DeltaWebsiteDomain; Https = $isHttps }
+}
+
+function Show-DeltaIisActivationSummary {
+    <#
+      UX polish only - shown once, immediately before the SSL Certificate
+      Review, from inside Invoke-DeltaIisActivationSslReview (below),
+      purely to explain what is about to happen before the review appears
+      unannounced. Display-only: decides nothing, changes nothing, and
+      does not alter the order, gating, or outcome of any of the steps it
+      lists - those are exactly the same steps, in exactly the same
+      order, this file's own orchestration/menu actions already perform
+      (Invoke-DeltaIisActivationSslReview itself, then
+      Test-DeltaIisPortPrerequisites, then Start-DeltaIisManagedWebsite,
+      then Show-DeltaIisPostHandoverValidation, then the caller's own
+      final PUBLIC_URL sync). "Perform reverse-proxy handover (if
+      required)" is listed unconditionally since there is no way to know
+      in advance, before Get-DeltaReverseProxyHandoverPlan actually runs,
+      whether a handover is even needed this time.
+    #>
+
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+    Write-Host ''
+    Write-Host 'Activate Microsoft IIS'
+    Write-Host ''
+    Write-Host 'The following actions will be performed:'
+    Write-Host ''
+    Write-Host '    - Review the SSL certificate'
+    Write-Host '    - Perform reverse-proxy handover (if required)'
+    Write-Host '    - Start Microsoft IIS'
+    Write-Host '    - Validate the deployment'
+    Write-Host '    - Synchronize PUBLIC_URL'
+    Write-Host ''
+    Write-Host 'No changes will be made until all required steps have completed successfully.'
+    Write-Host ''
+    Write-Host ('-' * $Script:BannerWidth)
+}
+
+function Invoke-DeltaIisActivationSslReview {
+    <#
+      The single, shared SSL Certificate Review gate for EVERY code path
+      that can transition the DELTA-managed website from not-Started to
+      Started: the orchestration block's own Existing Managed Site
+      branch, and this file's own management menu ("Start Website"/
+      "Restart Website" actions, below) - all three call this, never
+      Invoke-DeltaIisSslCertificateSetup directly, so the review happens
+      identically regardless of entry point, per this feature's own
+      "consistent... across every code path that activates a reverse
+      proxy" requirement. One shared gate, reused verbatim, rather than
+      three separate copies of the same "am I about to activate" check.
+
+      A no-op ($null, nothing runs - no review, no prompt) whenever the
+      site is already Started, or does not exist at all: neither this
+      review nor the Manual Reverse Proxy Handover it is always called
+      immediately before (every one of this function's own callers) apply
+      to a provider that isn't actually transitioning to Active - in
+      particular, "Restart Website" on an already-Running site is a
+      restart-in-place, never an activation, and gets no review either.
+
+      $Script:DeltaWebsiteDomain is set here from the site's own current,
+      live host header - read via a brand new ServerManager/site lookup,
+      never a caller-supplied object that might be stale (Resolve-DeltaIisPublicUrlSync,
+      when it just reconciled a genuine domain mismatch, commits that
+      change through its OWN separate ServerManager before this ever
+      runs, so a fresh read here already reflects it without this
+      function needing to know that happened at all).
+      Confirm-DeltaIisHttpsBinding (inside the wizard) needs this domain
+      set to build the correct binding.
+
+      Shows Show-DeltaIisActivationSummary (UX polish only - see that
+      function's own header) immediately before the review itself, so it
+      never appears unannounced regardless of which caller reached here.
+
+      Returns whatever Invoke-DeltaIisSslCertificateSetup itself returned
+      (HttpsConfigured/Thumbprint/Source/Cancelled) when the review
+      actually ran, or $null when it was skipped (already Started) -
+      every caller uses this to decide whether/how to sync PUBLIC_URL
+      once the site has actually started successfully.
+    #>
+    param()
+
+    $serverManager = Get-DeltaIisServerManager
+    $site = Get-DeltaIisSiteByName -ServerManager $serverManager -Name $Script:DeltaIisSiteName
+    if (-not $site -or (Get-DeltaIisSiteState -Site $site) -eq 'Started') {
+        return $null
+    }
+
+    $Script:DeltaWebsiteDomain = Get-DeltaIisSiteHostHeader -Site $site
+
+    Show-DeltaIisActivationSummary
+
+    $sslResult = Invoke-DeltaIisSslCertificateSetup
+    if ($sslResult.Cancelled) {
+        exit 0
+    }
+
+    return $sslResult
 }
 
 function Show-DeltaIisManagementMenu {
@@ -2453,16 +2644,33 @@ function Show-DeltaIisManagementMenu {
 
         switch ($choice.Trim()) {
             '1' {
-                # Fresh, never the menu-entry snapshot - see this
-                # function's own header for the real bug this fixes.
+                # SSL Certificate Review first (Invoke-DeltaIisActivationSslReview -
+                # a no-op if the site is already Started), then the
+                # Manual Reverse Proxy Handover, fresh, never the
+                # menu-entry snapshot - see this function's own header for
+                # the real bug that fixed. PUBLIC_URL is only resynced
+                # once the site has actually started, and only if the
+                # review actually ran.
+                $sslResult = Invoke-DeltaIisActivationSslReview
                 Test-DeltaIisPortPrerequisites -ReverseProxyState (Get-DeltaReverseProxyState)
                 Start-DeltaIisManagedWebsite
+                if ($sslResult) {
+                    Sync-DeltaPublicUrlEnvironment -Domain $Script:DeltaWebsiteDomain -Https:$sslResult.HttpsConfigured
+                }
                 Show-DeltaIisPostHandoverValidation
             }
             '2' { Stop-DeltaIisManagedWebsite }
             '3' {
+                # Same SSL Certificate Review gate as "Start Website"
+                # above - a no-op here whenever the site is already
+                # Started, since Restart Website on an already-Running
+                # site is a restart-in-place, never an activation.
+                $sslResult = Invoke-DeltaIisActivationSslReview
                 Test-DeltaIisPortPrerequisites -ReverseProxyState (Get-DeltaReverseProxyState)
                 Restart-DeltaIisManagedWebsite
+                if ($sslResult) {
+                    Sync-DeltaPublicUrlEnvironment -Domain $Script:DeltaWebsiteDomain -Https:$sslResult.HttpsConfigured
+                }
                 Show-DeltaIisPostHandoverValidation
             }
             '4' { Restart-DeltaIisManagedAppPool }
@@ -2565,18 +2773,28 @@ try {
     # time (every check below simply reports failing, and the offered
     # repair creates it) or being reconciled because something about an
     # existing site broke.
-    # Manual Reverse Proxy Handover - only on the fresh-install path (no
-    # managed site exists yet, so this checkup is about to CREATE and bind
-    # the website for the first time): if NGINX is DELTA's active reverse
-    # proxy, offer to stop it before the checkup ever runs. Deliberately
-    # NOT run ahead of the existing-managed-site path below - an existing,
-    # already-active site isn't about to bind anything new, and that
-    # path's own handover point is the management menu's own Start/Restart
-    # actions instead (see Show-DeltaIisManagementMenu's own header). Also
-    # deliberately kept OUTSIDE Invoke-DeltaIisConfigurationCheckup itself -
-    # that shared cycle is also called by doctor.ps1, which must never gain
-    # this feature's own interactive prompt (see this section's own header
-    # further up this file).
+    # Manual Reverse Proxy Handover - on the fresh-install path (no managed
+    # site exists yet, so this checkup is about to CREATE and bind the
+    # website for the first time), if NGINX is DELTA's active reverse
+    # proxy, offer to stop it before the checkup ever runs. NOT run ahead
+    # of the existing-managed-site path below for the same reason - that
+    # path's own handover point is immediately before IT first tries to
+    # start the site (see the "Existing Managed Site" branch below,
+    # immediately before its own Start-DeltaIisManagedWebsite call) -
+    # ARCHITECTURE CORRECTION: a "managed site already exists and reports
+    # Healthy" is a fact about its CONFIGURATION only, never about whether
+    # it is actually running - an existing site can just as easily be
+    # Standby behind an Active NGINX as a fresh one can, and Confirm-
+    # DeltaIisWebsiteConfigurationResult/Get-DeltaIisConfigurationCheckup
+    # have no opinion on that either way (this is exactly the gap a real
+    # "NGINX Active, IIS Standby" run hit: Start-DeltaIisManagedWebsite
+    # used to run there completely unguarded and failed with 0x80070020 -
+    # NGINX still owned the required ports - after PUBLIC_URL had already
+    # been resynced to IIS's own URL). Also deliberately kept OUTSIDE
+    # Invoke-DeltaIisConfigurationCheckup itself - that shared cycle is
+    # also called by doctor.ps1, which must never gain this feature's own
+    # interactive prompt (see this section's own header further up this
+    # file).
     if (-not $websiteResult.ManagedSite) {
         Test-DeltaIisPortPrerequisites -ReverseProxyState $reverseProxyState
     }
@@ -2595,7 +2813,43 @@ try {
         # attention" posture rather than presenting a menu for a site this
         # script cannot yet vouch for.
         if ($checkup.Healthy) {
-            Resolve-DeltaIisPublicUrlSync -ManagedSite $websiteResult.ManagedSite
+            # Resolve-DeltaIisPublicUrlSync only ever reconciles IIS's own
+            # local configuration (web.config/binding/application pool)
+            # now, and never writes PUBLIC_URL itself - see that
+            # function's own header for why. A pending sync (Domain/Https)
+            # is returned only from its "genuine mismatch" branch; $null
+            # otherwise (nothing to sync, or already backfilled with
+            # nothing to conflict with).
+            $pendingPublicUrlSync = Resolve-DeltaIisPublicUrlSync -ManagedSite $websiteResult.ManagedSite
+
+            # SSL Certificate Review - Invoke-DeltaIisActivationSslReview
+            # is the one shared gate every code path that can activate
+            # IIS goes through (see that function's own header) - a no-op
+            # ($null) when the site is already Started, otherwise the
+            # review runs and $Script:DeltaWebsiteDomain is (re)resolved
+            # from the site's own current, live host header, which
+            # already reflects whatever Resolve-DeltaIisPublicUrlSync
+            # itself just committed above, if anything.
+            $sslResult = Invoke-DeltaIisActivationSslReview
+
+            # Manual Reverse Proxy Handover - immediately after the SSL
+            # Certificate Review above (never before it - see that
+            # function's own header for why), and immediately before this
+            # branch's own first attempt to start the site, exactly like
+            # the fresh-install path's own identical call above (see that
+            # call site's own comment for the full rationale this
+            # mirrors) and setup-nginx.ps1's own identical guard on its
+            # own management-flow side. "Only when Stopped" matches
+            # Resolve-DeltaNginxPublicUrlSync's own identical guard - a
+            # Running/Started site already owns its ports, so checking
+            # here too would misreport IIS's own already-held ports as a
+            # conflict against itself. A decline is a complete, reported
+            # no-op (exit 0) - PUBLIC_URL has not been touched (nothing
+            # above ever wrote it), the site has not been started, and
+            # NGINX remains DELTA's active reverse proxy.
+            if ((Get-DeltaIisSiteState -Site $websiteResult.ManagedSite) -ne 'Started') {
+                Test-DeltaIisPortPrerequisites -ReverseProxyState $reverseProxyState
+            }
 
             # Start the managed reverse proxy - the exact same call, in
             # the exact same "Repair/Configure -> Start -> hand off" order,
@@ -2616,6 +2870,31 @@ try {
             # path into this branch, not just the mismatch one.
             Start-DeltaIisManagedWebsite
 
+            # Deployment Validation - only ever prints Doctor's own
+            # re-detection when a Manual Reverse Proxy Handover actually
+            # occurred just above (see this function's own header) - the
+            # same "Doctor confirms the new Active Provider" check the
+            # fresh-install path below already performs in the identical
+            # position, immediately after its own Start-DeltaIisManagedWebsite.
+            Show-DeltaIisPostHandoverValidation
+
+            # PUBLIC_URL is synced last, only now that the site has
+            # actually started successfully (a failed Start-DeltaIisManagedWebsite
+            # above throws out to the top-level catch, so nothing past
+            # that point - including this - ever runs). $sslResult, when
+            # set, reflects the genuinely FINAL HTTP/HTTPS outcome
+            # (including a certificate installed just above) and takes
+            # priority over $pendingPublicUrlSync's own, now possibly
+            # stale, Https value; $pendingPublicUrlSync alone still
+            # covers a domain-only mismatch that never touched HTTPS at
+            # all. Neither set means nothing here needs syncing.
+            if ($sslResult) {
+                Sync-DeltaPublicUrlEnvironment -Domain $Script:DeltaWebsiteDomain -Https:$sslResult.HttpsConfigured
+            }
+            elseif ($pendingPublicUrlSync) {
+                Sync-DeltaPublicUrlEnvironment -Domain $pendingPublicUrlSync.Domain -Https:$pendingPublicUrlSync.Https
+            }
+
             Show-DeltaIisManagementMenu
         }
         exit 0
@@ -2628,13 +2907,40 @@ try {
         exit 1
     }
 
+    # The Certificate Wizard - reached BEFORE the website is ever started.
+    # Binding/certificate association (Confirm-DeltaIisHttpsBinding, called
+    # from inside Invoke-DeltaIisSslCertificateSetup) only ever writes to
+    # applicationHost.config via ServerManager - it needs no more than the
+    # site to already exist (Invoke-DeltaIisConfigurationCheckup above
+    # already guarantees that), never W3SVC/WAS actually running, so
+    # running this first is always safe. Doing it first, rather than
+    # after Start-DeltaIisManagedWebsite below, is what guarantees the
+    # HTTPS binding is already committed by the time the site ever goes
+    # live - previously this ran AFTER the site was started, so the site's
+    # very first requests were served HTTP-only regardless of the
+    # administrator's choice here, and an interruption between the two
+    # calls (the site starting, then this wizard never completing) left a
+    # healthy-looking HTTP-only site behind that every later run's own
+    # "does a managed site already exist" check treats as fully
+    # configured - permanently skipping this wizard on every subsequent
+    # run. Cancel exits immediately here, before the site is ever started
+    # or the summary shown, mirroring setup-nginx.ps1's own Cancel path
+    # (Show-SslCertificateCancelledNotice + exit 0, bypassing the summary
+    # entirely). Decline ("No") and Keep both fall through normally, since
+    # both are complete, successful outcomes.
+    $sslResult = Invoke-DeltaIisSslCertificateSetup
+    if ($sslResult.Cancelled) {
+        exit 0
+    }
+
     # Start the managed reverse proxy - the direct IIS analogue of
-    # setup-nginx.ps1's own Start-DeltaNginx call, in the same position in
-    # the lifecycle (Repair/Configure -> Start -> Validate deployment).
-    # Invoke-DeltaIisConfigurationCheckup above only ever creates/reconciles
-    # the site's own configuration (application pool, web.config, HTTP
-    # binding) - it never starts it, so without this call the website could
-    # be left Healthy but never Active (Doctor's own
+    # setup-nginx.ps1's own Start-DeltaNginx call, now reached only once
+    # the Certificate Wizard above has already finished, so any HTTPS
+    # binding it configured is already in place before the site ever goes
+    # live. Invoke-DeltaIisConfigurationCheckup only ever creates/
+    # reconciles the site's own HTTP configuration (application pool,
+    # web.config, HTTP binding) - it never starts it, so without this call
+    # the website could be left Healthy but never Active (Doctor's own
     # Get-DeltaIisReverseProxyProviderState reads Active straight from the
     # site's own state (Get-DeltaIisSiteState -eq 'Started'), a genuine
     # runtime fact site creation does not always leave true on its own).
@@ -2654,16 +2960,10 @@ try {
     # Start-DeltaNginx.
     Show-DeltaIisPostHandoverValidation
 
-    # The Certificate Wizard. Cancel exits immediately here, before the
-    # summary, mirroring setup-nginx.ps1's own Cancel path
-    # (Show-SslCertificateCancelledNotice + exit 0, bypassing the summary
-    # entirely). Decline ("No") and Keep both fall through to the summary
-    # normally, since both are complete, successful outcomes.
-    $sslResult = Invoke-DeltaIisSslCertificateSetup
-    if ($sslResult.Cancelled) {
-        exit 0
-    }
-
+    # PUBLIC_URL is synced last, from $sslResult.HttpsConfigured - the
+    # genuinely final outcome of the Certificate Wizard above, read after
+    # both the HTTP/HTTPS configuration and the website start have
+    # completed, never a scheme guessed ahead of either.
     Sync-DeltaPublicUrlEnvironment -Domain $Script:DeltaWebsiteDomain -Https:$sslResult.HttpsConfigured
 
     Show-DeltaIisSslSummary -SslResult $sslResult

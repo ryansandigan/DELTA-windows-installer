@@ -263,6 +263,52 @@ function Get-DeltaIisVersion {
     return ($versionString -replace '^Version\s+', '').Trim()
 }
 
+function Test-DeltaWindowsServicingActive {
+    <#
+      Whether Windows servicing (Component Based Servicing - the
+      TrustedInstaller/TiWorker machinery behind Windows Update and
+      Add/Remove Windows Features alike) is actively processing an
+      operation on this machine right now - the one precondition
+      Get-DeltaIisDetectionResult's own Get-WindowsFeature/
+      Get-WindowsOptionalFeature loop (immediately below) must check
+      before it runs, not after it stalls.
+
+      Confirmed directly, not assumed: with TiWorker.exe running,
+      Get-WindowsFeature -Name Web-Server blocked for 60+ seconds with no
+      timeout of its own (traced instrumentation showed the CALL line with
+      no matching RETURN); the moment TiWorker.exe exited, the identical
+      call returned in ~1.3 seconds. Get-WindowsFeature/
+      Get-WindowsOptionalFeature both go through the same CBS backend
+      TrustedInstaller/TiWorker hold exclusive access to while servicing
+      is in progress, so this check applies before either branch of
+      Test-DeltaIisFeatureInstalled, regardless of OperatingSystemType.
+
+      Deliberately keys off the PROCESSES (TiWorker.exe/TrustedInstaller.exe
+      existing), never the TrustedInstaller SERVICE's own Status: that
+      service can legitimately report Running while genuinely idle
+      (Windows keeps it started on demand for dependent operations), so
+      Get-Service would false-positive constantly. Also deliberately does
+      NOT key off any Component Based Servicing registry state
+      (e.g. SessionsPending) - confirmed directly that SessionsPending
+      still had six queued subkeys on this same machine a full 90 seconds
+      after TiWorker.exe had already exited and Get-WindowsFeature was
+      responding normally again, so that key reports "queued/historical",
+      not "actively running right now", and would false-positive too.
+      TiWorker.exe's own existence is the only signal observed to
+      correlate with the actual hang window.
+
+      Never throws (Get-Process -ErrorAction SilentlyContinue) and never
+      installs/starts/stops anything - a detection primitive exactly like
+      every other function in this section.
+    #>
+    $servicingProcesses = @(Get-Process -Name 'TiWorker', 'TrustedInstaller' -ErrorAction SilentlyContinue)
+
+    return [PSCustomObject]@{
+        Active       = ($servicingProcesses.Count -gt 0)
+        ProcessNames = @($servicingProcesses | Select-Object -ExpandProperty ProcessName -Unique)
+    }
+}
+
 function Get-DeltaIisDetectionResult {
     <#
       The orchestrator for this whole section - collects every fact IIS
@@ -280,7 +326,36 @@ function Get-DeltaIisDetectionResult {
       that was only partially removed (the registry key lingering with
       the role service actually gone, or vice versa) is exactly the kind
       of disagreement a single signal would silently paper over.
+
+      Stops immediately (Stop-Setup) if Test-DeltaWindowsServicingActive
+      reports Windows servicing is currently active - see that function's
+      own header for the confirmed, traced evidence of why: the feature
+      loop below has no timeout of its own, and this is reachable from
+      EVERY caller of Invoke-DeltaReverseProxyDetection
+      (lib\DeltaDoctor.ReverseProxy.ps1's own provider registry always
+      checks the IIS provider, even for a pure-NGINX deployment - see
+      that file's own header), so an unguarded hang here silently blocks
+      setup-nginx.ps1/doctor.ps1 runs that have nothing to do with IIS at
+      all. A fast, explicit error the administrator can act on (wait for
+      servicing to finish, re-run) is strictly better than the indefinite
+      hang this replaces - it never introduces a NEW blocking condition
+      for a caller that didn't already hang here before this check
+      existed.
     #>
+
+    $servicingState = Test-DeltaWindowsServicingActive
+    if ($servicingState.Active) {
+        Stop-Setup @"
+Windows servicing is currently in progress on this machine ($($servicingState.ProcessNames -join ', ') is running).
+
+IIS feature detection (Get-WindowsFeature/Get-WindowsOptionalFeature) has
+no timeout of its own and can block for the entire duration of a Windows
+servicing operation (Windows Update, a feature install/removal, a pending
+component cleanup).
+
+Please wait for Windows servicing to finish, then re-run this script.
+"@
+    }
 
     $osInfo  = Get-DeltaIisOperatingSystemInfo
     $version = Get-DeltaIisVersion
@@ -716,12 +791,56 @@ function New-DeltaIisApplicationPool {
     return $ServerManager.ApplicationPools.Add($Name)
 }
 
+function Start-DeltaIisPlatformServices {
+    <#
+      Starts WAS (Windows Process Activation Service) and W3SVC (World
+      Wide Web Publishing Service) if either isn't already running, and
+      waits until both genuinely report Running - the exact precondition
+      IIS itself enforces before any site or application pool can be
+      started ("Websites and application pools cannot be started unless
+      both... WAS and W3SVC are running", the COMException
+      Site.Start()/Start-DeltaIisSite below throws otherwise, most often
+      right after a fresh IIS role install where neither service has ever
+      been started yet). W3SVC depends on WAS, so WAS is started first;
+      each service is only asked to start if its own Status isn't already
+      Running, keeping this idempotent on every later, already-running
+      call. WaitForStatus is what actually blocks until each service
+      finishes transitioning - a fresh Get-Service snapshot no longer
+      reflects a Status still mid-transition immediately after
+      Start-Service returns.
+    #>
+
+    foreach ($serviceName in @('WAS', 'W3SVC')) {
+        $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if (-not $service) {
+            Stop-Setup "Required IIS service '$serviceName' was not found. Re-run Phase 3 (Microsoft IIS Installation) first."
+        }
+
+        if ($service.Status -ne 'Running') {
+            Write-Detail "Starting service '$serviceName'..."
+            Start-Service -Name $serviceName
+        }
+
+        try {
+            $service.WaitForStatus('Running', (New-TimeSpan -Seconds 30))
+        }
+        catch [System.ServiceProcess.TimeoutException] {
+            Stop-Setup "Service '$serviceName' did not reach the Running state within 30 seconds."
+        }
+    }
+}
+
 function Start-DeltaIisSite {
     <#
       $Site.Start() - the direct replacement for Start-Website -Name
       <name>. A live runtime action mediated by WAS, exactly like the
       WebAdministration cmdlet it replaces - never requires
-      CommitChanges, and never touches applicationHost.config.
+      CommitChanges, and never touches applicationHost.config. Callers
+      that cannot yet guarantee WAS/W3SVC are running (a fresh IIS
+      install, a machine that just rebooted) must call
+      Start-DeltaIisPlatformServices first - this function itself only
+      starts the one site, never the platform services Start() itself
+      depends on.
     #>
     param([Parameter(Mandatory)]$Site)
 
@@ -747,32 +866,6 @@ function Restart-DeltaIisApplicationPool {
     param([Parameter(Mandatory)]$Pool)
 
     $Pool.Recycle() | Out-Null
-}
-
-function Add-DeltaIisCertificateToBinding {
-    <#
-      $Binding.AddSslCertificate($Thumbprint, $StoreName) - a native
-      method on Microsoft.Web.Administration.Binding itself (added for IIS
-      8's SNI support), not something WebAdministration's Get-WebBinding
-      merely bolted on - so this carries over unchanged from
-      setup-iis.ps1's own original call, now reached with a binding
-      obtained via ServerManager instead. [void], never | Out-Null -
-      confirmed directly (setup-iis.ps1's own Confirm-DeltaIisHttpsBinding,
-      the only caller) that this method's own return value, left
-      unsuppressed, leaks into and corrupts the caller's own returned
-      object further up the call chain - see that call site's own comment
-      for the full story. Requires the change to already be committed
-      (the binding must genuinely exist in applicationHost.config) before
-      this is called, exactly like the WebAdministration-based version
-      always required a fresh Get-WebBinding re-fetch first.
-    #>
-    param(
-        [Parameter(Mandatory)]$Binding,
-        [Parameter(Mandatory)][string]$Thumbprint,
-        [Parameter(Mandatory)][string]$StoreName
-    )
-
-    [void]$Binding.AddSslCertificate($Thumbprint, $StoreName)
 }
 
 function Remove-DeltaIisSite {
@@ -1584,13 +1677,20 @@ function Repair-DeltaIisManagedWebsite {
 
 function Start-DeltaIisManagedWebsite {
     <#
-      Starts the DELTA-managed website only - never any other site, and
-      never W3SVC/IIS itself. A no-op, reported plainly, if the site is
-      already running, or if no DELTA-managed website exists at all right
-      now (nothing to start). Shared lifecycle primitive - consumed by
-      setup-iis.ps1's own management menu ("Start Website", "Restart
-      Website"), and available to any future caller (uninstall.ps1, a
-      future reverse-proxy.ps1) that needs the identical action.
+      Starts the DELTA-managed website only - never any other site. A
+      no-op, reported plainly, if the site is already running, or if no
+      DELTA-managed website exists at all right now (nothing to start).
+      Shared lifecycle primitive - consumed by setup-iis.ps1's own
+      management menu ("Start Website", "Restart Website"), and available
+      to any future caller (uninstall.ps1, a future reverse-proxy.ps1)
+      that needs the identical action.
+
+      Calls Start-DeltaIisPlatformServices first - WAS/W3SVC are not
+      guaranteed to already be running (most reliably reproduced right
+      after a fresh IIS role install, where neither has ever started
+      yet), and Site.Start() throws a COMException rather than starting
+      them itself. This is the only place that guarantee is established -
+      never duplicated at any of this function's own callers.
     #>
 
     $websiteResult = Get-DeltaIisManagedWebsiteResult
@@ -1605,6 +1705,8 @@ function Start-DeltaIisManagedWebsite {
         Write-Detail 'The website is already running.'
         return
     }
+
+    Start-DeltaIisPlatformServices
 
     Write-Step 'Starting the website...'
     Start-DeltaIisSite -Site $websiteResult.ManagedSite

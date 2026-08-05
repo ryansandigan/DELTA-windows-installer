@@ -60,14 +60,11 @@ $ErrorActionPreference = 'Stop'
 function Get-DeltaIisReverseProxyProviderState {
     <#
       Reuses lib\DeltaDoctor.IIS.ps1's own existing detection wholesale -
-      no independent IIS logic lives here. Installed comes from
-      Get-DeltaIisDetectionResult (the same IIS-role-service detection
-      setup-iis.ps1's own Phase 2/doctor.ps1's own IIS-prerequisite check
-      already use). ManagedByDelta/ConfigurationHealthy both come from a
-      single Get-DeltaDoctorWebsiteChecks call - the exact same function
-      doctor.ps1's own "Inspecting DELTA IIS configuration" section and
-      setup-iis.ps1's own "Validate Configuration" menu action already
-      call; ManagedByDelta is true only once that function's own
+      no independent IIS logic lives here. ManagedByDelta/ConfigurationHealthy
+      both come from a single Get-DeltaDoctorWebsiteChecks call - the exact
+      same function doctor.ps1's own "Inspecting DELTA IIS configuration"
+      section and setup-iis.ps1's own "Validate Configuration" menu action
+      already call; ManagedByDelta is true only once that function's own
       Get-DeltaIisManagedWebsiteResult call confirms BOTH the fixed site
       name AND the physical path belong to this DELTA installation (never
       the name alone - see that function's own header), and
@@ -83,11 +80,42 @@ function Get-DeltaIisReverseProxyProviderState {
       port/process check - the site's own IIS-reported state is a direct,
       first-party signal, not an inference from something else that could
       belong to a different site entirely.
+
+      Installed is deliberately NOT Get-DeltaIisDetectionResult's own
+      Get-WindowsFeature-derived value here (setup-iis.ps1's own Phase 2/
+      doctor.ps1's own IIS-prerequisite check still use that function
+      directly, unchanged, where the full role-service breakdown actually
+      matters for deciding what to install) - confirmed directly (traced
+      instrumentation against a real hang) that Get-WindowsFeature has no
+      timeout of its own and can block for the full duration of a Windows
+      servicing operation (TrustedInstaller/TiWorker holding the CBS
+      store), and this function runs unconditionally on every Reverse
+      Proxy Detection pass - including a pure-NGINX setup-nginx.ps1 run
+      that has no reason to ever wait on IIS-specific servicing state.
+      Every consumer of this Installed field (Show-DeltaReverseProxyReport,
+      setup-nginx.ps1's own Test-DeltaNginxPortPrerequisites) only ever
+      needed a correct yes/no "is IIS present on this machine", never the
+      specific per-role-service breakdown - so it's computed here from the
+      same two signals Get-DeltaIisDetectionResult itself already combines
+      for that exact boolean (never trust one alone, matching that
+      function's own documented rationale), minus the Get-WindowsFeature
+      call neither signal actually needs: Get-DeltaIisVersion (the
+      InetStp registry key, written once IIS has ever been installed -
+      a plain registry read, no CBS interaction) OR
+      Test-DeltaIisManagementAssemblyAvailable (Microsoft.Web.Administration.dll
+      only loads once IIS's management components are genuinely present -
+      an Add-Type call, not a CBS/ServerManager query). This function
+      already had to call Test-DeltaIisManagementAssemblyAvailable
+      unconditionally as its own second gate below, so folding it into
+      Installed's own calculation adds no new call, only reuses the
+      result.
     #>
 
-    $installed = (Get-DeltaIisDetectionResult).Installed
+    $version = Get-DeltaIisVersion
+    $assemblyAvailable = Test-DeltaIisManagementAssemblyAvailable
+    $installed = [bool]($version -or $assemblyAvailable)
 
-    if (-not $installed -or -not (Test-DeltaIisManagementAssemblyAvailable)) {
+    if (-not $installed -or -not $assemblyAvailable) {
         return [PSCustomObject]@{
             Name                 = 'IIS'
             Installed            = $installed
