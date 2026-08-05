@@ -1598,6 +1598,15 @@ function Start-DeltaNginx {
         Stop-Setup 'Administrator privileges are required to start or reload NGINX (binding port 80 requires it). Re-run this script from an elevated PowerShell session.'
     }
 
+    # Startup preparation: an unclean shutdown (e.g. a Windows reboot while
+    # NGINX was still running) leaves nginx.pid behind naming a process that
+    # no longer exists. Clear it before Get-DeltaNginxRuntimeState reads it,
+    # so that stale file doesn't misreport a clean Stopped state as Broken.
+    $lastNginxPid = Read-DeltaNginxPid
+    if ($lastNginxPid -and -not (Get-DeltaProcessById -ProcessId $lastNginxPid)) {
+        Remove-Item -LiteralPath (Get-DeltaNginxPidFilePath) -Force -ErrorAction SilentlyContinue
+    }
+
     $state = Get-DeltaNginxRuntimeState
 
     if ($state.State -eq 'Running') {
