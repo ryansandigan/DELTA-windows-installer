@@ -303,6 +303,24 @@ function Get-DeltaNginxRuntimeState {
         }
     }
 
+    # A stale pid file - one naming a process ID that no longer exists at
+    # all - is just an orphaned artifact of an unclean shutdown (e.g. a
+    # Windows reboot while NGINX was still running), never a broken
+    # installation: nothing is running ($managedProcesses.Count -eq 0), so
+    # there is nothing to reconcile against. Removed automatically, then
+    # reported as the genuinely clean Stopped state underneath it, rather
+    # than Broken. A live process under a mismatched/different executable
+    # is deliberately NOT covered here - that stays Broken below.
+    if ($pidFileExists -and $parsedPid -and $managedProcesses.Count -eq 0 -and -not (Get-DeltaProcessById -ProcessId $parsedPid)) {
+        Remove-Item -LiteralPath $pidFilePath -Force -ErrorAction SilentlyContinue
+        return [PSCustomObject]@{
+            State            = 'Stopped'
+            Reason           = $null
+            ProcessId        = $null
+            ManagedProcesses = @()
+        }
+    }
+
     $reason =
         if (-not $pidFileExists) {
             "The PID file ($pidFilePath) is missing, but $($managedProcesses.Count) NGINX process(es) are still running from $($Script:NginxExePath)."
