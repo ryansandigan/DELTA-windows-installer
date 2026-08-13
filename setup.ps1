@@ -674,10 +674,13 @@ function Show-DeltaAccessGuide {
       declines to print URLs it can't know rather than guessing.
 
       Deliberately local-only: a fresh installation's .env carries
-      PUBLIC_URL as a placeholder default, so its presence proves
-      nothing about public reachability - public access is described
-      only as requiring a configured reverse proxy, without ever
-      printing PUBLIC_URL as an endpoint.
+      PUBLIC_URL as a localhost default pointing straight back at this
+      same port, so its presence proves nothing about public
+      reachability - public access is described only as requiring a
+      configured reverse proxy, without ever printing PUBLIC_URL as an
+      endpoint. The URLs below are built from $Port rather than read
+      from PUBLIC_URL for that reason, which is also what keeps this
+      screen correct once a reverse proxy has taken PUBLIC_URL over.
     #>
     param($Port)
 
@@ -3481,7 +3484,13 @@ function New-DeltaEnvironmentFile {
       state, and that's handled by Update-DeltaApplicationPortEnvironment's
       own, separate, narrower $managedValues (below, in the DELTA
       application startup section) - never here, since this function has
-      no idea yet whether the configured port is actually free.
+      no idea yet whether the configured port is actually free. The same
+      is true of PUBLIC_URL: its localhost default
+      ("http://localhost:3000") is likewise a plain .env.example line
+      passed through untouched here, and only the conflict case - where
+      that default would otherwise name a port DELTA is no longer
+      listening on - is installer-decided, again in
+      Update-DeltaApplicationPortEnvironment rather than here.
 
       The "read the existing .env, else fall back to the template" dual
       source is orthogonal to that architecture, not an exception to
@@ -4217,6 +4226,11 @@ function Resolve-DeltaApplicationPort {
     $Script:DeltaSkipManagedInstanceRestart = $false
 
     Resolve-DeltaBackendPort
+    # The port .env described on the way in, captured before anything
+    # below can move $Script:DeltaBackendPort off it - this is what
+    # Update-DeltaApplicationPortEnvironment needs to recognize an
+    # installer-managed localhost PUBLIC_URL by (see its own header).
+    $Script:DeltaApplicationPreviousPort = $Script:DeltaBackendPort
     $Script:DeltaApplicationPortChanged = $false
 
     $check = Test-TcpPortAvailable -Port $Script:DeltaBackendPort
@@ -4379,15 +4393,39 @@ function Resolve-DeltaManagedInstanceRestartDecision {
 
 function Update-DeltaApplicationPortEnvironment {
     <#
-      Writes the operator-selected DELTA application port back into .env
-      via the exact same managed-values mechanism (Update-
-      ManagedEnvironmentLines) New-DeltaEnvironmentFile already uses for
-      DATABASE_URL - no second .env-writing mechanism. A no-op whenever
+      Writes the operator-selected DELTA application port back into .env,
+      via Update-DeltaBackendPortEnvironment (lib\DeltaInstaller.Common.ps1),
+      which in turn goes through the exact same managed-values mechanism
+      (Update-ManagedEnvironmentLines) New-DeltaEnvironmentFile already
+      uses for DATABASE_URL - no second .env-writing mechanism. This
+      function's own remaining job is the parts that are genuinely
+      setup.ps1's: the should-we-write-at-all gate, the target path, and
+      the console reporting. A no-op whenever
       Resolve-DeltaApplicationPort didn't have to change anything
       ($Script:DeltaApplicationPortChanged still $false): a correctly-
       configured .env - PORT absent and 3000 free, or PORT already set to
       whatever's actually free - is left completely untouched, never
       rewritten to the same value it already had.
+
+      PUBLIC_URL rides along in the same write, but only when it is still
+      the installer's own localhost form for the port .env described on
+      the way in ($Script:DeltaApplicationPreviousPort) - the ownership
+      test lives in Resolve-DeltaLocalhostPublicUrlSync
+      (lib\DeltaInstaller.Common.ps1), not here, since deciding "is this
+      value still mine to rewrite" is the same question setup-nginx.ps1/
+      setup-iis.ps1 answer for their own PUBLIC_URL writes. .env.example
+      ships PUBLIC_URL="http://localhost:3000" alongside PORT="3000", so
+      a fresh install forced onto 3001 has to move both together or ship
+      a .env whose own two lines contradict each other. A PUBLIC_URL that
+      is anything else - a real public domain, an https URL, a localhost
+      URL carrying a path - is left exactly as it is, and PORT is written
+      alone: past that point PUBLIC_URL describes what the reverse proxy
+      serves, not what Node binds, and the two are legitimately different
+      by design.
+
+      When no sync applies, PUBLIC_URL never enters the managed-values
+      table at all, so Update-ManagedEnvironmentLines cannot rewrite it -
+      and cannot append it to a .env that never declared it either.
     #>
     if (-not $Script:DeltaApplicationPortChanged) {
         Write-Detail '.env already reflects an available port - no change needed.'
@@ -4401,14 +4439,15 @@ function Update-DeltaApplicationPortEnvironment {
         Stop-Setup "DELTA environment file not found: $envTargetPath. Run the database setup phase first."
     }
 
-    Backup-DeltaEnvironmentFile -Path $envTargetPath
-
-    $sourceLines = Get-Content -LiteralPath $envTargetPath
-    $managedValues = [ordered]@{ PORT = $Script:DeltaBackendPort }
-    $updatedLines = Update-ManagedEnvironmentLines -SourceLines $sourceLines -ManagedValues $managedValues
-    Set-Content -LiteralPath $envTargetPath -Value $updatedLines -Encoding utf8
+    $result = Update-DeltaBackendPortEnvironment -Path $envTargetPath -PreviousPort $Script:DeltaApplicationPreviousPort -NewPort $Script:DeltaBackendPort
 
     Write-Success "    .env updated (PORT=$($Script:DeltaBackendPort))."
+    if ($result.PublicUrl) {
+        Write-Success "    .env updated (PUBLIC_URL=`"$($result.PublicUrl)`")."
+    }
+    elseif ($result.PreviousPublicUrl) {
+        Write-Detail "PUBLIC_URL left unchanged ($($result.PreviousPublicUrl)) - it is not the installer's localhost default."
+    }
 }
 
 # Get-DeltaStartupLogPaths, Start-DeltaRuntimeForValidation,

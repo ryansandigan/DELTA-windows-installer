@@ -2318,6 +2318,180 @@ function Test-DeltaPublicUrlsMatch {
     return (& $normalize $First) -eq (& $normalize $Second)
 }
 
+function Get-DeltaLocalhostPublicUrl {
+    <#
+      The installer-managed localhost PUBLIC_URL shape - the value
+      .env.example itself ships (PUBLIC_URL="http://localhost:3000",
+      matching its PORT="3000") and the only shape
+      Resolve-DeltaLocalhostPublicUrlSync (below) will ever write.
+      Built through Get-DeltaPublicUrl rather than string-formatted here
+      so there stays exactly one place in this installer that decides
+      what a PUBLIC_URL looks like - "localhost:<port>" is just a
+      domain-with-port to that function, and http is correct here by
+      construction: this is the direct Node listener, never a
+      TLS-terminating reverse proxy.
+    #>
+    param([Parameter(Mandatory)][int]$Port)
+
+    return Get-DeltaPublicUrl -Domain "localhost:$Port" -Https $false
+}
+
+function Test-DeltaInstallerManagedLocalhostPublicUrl {
+    <#
+      Reports whether $Value is still recognizably the installer's own
+      generated localhost PUBLIC_URL for $Port - the ownership test that
+      decides whether this installer is allowed to rewrite PUBLIC_URL at
+      all when the backend port moves.
+
+      Deliberately strict, because the cost of a false positive is
+      silently destroying an operator's real public URL. Every one of
+      these must hold:
+
+        - scheme is exactly http (an https URL is a reverse-proxied
+          public address, never this installer's direct-to-Node default);
+        - host is exactly "localhost" (127.0.0.1, ::1, a machine name, or
+          any real domain is somebody else's decision - this installer
+          has never generated any of them);
+        - the port is exactly $Port, the port PUBLIC_URL is being checked
+          against (normally the port .env described before this run
+          changed it);
+        - there is no path beyond "/", and no query, fragment, or
+          userinfo - "http://localhost:3000/delta" is a deliberate
+          operator customization that happens to mention localhost, not
+          something this installer wrote.
+
+      Parsed with [System.Uri] rather than a regex so the host/port/path
+      split is done by the same component parser the rest of the world
+      uses, instead of a pattern that has to re-derive URL syntax.
+      Anything that doesn't parse as an absolute URI at all is simply not
+      ours - $false, never an error.
+    #>
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Value,
+        [Parameter(Mandatory)][int]$Port
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $false
+    }
+
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($Value.Trim(), [System.UriKind]::Absolute, [ref]$uri)) {
+        return $false
+    }
+
+    if ($uri.Scheme -ne 'http') { return $false }
+    if ($uri.Host -ne 'localhost') { return $false }
+    if ($uri.Port -ne $Port) { return $false }
+    if ($uri.AbsolutePath -ne '/') { return $false }
+    if ($uri.Query) { return $false }
+    if ($uri.Fragment) { return $false }
+    if ($uri.UserInfo) { return $false }
+
+    return $true
+}
+
+function Resolve-DeltaLocalhostPublicUrlSync {
+    <#
+      Decides what PUBLIC_URL should become when the DELTA backend port
+      moves from $PreviousPort to $NewPort, given the value $CurrentValue
+      currently in .env. Returns the new URL to write, or $null for
+      "leave PUBLIC_URL exactly as it is" - which is the answer in every
+      case except the one this is for.
+
+      PUBLIC_URL is synchronized only when it is still the installer's
+      own localhost form for $PreviousPort
+      (Test-DeltaInstallerManagedLocalhostPublicUrl above). That keeps
+      the two variables' architectural roles intact rather than coupling
+      them: PORT is the local TCP port the Node application listens on,
+      while PUBLIC_URL is the externally meaningful base address, which
+      starts out pointing at that local listener on a fresh install but
+      becomes a public domain the moment a reverse proxy is configured
+      (Sync-DeltaPublicUrlEnvironment above) or an operator edits it. In
+      both of those cases PUBLIC_URL is no longer describing the Node
+      listener at all - NGINX/IIS front it on 80/443 and forward to
+      localhost:<PORT> - so moving the backend port must leave it
+      completely alone. A customized "https://delta.example.org" survives
+      a 3000 -> 3001 move untouched, and that is the intended
+      relationship, not a gap.
+
+      $null when nothing needs to change is what lets the caller keep
+      PUBLIC_URL out of its managed-values table entirely in that case,
+      so an untouched variable is genuinely never rewritten - not even to
+      the value it already had, and not appended to a .env that never
+      declared it.
+    #>
+    param(
+        [AllowNull()][AllowEmptyString()][string]$CurrentValue,
+        [Parameter(Mandatory)][int]$PreviousPort,
+        [Parameter(Mandatory)][int]$NewPort
+    )
+
+    if ($PreviousPort -eq $NewPort) {
+        return $null
+    }
+
+    if (-not (Test-DeltaInstallerManagedLocalhostPublicUrl -Value $CurrentValue -Port $PreviousPort)) {
+        return $null
+    }
+
+    return Get-DeltaLocalhostPublicUrl -Port $NewPort
+}
+
+function Update-DeltaBackendPortEnvironment {
+    <#
+      Writes a changed DELTA backend port into a .env file, carrying
+      PUBLIC_URL along with it only when Resolve-DeltaLocalhostPublicUrlSync
+      (above) says that value is still the installer's own localhost form
+      for $PreviousPort. Both variables go into ONE
+      Update-ManagedEnvironmentLines call - the same generic managed-keys
+      mechanism every other .env write in this installer uses - so the
+      file is never left momentarily describing a port and a URL that
+      disagree, and every unmanaged line keeps its original quoting,
+      comments, and position.
+
+      Lives here rather than inside setup.ps1's own
+      Update-DeltaApplicationPortEnvironment (its only production caller,
+      which supplies the ports from $Script:DeltaApplicationPreviousPort/
+      $Script:DeltaBackendPort and owns the console output) so the
+      decision-plus-write is reachable as a plain function against a
+      plain path - that is what lets tools\test-delta-public-url-port-sync.ps1
+      exercise the real code rather than a second copy of the rule, and
+      it matches how Backup-DeltaEnvironmentFile and
+      Update-ManagedEnvironmentLines themselves ended up here.
+
+      Returns what actually happened, for the caller to report:
+      NewPort always, PublicUrl set only when PUBLIC_URL was
+      synchronized ($null when it was deliberately left alone), and
+      PreviousPublicUrl as it was found before the write.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int]$PreviousPort,
+        [Parameter(Mandatory)][int]$NewPort
+    )
+
+    $currentPublicUrl = Get-EnvFileValue -Path $Path -Key 'PUBLIC_URL'
+    $syncedPublicUrl = Resolve-DeltaLocalhostPublicUrlSync -CurrentValue $currentPublicUrl -PreviousPort $PreviousPort -NewPort $NewPort
+
+    $managedValues = [ordered]@{ PORT = $NewPort }
+    if ($syncedPublicUrl) {
+        $managedValues['PUBLIC_URL'] = $syncedPublicUrl
+    }
+
+    Backup-DeltaEnvironmentFile -Path $Path
+
+    $sourceLines = Get-Content -LiteralPath $Path
+    $updatedLines = Update-ManagedEnvironmentLines -SourceLines $sourceLines -ManagedValues $managedValues
+    Set-Content -LiteralPath $Path -Value $updatedLines -Encoding utf8
+
+    return [PSCustomObject]@{
+        NewPort           = $NewPort
+        PublicUrl         = $syncedPublicUrl
+        PreviousPublicUrl = $currentPublicUrl
+    }
+}
+
 function Sync-DeltaPublicUrlEnvironment {
     <#
       Writes PUBLIC_URL = "<scheme>://<domain>" into the deployed .env
