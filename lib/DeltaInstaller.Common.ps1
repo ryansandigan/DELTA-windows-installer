@@ -1540,7 +1540,14 @@ function Get-EnvFileValue {
       case-insensitively (PowerShell's default -eq already does this), and
       a value wrapped in matching single or double quotes has those quotes
       stripped, matching the quoting Update-ManagedEnvironmentLines
-      (setup.ps1) itself writes (KEY="value"). Returns $null - never
+      (below) itself writes (KEY="value"). A trailing inline comment is
+      excluded from the returned value - for a quoted value, everything
+      after the closing quote; for an unquoted one, everything from the
+      first whitespace-preceded '#' (never a '#' inside the quotes or
+      glued to the value itself, so a quoted URL fragment or password
+      containing '#' is returned intact) - the exact shapes .env.example
+      itself ships (EMAIL_TRANSPORT="file" # file or smtp,
+      SESSION_SECRET="..." # should be random...). Returns $null - never
       throws - both when $Path doesn't exist and when $Key isn't set in
       it, since "absent" is a normal, expected outcome every caller here
       needs to tell apart from "present but invalid" for itself (see
@@ -1581,10 +1588,18 @@ function Get-EnvFileValue {
         }
 
         $value = $trimmedLine.Substring($separatorIndex + 1).Trim()
-        $isDoubleQuoted = $value.Length -ge 2 -and $value.StartsWith('"') -and $value.EndsWith('"')
-        $isSingleQuoted = $value.Length -ge 2 -and $value.StartsWith("'") -and $value.EndsWith("'")
-        if ($isDoubleQuoted -or $isSingleQuoted) {
-            $value = $value.Substring(1, $value.Length - 2)
+        if ($value.Length -ge 2 -and ($value[0] -eq '"' -or $value[0] -eq "'")) {
+            $closingQuoteIndex = $value.IndexOf($value[0], 1)
+            if ($closingQuoteIndex -gt 0) {
+                return $value.Substring(1, $closingQuoteIndex - 1)
+            }
+            # Unterminated quote - returned as-is, the same thing the
+            # previous strip-only-matching-outer-quotes logic did.
+            return $value
+        }
+        $commentMatch = [regex]::Match($value, '\s#')
+        if ($commentMatch.Success) {
+            $value = $value.Substring(0, $commentMatch.Index).TrimEnd()
         }
         return $value
     }
@@ -1640,6 +1655,21 @@ function Update-ManagedEnvironmentLines {
         [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$ManagedValues
     )
 
+    # KEY="value" is the framing this writer has always produced; a value
+    # that itself contains a double quote (EMAIL_FROM's
+    # '"DELTA" <no-reply@undrr.org>' shape) would corrupt it, so such a
+    # value is written single-quoted instead - the exact style
+    # .env.example itself already uses for that variable. A value
+    # containing BOTH quote characters cannot be represented in either
+    # framing and is each caller's job to reject before it gets here
+    # (Read-DeltaEmailSettingValue, setup.ps1, is the one interactive
+    # caller that can currently receive one).
+    function Format-ManagedEnvironmentAssignment {
+        param([string]$Key, [string]$Value)
+        $quote = if ($Value.Contains('"')) { "'" } else { '"' }
+        return "$Key=$quote$Value$quote"
+    }
+
     # Which managed keys were actually found (and replaced) in the source
     # file - tracked with a plain hashtable rather than removing from a
     # copy of $ManagedValues.Keys, since OrderedDictionary's Keys
@@ -1658,7 +1688,31 @@ function Update-ManagedEnvironmentLines {
 
         if ($matchedKey) {
             $foundKeys[$matchedKey] = $true
-            "$matchedKey=`"$($ManagedValues[$matchedKey])`""
+            $newLine = Format-ManagedEnvironmentAssignment -Key $matchedKey -Value ([string]$ManagedValues[$matchedKey])
+            # A trailing inline comment on the replaced line
+            # (EMAIL_TRANSPORT="file" # file or smtp) is carried over to
+            # the new one rather than silently dropped - located with the
+            # same quoted/unquoted split Get-EnvFileValue reads values
+            # with, so a '#' inside the old quoted value is never
+            # mistaken for one.
+            $oldValue = $line.Substring($line.IndexOf('=') + 1).Trim()
+            $trailingText = ''
+            if ($oldValue.Length -ge 2 -and ($oldValue[0] -eq '"' -or $oldValue[0] -eq "'")) {
+                $closingQuoteIndex = $oldValue.IndexOf($oldValue[0], 1)
+                if ($closingQuoteIndex -gt 0) {
+                    $trailingText = $oldValue.Substring($closingQuoteIndex + 1).Trim()
+                }
+            }
+            else {
+                $commentMatch = [regex]::Match($oldValue, '\s#')
+                if ($commentMatch.Success) {
+                    $trailingText = $oldValue.Substring($commentMatch.Index).Trim()
+                }
+            }
+            if ($trailingText.StartsWith('#')) {
+                $newLine = "$newLine $trailingText"
+            }
+            $newLine
         }
         else {
             $line
@@ -1674,7 +1728,7 @@ function Update-ManagedEnvironmentLines {
     # order always matches the table's own declared, stable order.
     foreach ($key in $ManagedValues.Keys) {
         if (-not $foundKeys.ContainsKey($key)) {
-            $updatedLines = @($updatedLines) + "$key=`"$($ManagedValues[$key])`""
+            $updatedLines = @($updatedLines) + (Format-ManagedEnvironmentAssignment -Key $key -Value ([string]$ManagedValues[$key]))
         }
     }
 

@@ -556,15 +556,17 @@ function Show-MainMenu {
         if ($isRunning -or $isLauncherOnly) {
             Write-Host '3. Stop DELTA'
             Write-Host '4. Restart DELTA'
-            Write-Host '5. Reset administrator password'
-            Write-Host '6. DELTA access guide'
-            Write-Host '7. Exit'
+            Write-Host '5. Configure email / SMTP'
+            Write-Host '6. Reset administrator password'
+            Write-Host '7. DELTA access guide'
+            Write-Host '8. Exit'
         }
         else {
             Write-Host '3. Start DELTA'
-            Write-Host '4. Reset administrator password'
-            Write-Host '5. DELTA access guide'
-            Write-Host '6. Exit'
+            Write-Host '4. Configure email / SMTP'
+            Write-Host '5. Reset administrator password'
+            Write-Host '6. DELTA access guide'
+            Write-Host '7. Exit'
         }
         Write-Host ''
         $choice = Read-Host -Prompt 'Selection'
@@ -582,9 +584,10 @@ function Show-MainMenu {
                 '2' { $action = 'Reinstall' }
                 '3' { $action = 'Stop' }
                 '4' { $action = 'Restart' }
-                '5' { $action = 'ResetPassword' }
-                '6' { $action = 'AccessGuide' }
-                '7' { $action = 'Exit' }
+                '5' { $action = 'ConfigureEmail' }
+                '6' { $action = 'ResetPassword' }
+                '7' { $action = 'AccessGuide' }
+                '8' { $action = 'Exit' }
             }
         }
         else {
@@ -592,9 +595,10 @@ function Show-MainMenu {
                 '1' { $action = 'Update' }
                 '2' { $action = 'Reinstall' }
                 '3' { $action = 'Start' }
-                '4' { $action = 'ResetPassword' }
-                '5' { $action = 'AccessGuide' }
-                '6' { $action = 'Exit' }
+                '4' { $action = 'ConfigureEmail' }
+                '5' { $action = 'ResetPassword' }
+                '6' { $action = 'AccessGuide' }
+                '7' { $action = 'Exit' }
             }
         }
 
@@ -636,9 +640,10 @@ function Show-MainMenu {
                     Restart-DeltaRuntimeForReverseProxy
                 }
             }
-            'ResetPassword' { Invoke-DeltaAdminPasswordReset }
-            'AccessGuide'   { Show-DeltaAccessGuide -Port $portNumber }
-            'Exit'          { return $false }
+            'ConfigureEmail' { Invoke-DeltaEmailConfiguration -InstallPath $existingInstallPath -EnvPath $existingEnvPath }
+            'ResetPassword'  { Invoke-DeltaAdminPasswordReset }
+            'AccessGuide'    { Show-DeltaAccessGuide -Port $portNumber }
+            'Exit'           { return $false }
             default {
                 Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
                 Write-Host ''
@@ -700,6 +705,288 @@ function Show-DeltaAccessGuide {
     Write-Host 'Press Enter to return to the menu...' -NoNewline
     Read-Host | Out-Null
     Write-Host ''
+}
+
+function Read-DeltaEmailTransportChoice {
+    <#
+      The first screen of Show-MainMenu's "Configure email / SMTP"
+      option: shows the transport currently configured in .env and asks
+      which one the administrator wants - the same '=' banner/title and
+      invalid-choice-redisplays-the-whole-screen shape
+      Read-DeltaAdminPasswordResetMethodChoice already uses. Returns
+      'file', 'smtp', or 'Cancel'; Cancel is a first-class option here
+      because this screen is the flow's only gate - choosing it must
+      leave .env completely untouched.
+    #>
+    param([AllowNull()][string]$CurrentTransport)
+
+    while ($true) {
+        Write-Host ''
+        Write-Host ('=' * $Script:BannerWidth)
+        Write-Host 'DELTA Email Configuration'
+        Write-Host ('=' * $Script:BannerWidth)
+        Write-Host ''
+        $currentDisplay = if ([string]::IsNullOrWhiteSpace($CurrentTransport)) { '(not set)' } else { $CurrentTransport }
+        Write-Host "Current transport: $currentDisplay"
+        Write-Host ''
+        Write-Host 'Choose email transport:'
+        Write-Host ''
+        Write-Host '1. File'
+        Write-Host '2. SMTP'
+        Write-Host '3. Cancel'
+        Write-Host ''
+        $choice = Read-Host -Prompt 'Selection'
+        Write-Host ''
+
+        switch ($choice.Trim()) {
+            '1' { return 'file' }
+            '2' { return 'smtp' }
+            '3' { return 'Cancel' }
+            default {
+                Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+function Read-DeltaEmailSettingValue {
+    <#
+      One prompt of the SMTP configuration flow: asks for a single
+      non-secret email setting, showing the value currently in .env as
+      the bracketed default - bare Enter keeps it, the same
+      bare-Enter-picks-the-shown-default convention Read-DeltaAppRoot
+      already follows. When there is no current value at all there is
+      nothing for Enter to keep, so a real answer is required.
+
+      Rejects a value containing BOTH quote characters - the one shape
+      Update-ManagedEnvironmentLines' KEY="value"/KEY='value' framings
+      genuinely cannot represent (see that function's own header) -
+      and re-prompts on a failed $Validator, a scriptblock returning a
+      human-readable error string for a bad answer and $null for a good
+      one, so each caller states only its own rule (valid TCP port,
+      true/false) without this function hardcoding any per-variable
+      policy.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [AllowNull()][AllowEmptyString()][string]$CurrentValue,
+        [scriptblock]$Validator
+    )
+
+    while ($true) {
+        $hasCurrent = -not [string]::IsNullOrEmpty($CurrentValue)
+        $promptText = if ($hasCurrent) { "$Prompt [$CurrentValue]" } else { $Prompt }
+        $answer = (Read-Host -Prompt $promptText).Trim()
+
+        if (-not $answer) {
+            if ($hasCurrent) {
+                return $CurrentValue
+            }
+            Write-Host 'A value is required.' -ForegroundColor Yellow
+            continue
+        }
+        if ($answer.Contains('"') -and $answer.Contains("'")) {
+            Write-Host 'A value cannot contain both single and double quotes.' -ForegroundColor Yellow
+            continue
+        }
+        if ($Validator) {
+            $validationError = & $Validator $answer
+            if ($validationError) {
+                Write-Host $validationError -ForegroundColor Yellow
+                continue
+            }
+        }
+        return $answer
+    }
+}
+
+function Read-DeltaSmtpPassword {
+    <#
+      The SMTP_PASS prompt of the SMTP configuration flow. Masked input
+      (Read-Host -AsSecureString) with the same enter-twice-and-match
+      rule every other operator-chosen credential here follows
+      (Read-DeltaAdminNewPassword and the two password prompts that
+      function's own header already cites) - but, unlike those, bare
+      Enter on the first prompt is the documented "keep what's already
+      configured" choice, returning $null: the current password is a
+      live credential this screen must never display, so "keep it" has
+      to be expressible without retyping it. The caller treats $null as
+      "leave the existing .env line completely untouched" - the value
+      is never even read back, let alone echoed or rewritten.
+
+      Returns a SecureString for a replacement password, converted to
+      plain text only at the single point it's written to .env -
+      matching how every other credential in this project is handled.
+    #>
+    param([Parameter(Mandatory)][bool]$HasCurrent)
+
+    $keepHint = if ($HasCurrent) { 'Enter = keep current' } else { 'Enter = leave unset' }
+    while ($true) {
+        $first = Read-Host -Prompt "SMTP Password [$keepHint]" -AsSecureString
+        $plainFirst = ConvertTo-PlainText -SecureString $first
+        if ($plainFirst.Length -eq 0) {
+            return $null
+        }
+        if ($plainFirst.Contains('"') -and $plainFirst.Contains("'")) {
+            Write-Host 'The password cannot contain both single and double quotes.' -ForegroundColor Yellow
+            continue
+        }
+
+        $second = Read-Host -Prompt 'Confirm SMTP password' -AsSecureString
+        $plainSecond = ConvertTo-PlainText -SecureString $second
+        if ($plainFirst -cne $plainSecond) {
+            Write-Host 'Passwords did not match. Try again.' -ForegroundColor Yellow
+            continue
+        }
+        return $first
+    }
+}
+
+function Invoke-DeltaEmailConfiguration {
+    <#
+      Show-MainMenu's "Configure email / SMTP" action - a recovery-style
+      menu option like the password reset and access guide around it:
+      never returns a value, always falls back into the menu loop.
+      Configures DELTA's existing email variables (EMAIL_TRANSPORT,
+      EMAIL_FROM, SMTP_*) in the installed .env and nothing else - no
+      test email is ever sent, and no SMTP semantics are imposed: port,
+      SMTP_SECURE, and host/user values are the administrator's own to
+      set according to their SMTP service, validated only against the
+      obvious existing contracts (Test-ValidTcpPort; SMTP_SECURE is the
+      literal "true"/"false" .env.example documents).
+
+      Collect-then-apply, deliberately in that order: every value is
+      gathered and validated first, then written in ONE
+      backup+read+update+write pass through the exact managed-values
+      mechanism every other .env writer here uses
+      (Backup-DeltaEnvironmentFile -> Get-Content ->
+      Update-ManagedEnvironmentLines -> Set-Content, the same sequence
+      as Sync-DeltaPublicUrlEnvironment) - so cancelling the transport
+      screen, declining the apply confirmation, or failing validation
+      can never leave a half-updated email configuration behind.
+      Choosing the file transport writes EMAIL_TRANSPORT alone -
+      EMAIL_FROM and every SMTP_* line stay byte-for-byte untouched, so
+      switching back to smtp later still finds the previous settings as
+      its defaults. A kept SMTP password is simply never added to the
+      managed-values table at all: its existing line is passed through
+      unmodified rather than read back and rewritten.
+
+      The restart offer afterward reuses the exact runtime path the
+      menu's own Restart action uses (Restart-DeltaRuntimeForReverseProxy,
+      via the same $Script:DeltaInstallPath/$Script:DeltaEnvPath
+      handoff), re-checking the running state at apply time rather than
+      trusting the menu render - and only when DELTA is actually
+      running: a stopped DELTA is never started merely because email
+      configuration changed; Node reads .env at startup, so the saved
+      values take effect on the next start regardless.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallPath,
+        [Parameter(Mandatory)][string]$EnvPath
+    )
+
+    if (-not (Test-Path -LiteralPath $EnvPath)) {
+        Write-Host "No .env file was found at: $EnvPath" -ForegroundColor Yellow
+        Write-Host 'Email cannot be configured until the DELTA configuration file exists.' -ForegroundColor Yellow
+        Write-Host ''
+        return
+    }
+
+    $currentTransport = Get-EnvFileValue -Path $EnvPath -Key 'EMAIL_TRANSPORT'
+    $transport = Read-DeltaEmailTransportChoice -CurrentTransport $currentTransport
+    if ($transport -eq 'Cancel') {
+        Write-Host 'Email configuration cancelled - .env was not modified.'
+        Write-Host ''
+        return
+    }
+
+    $managedValues = [ordered]@{}
+    if ($transport -eq 'file') {
+        $managedValues['EMAIL_TRANSPORT'] = 'file'
+    }
+    else {
+        $currentFrom        = Get-EnvFileValue -Path $EnvPath -Key 'EMAIL_FROM'
+        $currentHost        = Get-EnvFileValue -Path $EnvPath -Key 'SMTP_HOST'
+        $currentPort        = Get-EnvFileValue -Path $EnvPath -Key 'SMTP_PORT'
+        $currentUser        = Get-EnvFileValue -Path $EnvPath -Key 'SMTP_USER'
+        $currentSecure      = Get-EnvFileValue -Path $EnvPath -Key 'SMTP_SECURE'
+        $hasCurrentPassword = -not [string]::IsNullOrEmpty((Get-EnvFileValue -Path $EnvPath -Key 'SMTP_PASS'))
+
+        Write-Host 'Enter the SMTP configuration. Press Enter to keep the value shown in brackets.'
+        Write-Host ''
+
+        $emailFrom = Read-DeltaEmailSettingValue -Prompt 'Email From' -CurrentValue $currentFrom
+        $smtpHost  = Read-DeltaEmailSettingValue -Prompt 'SMTP Host' -CurrentValue $currentHost
+        $smtpPort  = Read-DeltaEmailSettingValue -Prompt 'SMTP Port' -CurrentValue $currentPort -Validator {
+            param($value)
+            if (Test-ValidTcpPort -Value $value) { $null } else { 'SMTP Port must be a valid TCP port number (1-65535).' }
+        }
+        $smtpUser = Read-DeltaEmailSettingValue -Prompt 'SMTP Username' -CurrentValue $currentUser
+        $newSmtpPassword = Read-DeltaSmtpPassword -HasCurrent $hasCurrentPassword
+        $smtpSecure = (Read-DeltaEmailSettingValue -Prompt 'SMTP Secure (true/false)' -CurrentValue $currentSecure -Validator {
+            param($value)
+            if ($value -in @('true', 'false')) { $null } else { 'SMTP Secure must be "true" or "false".' }
+        }).ToLowerInvariant()
+
+        $passwordDisplay = if ($newSmtpPassword) { '(will be updated)' } elseif ($hasCurrentPassword) { '(unchanged)' } else { '(not set)' }
+        $confirmed = Read-DeltaYesNoConfirmation -Body {
+            Write-Host 'Email transport : smtp'
+            Write-Host "Email From      : $emailFrom"
+            Write-Host "SMTP Host       : $smtpHost"
+            Write-Host "SMTP Port       : $smtpPort"
+            Write-Host "SMTP Username   : $smtpUser"
+            Write-Host "SMTP Password   : $passwordDisplay"
+            Write-Host "SMTP Secure     : $smtpSecure"
+            Write-Host ''
+            Write-Host 'Apply this email configuration?'
+        }
+        if (-not $confirmed) {
+            Write-Host 'Email configuration cancelled - .env was not modified.'
+            Write-Host ''
+            return
+        }
+
+        $managedValues['EMAIL_FROM']      = $emailFrom
+        $managedValues['EMAIL_TRANSPORT'] = 'smtp'
+        $managedValues['SMTP_HOST']       = $smtpHost
+        $managedValues['SMTP_PORT']       = $smtpPort
+        $managedValues['SMTP_USER']       = $smtpUser
+        if ($newSmtpPassword) {
+            $managedValues['SMTP_PASS'] = ConvertTo-PlainText -SecureString $newSmtpPassword
+        }
+        $managedValues['SMTP_SECURE'] = $smtpSecure
+    }
+
+    Backup-DeltaEnvironmentFile -Path $EnvPath
+    $sourceLines = Get-Content -LiteralPath $EnvPath
+    $updatedLines = Update-ManagedEnvironmentLines -SourceLines $sourceLines -ManagedValues $managedValues
+    Set-Content -LiteralPath $EnvPath -Value $updatedLines -Encoding utf8
+
+    Write-Host ''
+    Show-Success "Email configuration updated successfully (EMAIL_TRANSPORT=`"$transport`")."
+    Write-Host ''
+
+    if (@(Get-RunningDeltaProcesses -DeltaRuntimeRoot $InstallPath).Count -gt 0) {
+        $restartNow = Read-DeltaYesNoConfirmation -Body {
+            Write-Host 'DELTA only reads .env at startup.'
+            Write-Host ''
+            Write-Host 'Restart DELTA now to apply the changes?'
+        }
+        Write-Host ''
+        if ($restartNow) {
+            $Script:DeltaInstallPath = $InstallPath
+            $Script:DeltaEnvPath = $EnvPath
+            Restart-DeltaRuntimeForReverseProxy
+        }
+        else {
+            Write-Host 'The saved email configuration will take effect the next time DELTA is restarted.'
+            Write-Host ''
+        }
+    }
+    else {
+        Write-Host 'DELTA is not running - the saved email configuration will take effect the next time DELTA is started.'
+        Write-Host ''
+    }
 }
 
 function Show-DeltaAdminPasswordResetConfirmation {
