@@ -69,6 +69,88 @@ jobs:
           Write-Host ""
           Write-Host "Proceeding with release build..."
 
+      - name: Extract release notes from changelog
+        id: notes
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          # CHANGELOG.md is the curated source of truth for release
+          # notes. release.ps1 already refused to push this tag unless
+          # its '## [X.Y.Z]' section existed and had content
+          # (Assert-ChangelogEntry - the identical heading contract used
+          # here), so a failure below means the tag was created outside
+          # release.ps1. Failing the job is deliberate: publishing an
+          # empty or unrelated release body would be worse.
+          #
+          # Runs before the build on purpose - a tag with no release
+          # notes should fail fast, not after paying for packaging.
+          # The notes are written under RUNNER_TEMP, never release\,
+          # because tools/build-release.ps1 deletes and recreates
+          # release\ wholesale.
+          $version = "${{ steps.version.outputs.version }}"
+
+          if (-not (Test-Path -LiteralPath 'CHANGELOG.md' -PathType Leaf)) {
+            throw "CHANGELOG.md not found in the tagged commit - cannot build release notes for ${{ github.ref_name }}."
+          }
+
+          $changelogLines = @(Get-Content -LiteralPath 'CHANGELOG.md')
+          $headingPattern = "^##\s+\[$([regex]::Escape($version))\]"
+
+          $startIndex = -1
+          for ($i = 0; $i -lt $changelogLines.Count; $i++) {
+            if ($changelogLines[$i] -match $headingPattern) {
+              $startIndex = $i
+              break
+            }
+          }
+          if ($startIndex -lt 0) {
+            throw "CHANGELOG.md has no '## [$version]' section for tag ${{ github.ref_name }}."
+          }
+
+          # The section runs until the next '## [' release heading, or
+          # end of file for the newest-at-bottom / only entry.
+          $endIndex = $changelogLines.Count
+          for ($i = $startIndex + 1; $i -lt $changelogLines.Count; $i++) {
+            if ($changelogLines[$i] -match '^##\s+\[') {
+              $endIndex = $i
+              break
+            }
+          }
+
+          $sectionLines = @()
+          if ($startIndex + 1 -lt $endIndex) {
+            $sectionLines = @($changelogLines[($startIndex + 1)..($endIndex - 1)])
+          }
+
+          # "Meaningful content" means something beyond blank lines and
+          # bare '###' category headings - the same rule release.ps1
+          # enforces before the tag ever gets pushed.
+          $contentLines = @($sectionLines | Where-Object { $_.Trim() -and $_ -notmatch '^###\s' })
+          if ($contentLines.Count -eq 0) {
+            throw "CHANGELOG.md's '## [$version]' section contains no release-note content."
+          }
+
+          # The release body is the section's content without its own
+          # version heading - the release page's title already names the
+          # tag. Leading/trailing blank lines are trimmed for a clean
+          # body; interior formatting is preserved exactly as curated.
+          while ($sectionLines.Count -gt 0 -and [string]::IsNullOrWhiteSpace($sectionLines[0])) {
+            $sectionLines = @($sectionLines | Select-Object -Skip 1)
+          }
+          while ($sectionLines.Count -gt 0 -and [string]::IsNullOrWhiteSpace($sectionLines[-1])) {
+            $sectionLines = @($sectionLines | Select-Object -First ($sectionLines.Count - 1))
+          }
+
+          $notesPath = Join-Path $env:RUNNER_TEMP 'RELEASE_NOTES.md'
+          Set-Content -LiteralPath $notesPath -Value ($sectionLines -join "`n") -Encoding utf8
+          "path=$notesPath" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Release notes extracted for $version ($($contentLines.Count) content line(s)):"
+          Write-Host ""
+          Write-Host ($sectionLines -join "`n")
+
       - name: Build release package
         shell: pwsh
         run: .\tools\build-release.ps1 -Version "${{ steps.version.outputs.version }}"
@@ -94,6 +176,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
+          # The release body is the tag's own curated CHANGELOG.md
+          # section, extracted (and validated non-empty) above - never
+          # auto-generated from commit messages.
+          body_path: ${{ steps.notes.outputs.path }}
           files: |
             release/DELTA-windows-installer-${{ steps.version.outputs.version }}.zip
             release/DELTA-windows-installer-${{ steps.version.outputs.version }}.zip.sha256

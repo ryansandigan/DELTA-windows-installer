@@ -24,7 +24,10 @@
     Guardrails run before anything is changed: the current directory
     must be a Git repository, the current branch must be 'main', the
     working tree must have no uncommitted changes, the version file
-    must parse, and the target tag must not already exist. Any failure
+    must parse, the target tag must not already exist, and CHANGELOG.md
+    must contain a non-empty '## [X.Y.Z]' section for the target
+    version (the curated release notes release.yml publishes as the
+    GitHub Release body). Any failure
     aborts before lib\DeltaInstaller.Version.ps1 or Git state is
     touched. Because the release sequence itself is a handful of
     separate git invocations (add, commit, push, tag, push), a failure
@@ -113,6 +116,7 @@ function Stop-Release {
 # location.
 $Script:ProjectRoot     = $PSScriptRoot
 $Script:VersionFilePath = Join-Path -Path $Script:ProjectRoot -ChildPath 'lib\DeltaInstaller.Version.ps1'
+$Script:ChangelogPath   = Join-Path -Path $Script:ProjectRoot -ChildPath 'CHANGELOG.md'
 $Script:RequiredBranch  = 'main'
 
 # Major.Minor.Patch only - matches every version this project has ever
@@ -310,13 +314,80 @@ function Update-VersionFile {
 }
 
 # ---------------------------------------------------------------------------
+# Changelog validation
+# ---------------------------------------------------------------------------
+
+function Assert-ChangelogEntry {
+    <#
+      Verifies CHANGELOG.md contains a release section for the version
+      about to be released: a "## [X.Y.Z]" heading, whose section runs
+      until the next "## [" release heading (or end of file) and holds
+      at least one meaningful content line - blank lines and bare "###"
+      category headings alone don't count. Runs with the other
+      guardrails, before -DryRun exits and before Update-VersionFile,
+      so a missing or empty entry aborts with the version file and Git
+      state completely untouched.
+
+      This is the same "## [X.Y.Z]" heading contract
+      .github\workflows\release.yml's own "Extract release notes from
+      changelog" step slices the GitHub Release body out of once the
+      tag is pushed - validating it here is what guarantees that step
+      can't later find itself publishing a tag with no notes.
+      CHANGELOG.md is the curated source of truth: nothing in this
+      script generates, rewrites, or reorders entries - the operator
+      writes the section by hand, this only refuses to release without
+      it.
+    #>
+    param([Parameter(Mandatory)][string]$TargetVersion)
+
+    Write-Step "Verifying CHANGELOG.md has release notes for $TargetVersion..."
+
+    if (-not (Test-Path -LiteralPath $Script:ChangelogPath -PathType Leaf)) {
+        Stop-Release "CHANGELOG.md not found at $($Script:ChangelogPath). Add a '## [$TargetVersion]' section describing this release, then re-run."
+    }
+
+    $changelogLines = @(Get-Content -LiteralPath $Script:ChangelogPath)
+    $headingPattern = "^##\s+\[$([regex]::Escape($TargetVersion))\]"
+
+    $startIndex = -1
+    for ($i = 0; $i -lt $changelogLines.Count; $i++) {
+        if ($changelogLines[$i] -match $headingPattern) {
+            $startIndex = $i
+            break
+        }
+    }
+    if ($startIndex -lt 0) {
+        Stop-Release "CHANGELOG.md has no '## [$TargetVersion]' section. Add the release notes for $TargetVersion to CHANGELOG.md and commit them, then re-run."
+    }
+
+    $endIndex = $changelogLines.Count
+    for ($i = $startIndex + 1; $i -lt $changelogLines.Count; $i++) {
+        if ($changelogLines[$i] -match '^##\s+\[') {
+            $endIndex = $i
+            break
+        }
+    }
+
+    $sectionLines = @()
+    if ($startIndex + 1 -lt $endIndex) {
+        $sectionLines = @($changelogLines[($startIndex + 1)..($endIndex - 1)])
+    }
+    $contentLines = @($sectionLines | Where-Object { $_.Trim() -and $_ -notmatch '^###\s' })
+    if ($contentLines.Count -eq 0) {
+        Stop-Release "CHANGELOG.md's '## [$TargetVersion]' section contains no release-note content. Describe the release under that heading, then re-run."
+    }
+
+    Write-Detail "Found '## [$TargetVersion]' with $($contentLines.Count) release-note line(s)."
+}
+
+# ---------------------------------------------------------------------------
 # Orchestration
 #
 # Each step is a single top-level function call, in dependency order:
 # validate repository/branch/cleanliness, resolve the version to
-# release, validate its tag is free, then (unless -DryRun) mutate the
-# version file and run the fixed add/commit/push/tag/push sequence that
-# hands off to GitHub Actions.
+# release, validate its tag is free and its CHANGELOG.md section exists,
+# then (unless -DryRun) mutate the version file and run the fixed
+# add/commit/push/tag/push sequence that hands off to GitHub Actions.
 # ---------------------------------------------------------------------------
 
 try {
@@ -329,12 +400,14 @@ try {
     $tagName        = "v$nextVersion"
 
     Assert-TagAvailable -Tag $tagName
+    Assert-ChangelogEntry -TargetVersion $nextVersion
 
     if ($DryRun) {
         Write-Host ''
         Write-Step 'Dry run - no changes will be made.'
         Write-Detail "Current Version: $currentVersion"
         Write-Detail "Next Version:    $nextVersion"
+        Write-Detail "Release Notes:   CHANGELOG.md '## [$nextVersion]' section found"
         Write-Host ''
         Write-Step 'The following Git commands would be executed:'
         Write-Detail 'git add lib/DeltaInstaller.Version.ps1'

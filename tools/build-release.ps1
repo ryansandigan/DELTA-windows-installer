@@ -119,7 +119,8 @@ $Script:RequiredFiles = @(
 
 $Script:OptionalFiles = @(
     'README.md',
-    'LICENSE'
+    'LICENSE',
+    'CHANGELOG.md'
 )
 
 $Script:RequiredDirectories = @(
