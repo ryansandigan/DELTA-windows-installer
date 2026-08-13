@@ -441,6 +441,42 @@ function Show-MainMenu {
       prompt, or "Exit" on the existing-install menu) - the caller
       exits immediately in that case, before any installation action
       has run.
+
+      The existing-installation menu also shows the DELTA application's
+      current runtime state and offers the matching runtime actions
+      (Stop/Restart while running, Start while stopped) - state is
+      re-derived at the top of every loop iteration (the same
+      per-iteration re-read setup-nginx.ps1's own
+      Show-DeltaNginxManagementMenu already uses) so a just-run action
+      is reflected immediately rather than a stale snapshot. "Running"
+      is decided ONLY by process ownership (Get-RunningDeltaProcesses'
+      command-line match against this specific installation), never by
+      the configured port being listened on - an unrelated process
+      owning that port is reported as exactly that (via
+      Test-TcpPortAvailable's own PID cross-referenced against the
+      matched DELTA processes, the same cross-reference
+      Resolve-DeltaApplicationPort already uses), and is never
+      something any action here stops or kills. The displayed port
+      follows Resolve-DeltaBackendPort's own contract (PORT from .env
+      via Get-EnvFileValue; absent -> $Script:DefaultDeltaBackendPort;
+      invalid -> flagged, and the Start/Restart actions themselves
+      abort inside Resolve-DeltaBackendPort with the full corrective
+      message).
+
+      The runtime actions are recovery-style menu options like the
+      password reset below - they fall back into this loop rather than
+      returning, and reuse the existing lifecycle helpers unchanged:
+      Stop-RunningDeltaInstance (graceful -> bounded wait -> force ->
+      bounded wait) for Stop, and Restart-DeltaRuntimeForReverseProxy
+      (Resolve-DeltaBackendPort -> Confirm-DeltaRuntimeNotRunning ->
+      Start-DeltaRuntimeForValidation -> Confirm-DeltaRuntimeStarted,
+      every wait bounded) for Start/Restart - Start differing only in
+      refusing outright if a DELTA instance is already running by the
+      time it's chosen (its stop stage would otherwise make "Start"
+      silently behave as a restart). A failed action still calls
+      Stop-Setup, which throws out to this script's own top-level
+      try/catch - the same convention every other menu-triggered
+      failure here already follows.
     #>
     $existingInstallPath = Get-DeltaInstallPath
 
@@ -459,46 +495,211 @@ function Show-MainMenu {
         return ($choice.Trim() -in @('Y', 'y'))
     }
 
+    $existingEnvPath = Join-Path -Path $existingInstallPath -ChildPath '.env'
+
     while ($true) {
+        $serverProcesses = @(Get-RunningDeltaProcesses -DeltaRuntimeRoot $existingInstallPath)
+        $isRunning = $serverProcesses.Count -gt 0
+        # A launcher (cmd.exe) process without its server process is the
+        # documented orphaned-launcher failure mode (see
+        # Test-DeltaLauncherProcessCommandLine's own header) - neither
+        # Running nor cleanly Stopped. Stop-RunningDeltaInstance already
+        # knows how to clean it up, so the Running-state menu (Stop/
+        # Restart) is offered for it, under an explicit Broken status.
+        $isLauncherOnly = (-not $isRunning) -and (@(Get-RunningDeltaLauncherProcesses).Count -gt 0)
+
+        $portNumber = $null
+        $rawPort = Get-EnvFileValue -Path $existingEnvPath -Key 'PORT'
+        if ([string]::IsNullOrWhiteSpace($rawPort)) {
+            $portNumber = $Script:DefaultDeltaBackendPort
+        }
+        elseif (Test-ValidTcpPort -Value $rawPort) {
+            $portNumber = [int]$rawPort
+        }
+        $portDisplay = if ($null -ne $portNumber) { "$portNumber" } else { "'$rawPort' (invalid - PORT in .env must be 1-65535)" }
+
+        $unrelatedPortOwner = $null
+        if ($null -ne $portNumber) {
+            $portCheck = Test-TcpPortAvailable -Port $portNumber
+            if (-not $portCheck.Available) {
+                $isDeltaOwned = @($serverProcesses | Where-Object { [int]$_.ProcessId -eq [int]$portCheck.OwningProcessId }).Count -gt 0
+                if (-not $isDeltaOwned) {
+                    $unrelatedPortOwner = $portCheck.OwnerDescription
+                }
+            }
+        }
+
+        $stateDisplay = if ($isRunning) { 'Running' } elseif ($isLauncherOnly) { 'Broken' } else { 'Stopped' }
+
         Write-Host 'Existing DELTA installation detected.'
         Write-Host ''
         Write-Host 'Location:'
         Write-Host $existingInstallPath
         Write-Host ''
+        Write-Host "DELTA application: $stateDisplay"
+        Write-Host "Port: $portDisplay"
+        if ($isLauncherOnly) {
+            Write-Host ''
+            Write-Host 'A DELTA launcher process is still running, but no DELTA server process was found.' -ForegroundColor Yellow
+            Write-Host 'Choose "Stop DELTA" to clean it up, or "Restart DELTA" to recover.' -ForegroundColor Yellow
+        }
+        if ($unrelatedPortOwner) {
+            Write-Host ''
+            Write-Host "Port $portNumber is currently in use by another process: $unrelatedPortOwner" -ForegroundColor Yellow
+            Write-Host 'DELTA cannot use this port until it is free, or PORT in .env is changed.' -ForegroundColor Yellow
+        }
+        Write-Host ''
         Write-Host 'Choose an option:'
         Write-Host ''
         Write-Host '1. Update DELTA'
         Write-Host '2. Reinstall DELTA'
-        Write-Host '3. Reset administrator password'
-        Write-Host '4. Exit'
+        if ($isRunning -or $isLauncherOnly) {
+            Write-Host '3. Stop DELTA'
+            Write-Host '4. Restart DELTA'
+            Write-Host '5. Reset administrator password'
+            Write-Host '6. DELTA access guide'
+            Write-Host '7. Exit'
+        }
+        else {
+            Write-Host '3. Start DELTA'
+            Write-Host '4. Reset administrator password'
+            Write-Host '5. DELTA access guide'
+            Write-Host '6. Exit'
+        }
         Write-Host ''
         $choice = Read-Host -Prompt 'Selection'
         Write-Host ''
 
-        switch ($choice.Trim()) {
-            '1' { return $true }
-            '2' { return $true }
-            '3' {
+        # Map the state-dependent numbering back to one stable set of
+        # action names, so the action handling below stays a single
+        # switch regardless of which menu layout was shown. Empty string,
+        # not $null, for an unmatched choice - switch over $null iterates
+        # zero times and would skip even its own default branch.
+        $action = ''
+        if ($isRunning -or $isLauncherOnly) {
+            switch ($choice.Trim()) {
+                '1' { $action = 'Update' }
+                '2' { $action = 'Reinstall' }
+                '3' { $action = 'Stop' }
+                '4' { $action = 'Restart' }
+                '5' { $action = 'ResetPassword' }
+                '6' { $action = 'AccessGuide' }
+                '7' { $action = 'Exit' }
+            }
+        }
+        else {
+            switch ($choice.Trim()) {
+                '1' { $action = 'Update' }
+                '2' { $action = 'Reinstall' }
+                '3' { $action = 'Start' }
+                '4' { $action = 'ResetPassword' }
+                '5' { $action = 'AccessGuide' }
+                '6' { $action = 'Exit' }
+            }
+        }
+
+        switch ($action) {
+            'Update'    { return $true }
+            'Reinstall' { return $true }
+            'Stop' {
                 # Recovery-only action: never returns $true/$false itself -
                 # falling out of this case with no `return` (same pattern
                 # setup-nginx.ps1's own management menu already uses for
                 # its own non-exiting actions) re-enters this while loop,
-                # which redisplays this exact menu from the top. Requires
-                # the `default` branch below rather than the unconditional
-                # trailing "not a valid option" message this switch used
-                # to end with - that message would otherwise incorrectly
-                # print after every legitimate password reset too, since a
-                # PowerShell `switch` case that doesn't `return` still
-                # falls through to whatever follows the switch statement.
-                Invoke-DeltaAdminPasswordReset
+                # which re-derives the runtime state and redisplays the
+                # menu. Same for Restart/Start/ResetPassword below.
+                Stop-RunningDeltaInstance -DeltaRuntimeRoot $existingInstallPath
             }
-            '4' { return $false }
+            'Restart' {
+                # $Script:DeltaInstallPath/$Script:DeltaEnvPath are the two
+                # variables Restart-DeltaRuntimeForReverseProxy's other
+                # callers have Resolve-DeltaInstallation set - this menu
+                # already discovered the identical path itself
+                # (Get-DeltaInstallPath above), so it is passed through
+                # rather than re-resolved.
+                $Script:DeltaInstallPath = $existingInstallPath
+                $Script:DeltaEnvPath = $existingEnvPath
+                Restart-DeltaRuntimeForReverseProxy
+            }
+            'Start' {
+                # Re-checked at selection time, not trusted from the menu
+                # render above - if a DELTA instance appeared in between,
+                # Start must refuse rather than let the restart helper's
+                # own stop stage silently turn "Start" into a restart.
+                if (@(Get-RunningDeltaProcesses -DeltaRuntimeRoot $existingInstallPath).Count -gt 0) {
+                    Write-Host 'DELTA is already running - not starting a second instance.' -ForegroundColor Yellow
+                    Write-Host ''
+                }
+                else {
+                    $Script:DeltaInstallPath = $existingInstallPath
+                    $Script:DeltaEnvPath = $existingEnvPath
+                    Restart-DeltaRuntimeForReverseProxy
+                }
+            }
+            'ResetPassword' { Invoke-DeltaAdminPasswordReset }
+            'AccessGuide'   { Show-DeltaAccessGuide -Port $portNumber }
+            'Exit'          { return $false }
             default {
                 Write-Host "'$choice' is not a valid option." -ForegroundColor Yellow
                 Write-Host ''
             }
         }
     }
+}
+
+function Show-DeltaAccessGuide {
+    <#
+      The informational screen behind Show-MainMenu's "DELTA access
+      guide" option. Configuration guidance only, never a reachability
+      claim - which is why the menu offers it in both its Running and
+      Stopped layouts, and why nothing here probes the runtime.
+
+      $Port is Show-MainMenu's own already-resolved effective port
+      (PORT from .env when valid, $Script:DefaultDeltaBackendPort when
+      absent), passed through rather than re-read so this screen can
+      never disagree with the "Port:" line the operator just saw.
+      $null when .env's PORT is invalid - Show-MainMenu has already
+      shown its yellow invalid-PORT warning by then, so this screen
+      declines to print URLs it can't know rather than guessing.
+
+      Deliberately local-only: a fresh installation's .env carries
+      PUBLIC_URL as a placeholder default, so its presence proves
+      nothing about public reachability - public access is described
+      only as requiring a configured reverse proxy, without ever
+      printing PUBLIC_URL as an endpoint.
+    #>
+    param($Port)
+
+    Show-Section -Title 'DELTA Access Guide'
+
+    if ($null -ne $Port) {
+        Write-Host 'Local application:'
+        Write-Detail "http://localhost:$Port"
+        Write-Host ''
+        Write-Host 'Administrator login:'
+        Write-Detail "http://localhost:$Port/en/admin/login"
+        Write-Host ''
+        Write-Host 'User login:'
+        Write-Detail "http://localhost:$Port/en/user/login"
+    }
+    else {
+        Write-Host 'PORT in .env is invalid, so local URLs cannot be shown.' -ForegroundColor Yellow
+        Write-Host 'Set PORT to a value between 1 and 65535, then reopen this guide.' -ForegroundColor Yellow
+    }
+
+    Write-Host ''
+    Write-Host 'Initial setup:'
+    Write-Detail 'Sign in through the Administrator login first.'
+    Write-Detail 'Administrators can create and manage DELTA users'
+    Write-Detail 'from the admin interface.'
+    Write-Host ''
+    Write-Host 'Public access:'
+    Write-Detail 'Public access requires a configured reverse proxy'
+    Write-Detail 'such as NGINX or IIS.'
+    Write-Host ''
+    Write-Host 'Press Enter to return to the menu...' -NoNewline
+    Read-Host | Out-Null
+    Write-Host ''
 }
 
 function Show-DeltaAdminPasswordResetConfirmation {

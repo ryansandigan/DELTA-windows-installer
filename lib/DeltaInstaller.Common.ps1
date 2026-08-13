@@ -1170,8 +1170,17 @@ function Test-TcpPortAvailable {
 # how long Confirm-DeltaRuntimeStarted waits for the just-(re)started
 # process to bind $Script:DeltaBackendPort, and then to answer an HTTP
 # request, before treating startup as failed rather than merely slow.
+# The HTTP allowance is deliberately the longer of the two: DELTA can
+# bind its port and then keep performing first-run initialization for
+# well over a minute before serving its first response, and a fresh
+# install observed in the field kept initializing past the previous
+# 20-second allowance - DELTA finished starting successfully after the
+# installer had already given up and reported failure. The HTTP wait
+# loop returns the moment DELTA responds (and fails early if the
+# process exits), so this ceiling is only ever paid in full on a
+# genuine startup failure, never on a normal fast startup.
 $Script:DeltaStartupPortTimeoutSeconds = 60
-$Script:DeltaStartupHttpTimeoutSeconds = 20
+$Script:DeltaStartupHttpTimeoutSeconds = 180
 
 function Confirm-DeltaRuntimeNotRunning {
     <#
@@ -1188,6 +1197,25 @@ function Confirm-DeltaRuntimeNotRunning {
       instance running); setup-nginx.ps1/setup-iis.ps1 never set this
       variable, so for their own "Restart DELTA backend" menu action
       this check is always $false/unset and the stop always runs.
+
+      After the stop, the application port itself is re-checked
+      (Test-TcpPortAvailable): Stop-RunningDeltaInstance only ever stops
+      processes confirmed to be this installation's own runtime, so
+      anything STILL listening on $Script:DeltaBackendPort at this point
+      is by definition an unrelated process - and starting DELTA anyway
+      would both fail to bind and let Confirm-DeltaRuntimeStarted's own
+      port probe false-positive against that unrelated listener (a
+      listening port alone is its success signal for the port stage).
+      The only safe response is to refuse (Stop-Setup) - never to stop
+      or kill the owning process, which no code on this path is allowed
+      to touch. setup.ps1's own full-install flow normally resolves such
+      a conflict interactively well before this runs
+      (Resolve-DeltaApplicationPort), so there this guard only catches a
+      port grabbed between that resolution and the actual start; for the
+      management-menu restart paths (setup.ps1's main menu,
+      setup-nginx.ps1/setup-iis.ps1's "Restart DELTA backend"), which
+      have no earlier interactive conflict step, it is the primary
+      protection.
     #>
     Show-Section -Title 'DELTA Runtime Status'
 
@@ -1198,6 +1226,19 @@ function Confirm-DeltaRuntimeNotRunning {
 
     Write-Step 'Checking for an already-running DELTA instance...'
     Stop-RunningDeltaInstance -DeltaRuntimeRoot $Script:DeltaRuntimeRoot
+
+    $portCheck = Test-TcpPortAvailable -Port $Script:DeltaBackendPort
+    if (-not $portCheck.Available) {
+        Stop-Setup @"
+Port $($Script:DeltaBackendPort) is configured as the DELTA application port, but it is currently in use by:
+
+$($portCheck.OwnerDescription)
+
+This process is not a DELTA instance managed by this installer, so it was left running untouched.
+
+Free the port, or change PORT in the DELTA .env file, then try again.
+"@
+    }
 }
 
 function Get-DeltaStartupLogPaths {
@@ -1434,8 +1475,14 @@ function Confirm-DeltaRuntimeStarted {
 function Restart-DeltaRuntimeForReverseProxy {
     <#
       The single shared "restart DELTA and reload .env" action - the
-      implementation behind both setup-nginx.ps1's and setup-iis.ps1's
-      own "Restart DELTA backend" management menu option. Deliberately a
+      implementation behind setup-nginx.ps1's and setup-iis.ps1's own
+      "Restart DELTA backend" management menu option, and behind
+      setup.ps1's own main-menu "Start DELTA"/"Restart DELTA" actions
+      (Show-MainMenu - which passes the already-discovered install path
+      in via $Script:DeltaInstallPath/$Script:DeltaEnvPath, exactly the
+      two variables Resolve-DeltaInstallation sets for the other two
+      callers, rather than this function growing a second discovery
+      path). Deliberately a
       standalone, operator-triggered action, not something either script
       calls automatically after writing PUBLIC_URL: reverse proxy
       configuration changes (reload NGINX, update IIS bindings) and
