@@ -308,6 +308,113 @@ function Start-ProcessWithActivityIndicator {
     return $Process
 }
 
+# ---------------------------------------------------------------------------
+# Bounded third-party installer retry orchestration
+# ---------------------------------------------------------------------------
+
+function Invoke-DeltaComponentInstallWithRetry {
+    <#
+      Owns the generic mechanics of "a third-party installer can fail
+      transiently and succeed on a clean second attempt" for setup.ps1's
+      component phases (Node.js MSI, PostgreSQL EDB installer, PostGIS
+      bundle) - one shared, strictly bounded loop instead of three
+      hand-copied ones. Observed motivating case: the EDB PostgreSQL
+      installer returning a non-zero exit code during extraction and
+      leaving an incomplete install directory with no service and no
+      initialized data directory, where an immediately-repeated clean
+      attempt succeeds.
+
+      This function owns ONLY the retry mechanics: the attempt cap
+      (default 2 - never unlimited), attempt numbering, the short
+      settling delay, the retry console messaging, and the final
+      Stop-Setup on exhausted attempts. Everything component-specific
+      stays at the call site, supplied as scriptblocks:
+
+        -InstallAction   Runs ONE installer attempt and RETURNS its exit
+                         code (never calls Stop-Setup on a non-zero code
+                         itself - that decision now lives here). Receives
+                         the current attempt number as its first argument
+                         (declare param($Attempt)), so a caller can keep
+                         attempt-specific installer logs.
+        -TestComponentUsable
+                         The component's own existing validation logic,
+                         returning $true/$false. Consulted after a
+                         non-zero exit code: installers can exit non-zero
+                         after having actually installed a working
+                         component, and a working component is never
+                         retried (and never cleaned up).
+        -CleanupAction   Optional. Safe, component-specific recovery from
+                         artifacts the CURRENT failed attempt created.
+                         Runs only when the installer failed AND
+                         validation failed AND another attempt remains.
+                         The safety rules (never touch anything that
+                         existed before this setup run; never delete
+                         based on the exit code alone) are the call
+                         site's responsibility - this function has no
+                         knowledge of what is safe to remove, so it
+                         never removes anything itself.
+
+      Scriptblocks are invoked with & and resolve the call site's own
+      local variables exactly like Read-DeltaYesNoConfirmation's -Body
+      (see its header) - no explicit parameter plumbing needed.
+
+      On success this simply returns (the caller's existing post-install
+      validation still runs unchanged after it). On failure of every
+      attempt it calls Stop-Setup with a message that names the attempt
+      count and points at the installer logs - and never includes
+      passwords or installer command lines ($FailureLogHint must follow
+      the same rule).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ComponentName,
+        [Parameter(Mandatory)][scriptblock]$InstallAction,
+        [Parameter(Mandatory)][scriptblock]$TestComponentUsable,
+        [scriptblock]$CleanupAction,
+        [int[]]$SuccessExitCodes = @(0),
+        [int]$MaxAttempts = 2,
+        [int]$RetryDelaySeconds = 5,
+        [string]$FailureLogHint
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $exitCode = & $InstallAction $attempt
+
+        if ($SuccessExitCodes -contains $exitCode) {
+            if ($attempt -gt 1) {
+                Write-Success '    Retry completed successfully.'
+            }
+            return
+        }
+
+        Write-Detail "Installer returned exit code $exitCode."
+        Write-Step "$ComponentName installation did not complete successfully."
+
+        Write-Detail "Checking whether $ComponentName is nevertheless installed and usable..."
+        if (& $TestComponentUsable) {
+            Write-Detail "$ComponentName validated successfully despite the installer exit code - continuing without retry."
+            return
+        }
+
+        if ($attempt -lt $MaxAttempts) {
+            Write-Step 'Preparing for one automatic retry...'
+            if ($CleanupAction) {
+                & $CleanupAction
+            }
+            if ($RetryDelaySeconds -gt 0) {
+                Write-Detail "Waiting $RetryDelaySeconds second(s) before retrying..."
+                Start-Sleep -Seconds $RetryDelaySeconds
+            }
+            Write-Detail "Retrying $ComponentName installation (attempt $($attempt + 1) of $MaxAttempts)..."
+        }
+    }
+
+    $failureMessage = "$ComponentName installation failed after $MaxAttempts attempts. See the installer logs for details."
+    if ($FailureLogHint) {
+        $failureMessage = "$failureMessage $FailureLogHint"
+    }
+    Stop-Setup $failureMessage
+}
+
 function Write-DeltaTemplateFile {
     <#
       Engine-agnostic template rendering, shared by setup-nginx.ps1's own
@@ -3122,6 +3229,54 @@ function Test-PostgresServerPresent {
     }
 
     return $false
+}
+
+function Test-PostgresFreshInstallCleanupSafe {
+    <#
+      Pure decision predicate behind Install-PostgreSql's retry cleanup
+      (setup.ps1, Invoke-DeltaComponentInstallWithRetry's -CleanupAction):
+      is it provably safe to delete the target install prefix / data
+      directory left behind by a failed EDB installer attempt?
+
+      Returns $true ONLY when every signal agrees this was a fresh
+      installation whose on-disk leftovers belong to the current, failed
+      attempt:
+
+        - Nothing at the target existed before this setup run: not the
+          install prefix, not the data directory, not the Windows
+          service. Anything that pre-existed - even an incomplete tree
+          left by some EARLIER interrupted run (the repair path
+          Install-PostgreSql already handles) - is never this run's to
+          delete.
+        - No PostgreSQL service is registered NOW: a registered service
+          means the installer got far enough that "delete the directory"
+          is no longer a clean undo of a partial extraction.
+        - The data directory is not initialized NOW (no PG_VERSION): an
+          initdb-completed cluster is never deleted here, even one this
+          run's own failed attempt created - the retry installer handles
+          an existing data directory itself, and a cluster is the one
+          artifact whose loss can't be undone by re-running an installer.
+
+      Deliberately takes plain booleans, not paths - the caller performs
+      the actual filesystem/service probes - so this policy stays a pure,
+      directly-testable function (tools\test-delta-install-retry.ps1),
+      the same pattern as Test-DeltaManagedProcessCommandLine.
+    #>
+    param(
+        [Parameter(Mandatory)][bool]$InstallPrefixExistedBeforeSetup,
+        [Parameter(Mandatory)][bool]$DataDirectoryExistedBeforeSetup,
+        [Parameter(Mandatory)][bool]$ServiceExistedBeforeSetup,
+        [Parameter(Mandatory)][bool]$ServiceExistsNow,
+        [Parameter(Mandatory)][bool]$DataDirectoryInitializedNow
+    )
+
+    if ($InstallPrefixExistedBeforeSetup -or $DataDirectoryExistedBeforeSetup -or $ServiceExistedBeforeSetup) {
+        return $false
+    }
+    if ($ServiceExistsNow -or $DataDirectoryInitializedNow) {
+        return $false
+    }
+    return $true
 }
 
 function Get-PostgresBinDirectory {

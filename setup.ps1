@@ -426,7 +426,13 @@ function Show-ComponentStatus {
 function Show-MainMenu {
     <#
       The first screen shown after the installer banner (Initialize-
-      Setup). Purely a presentation-layer front door: it does not
+      Setup). Also re-entered directly - same function, never a copy -
+      by Invoke-DeltaOptionalReverseProxySetup's "Open DELTA Management
+      Menu" option at the end of a fresh installation, once
+      Register-DeltaInstallation has made this run's installation
+      discoverable to the exact same Get-DeltaInstallPath detection
+      below (see that call site for how the $true return is interpreted
+      there). Purely a presentation-layer front door: it does not
       decide *how* an existing DELTA deployment is handled -
       Resolve-ExistingDeltaDeployment still owns that, completely
       unchanged, once Resolve-DeltaAppRoot below knows the target
@@ -1395,19 +1401,45 @@ function Invoke-DeltaOptionalReverseProxySetup {
       cleanly either way. A failure inside either script shows its own
       error naturally (both already print their own red failure banner
       before exiting 1) - never wrapped, duplicated, or re-interpreted
-      here. Option 3 (Exit) needs no explicit `exit` call of its own -
+      here. Option 4 (Exit) needs no explicit `exit` call of its own -
       returning here simply lets setup.ps1's own orchestration block
       reach its normal `exit 0` moments later.
+
+      Option 3 (Open DELTA Management Menu) transitions into the exact
+      same Show-MainMenu the operator would reach by re-running setup.ps1
+      against the now-registered installation - a direct internal call,
+      never a second menu implementation and never a nested setup.ps1
+      process. This works because Register-DeltaInstallation has already
+      run by the time any completion screen prints (see its own header:
+      "this function ran" and "the installation succeeded" are the same
+      fact), so Show-MainMenu's own canonical discovery
+      (Get-DeltaInstallPath, Get-RunningDeltaProcesses, PORT from .env)
+      observes the fresh installation exactly as a subsequent invocation
+      would - nothing is passed in from this run's fresh-install
+      variables. Its return value needs one context-specific
+      interpretation here: $true means the operator chose Update or
+      Reinstall DELTA, which in a normal run tells the orchestration
+      block to proceed with the install phases - phases this run has
+      already completed moments ago. Re-running them from inside the
+      completion screen is exactly the kind of re-entrant orchestration
+      this installer avoids, so that choice gets an honest pointer to
+      re-run setup.ps1 instead, and every other menu action (Stop/
+      Start/Restart, email, password reset, access guide - all of which
+      loop inside Show-MainMenu itself) plus Exit ($false) behaves
+      identically to a normal run. This menu stays responsible for the
+      one-time optional reverse-proxy offer only; ongoing application
+      management remains entirely Show-MainMenu's.
     #>
     Show-Section -Title 'Optional Reverse Proxy Setup'
 
     Write-Host 'DELTA is running successfully.'
     Write-Host ''
-    Write-Host 'Choose a reverse proxy to configure now:'
+    Write-Host 'Choose an option:'
     Write-Host ''
     Write-Host '1. Configure NGINX'
     Write-Host '2. Configure IIS'
-    Write-Host '3. Exit'
+    Write-Host '3. Open DELTA Management Menu'
+    Write-Host '4. Exit'
     Write-Host ''
 
     while ($true) {
@@ -1424,6 +1456,16 @@ function Invoke-DeltaOptionalReverseProxySetup {
                 return
             }
             '3' {
+                if (Show-MainMenu) {
+                    # Update/Reinstall chosen - see this function's header
+                    # for why the just-completed install phases are not
+                    # re-run from inside the completion screen.
+                    Write-Host 'Update and Reinstall re-run the full installer flow, which this run has just completed.'
+                    Write-Host 'Re-run setup.ps1 to update or reinstall this installation.'
+                }
+                return
+            }
+            '4' {
                 return
             }
         }
@@ -1766,17 +1808,29 @@ function Get-NodeInstaller {
 
 function Install-NodeMsi {
     <#
-      Runs the MSI silently via msiexec and waits for it to finish.
-      Exit code 0 = success. 3010 = success, reboot recommended (not
-      required to continue this script). Anything else is a hard failure.
+      Runs the MSI silently via msiexec and waits for it to finish, ONE
+      attempt only. Exit code 0 = success. 3010 = success, reboot
+      recommended (not required to continue this script). Any other exit
+      code is RETURNED to the caller rather than stopping setup here -
+      Install-NodeJs wraps this in Invoke-DeltaComponentInstallWithRetry
+      (lib\DeltaInstaller.Common.ps1), which owns the bounded one-retry
+      policy and the final failure handling.
+
+      $Attempt selects an attempt-specific MSI log file so a retry never
+      overwrites the first attempt's diagnostics. Attempt 1 keeps the
+      original node-install.log name unchanged.
     #>
-    param([Parameter(Mandatory)][string]$InstallerPath)
+    param(
+        [Parameter(Mandatory)][string]$InstallerPath,
+        [int]$Attempt = 1
+    )
 
     if (-not (Test-IsAdministrator)) {
         Stop-Setup 'Administrator privileges are required to install Node.js. Re-run this script from an elevated PowerShell session.'
     }
 
-    $logPath = Join-Path -Path $Script:WorkingDirectory -ChildPath 'node-install.log'
+    $logFileName = if ($Attempt -le 1) { 'node-install.log' } else { "node-install-attempt$Attempt.log" }
+    $logPath = Join-Path -Path $Script:WorkingDirectory -ChildPath $logFileName
 
     Write-Step 'Installing Node.js (silent MSI install)...'
     Write-Detail "Log: $logPath"
@@ -1792,10 +1846,9 @@ function Install-NodeMsi {
         3010 {
             Write-Detail 'Installation completed successfully. A reboot is recommended but not required to continue.'
         }
-        default {
-            Stop-Setup "The Node.js installer returned exit code $($process.ExitCode). See the log for details: $logPath"
-        }
     }
+
+    return $process.ExitCode
 }
 
 # ---------------------------------------------------------------------------
@@ -1835,7 +1888,56 @@ function Install-NodeJs {
 
     Write-Host ''
     $installerPath = Get-NodeInstaller -DestinationDirectory $Script:InstallersDirectory
-    Install-NodeMsi -InstallerPath $installerPath
+
+    # Pre-install snapshot for the bounded-retry cleanup safety rules
+    # below: retry cleanup may only ever remove artifacts the CURRENT
+    # failed attempt created, never anything that existed before this
+    # setup run - $nodePath (the detection result above) distinguishes
+    # the two, and the directory check catches a pre-existing (even
+    # broken/partial) install tree the detection didn't count as usable.
+    $nodeExistedBeforeSetup = [bool]$nodePath
+    $nodeInstallDirectory = Join-Path -Path $env:ProgramFiles -ChildPath 'nodejs'
+    $nodeInstallDirExistedBeforeSetup = Test-Path -LiteralPath $nodeInstallDirectory
+
+    Invoke-DeltaComponentInstallWithRetry -ComponentName 'Node.js' `
+        -SuccessExitCodes @(0, 3010) `
+        -FailureLogHint "Logs: $(Join-Path -Path $Script:WorkingDirectory -ChildPath 'node-install.log') (attempt 1), $(Join-Path -Path $Script:WorkingDirectory -ChildPath 'node-install-attempt2.log') (attempt 2)." `
+        -InstallAction {
+            param($Attempt)
+            Install-NodeMsi -InstallerPath $installerPath -Attempt $Attempt
+        } `
+        -TestComponentUsable {
+            # Same detection/validation the phase already uses: an MSI
+            # exit code is not trusted in either direction - only a
+            # resolvable node.exe reporting the exact required version
+            # counts as installed.
+            Update-SessionEnvironmentPath
+            $nodePathNow = Find-NodeExecutable
+            return [bool]($nodePathNow -and ((Get-InstalledNodeVersion -NodeExecutablePath $nodePathNow) -eq $Script:RequiredNodeVersion))
+        } `
+        -CleanupAction {
+            if ($nodeExistedBeforeSetup -or $nodeInstallDirExistedBeforeSetup) {
+                Write-Detail 'Node.js (or its install directory) existed before this setup run - leaving it untouched.'
+                return
+            }
+            # Fresh install confirmed. A failed MSI normally rolls itself
+            # back; only a directory left WITHOUT node.exe is treated as a
+            # partial artifact of the failed attempt. If node.exe exists,
+            # nothing is deleted - the MSI retry repairs in place.
+            $nodeExeNow = Join-Path -Path $nodeInstallDirectory -ChildPath 'node.exe'
+            if ((Test-Path -LiteralPath $nodeInstallDirectory) -and -not (Test-Path -LiteralPath $nodeExeNow)) {
+                Write-Detail "Removing the partial Node.js directory created by the failed attempt: $nodeInstallDirectory"
+                try {
+                    Remove-Item -LiteralPath $nodeInstallDirectory -Recurse -Force -ErrorAction Stop
+                }
+                catch {
+                    Write-Detail "Could not remove the partial directory ($($_.Exception.Message)) - continuing with the retry anyway."
+                }
+            }
+            else {
+                Write-Detail 'No partial Node.js artifacts found to clean up (a failed MSI install rolls itself back).'
+            }
+        }
 
     Write-Step 'Refreshing environment variables for this session...'
     Update-SessionEnvironmentPath
@@ -2150,10 +2252,24 @@ function Install-PostgresServer {
       Passing it to 17 makes the installer reject the entire command line
       with "Unknown option: --errortrace" and exit 1 during argument
       parsing, before --debugtrace (or any log) is ever opened.
+
+      Runs ONE attempt only and RETURNS the installer's exit code rather
+      than stopping setup on a non-zero code itself - Install-PostgreSql
+      wraps this in Invoke-DeltaComponentInstallWithRetry
+      (lib\DeltaInstaller.Common.ps1), which owns the bounded one-retry
+      policy and the final failure handling. $Attempt selects
+      attempt-specific --debugtrace/--errortrace log files so a retry
+      never overwrites the first attempt's diagnostics; attempt 1 keeps
+      the original postgres-install.log name unchanged. Expects
+      $Script:PostgresPort to have been resolved (Resolve-PostgresPort)
+      by the caller before the first attempt - hoisted out of this
+      function so a retry can never re-run the interactive port-conflict
+      prompt mid-recovery.
     #>
     param(
         [Parameter(Mandatory)][string]$InstallerPath,
-        [Parameter(Mandatory)][SecureString]$SuperuserPassword
+        [Parameter(Mandatory)][SecureString]$SuperuserPassword,
+        [int]$Attempt = 1
     )
 
     if (-not (Test-IsAdministrator)) {
@@ -2162,17 +2278,10 @@ function Install-PostgresServer {
 
     Write-Step 'Installing PostgreSQL (silent, unattended install)...'
 
-    # Resolves to $Script:PostgresPort (5432) unchanged when it's free, so
-    # this is a no-op on the common path. Updates the script-scoped value
-    # itself (not a local variable) so every later reference to
-    # $Script:PostgresPort - the --serverport argument below, and any
-    # future phase building a connection string - sees whatever port was
-    # actually selected.
-    $Script:PostgresPort = Resolve-PostgresPort
-
-    $logPath            = Join-Path -Path $Script:WorkingDirectory -ChildPath 'postgres-install.log'
+    $logSuffix          = if ($Attempt -le 1) { '' } else { "-attempt$Attempt" }
+    $logPath            = Join-Path -Path $Script:WorkingDirectory -ChildPath "postgres-install$logSuffix.log"
     $supportsErrorTrace = [int]$Script:RequiredPostgresMajorVersion -lt 17
-    $errorTracePath     = if ($supportsErrorTrace) { Join-Path -Path $Script:WorkingDirectory -ChildPath 'postgres-errortrace.log' } else { $null }
+    $errorTracePath     = if ($supportsErrorTrace) { Join-Path -Path $Script:WorkingDirectory -ChildPath "postgres-errortrace$logSuffix.log" } else { $null }
 
     Write-Detail "Log: $logPath"
     if ($supportsErrorTrace) {
@@ -2215,11 +2324,11 @@ function Install-PostgresServer {
         $argumentString  = $null
     }
 
-    if ($process.ExitCode -ne 0) {
-        Stop-Setup "The PostgreSQL installer returned exit code $($process.ExitCode). EDB does not publish a documented meaning for non-zero exit codes beyond 0 = success, so this is treated as a failure. See the installer log for details: $logPath"
+    if ($process.ExitCode -eq 0) {
+        Write-Success '    Installer reported success (exit code 0).'
     }
 
-    Write-Success '    Installer reported success (exit code 0).'
+    return $process.ExitCode
 }
 
 function Get-CachedPostgresSuperuserPassword {
@@ -2540,7 +2649,78 @@ function Install-PostgreSql {
     Write-Host ''
     $superuserPassword = Get-CachedPostgresSuperuserPassword
     $installerPath = Get-PostgresInstaller -DestinationDirectory $Script:InstallersDirectory
-    Install-PostgresServer -InstallerPath $installerPath -SuperuserPassword $superuserPassword
+
+    # Resolved once, before any install attempt (previously inside
+    # Install-PostgresServer) - a retry must reuse the port the operator
+    # already settled on, never re-run the interactive port-conflict
+    # prompt mid-recovery. Behavior-neutral on the common path: a free
+    # 5432 still resolves silently. Updates the script-scoped value
+    # itself so the --serverport argument and every later phase building
+    # a connection string see whatever port was actually selected.
+    $Script:PostgresPort = Resolve-PostgresPort
+
+    # Pre-install snapshot for the bounded-retry cleanup safety rules
+    # below: retry cleanup may only ever remove artifacts the CURRENT
+    # failed attempt created. Anything at the target prefix/data
+    # directory/service name that existed before this setup run - a
+    # reused instance, a different-major-version install at another
+    # prefix, even an incomplete tree left by some EARLIER interrupted
+    # run (the repair path above) - is never this run's to delete.
+    $pgPrefixExistedBeforeSetup  = Test-Path -LiteralPath $Script:PostgresInstallPrefix
+    $pgDataDirExistedBeforeSetup = Test-Path -LiteralPath $Script:PostgresDataDirectory
+    $pgServiceExistedBeforeSetup = [bool](Get-Service -Name $Script:PostgresServiceName -ErrorAction SilentlyContinue)
+
+    Invoke-DeltaComponentInstallWithRetry -ComponentName 'PostgreSQL' `
+        -FailureLogHint "Logs: $(Join-Path -Path $Script:WorkingDirectory -ChildPath 'postgres-install.log') (attempt 1), $(Join-Path -Path $Script:WorkingDirectory -ChildPath 'postgres-install-attempt2.log') (attempt 2)." `
+        -InstallAction {
+            param($Attempt)
+            Install-PostgresServer -InstallerPath $installerPath -SuperuserPassword $superuserPassword -Attempt $Attempt
+        } `
+        -TestComponentUsable {
+            # The same requirements the phase validation below enforces:
+            # psql.exe and postgres.exe present, required major version,
+            # and the Windows service registered and Running. An EDB exit
+            # code is not trusted in either direction.
+            Update-SessionEnvironmentPath
+            $checkNow = Find-PostgresInstallation
+            return [bool]($checkNow.Found -and $checkNow.PsqlPath -and $checkNow.PostgresExePath -and
+                $checkNow.MajorVersion -eq $Script:RequiredPostgresMajorVersion -and
+                $checkNow.ServiceName -and $checkNow.ServiceStatus -eq 'Running')
+        } `
+        -CleanupAction {
+            # Targets the observed EDB failure class: non-zero exit during
+            # extraction leaving an incomplete install directory with no
+            # service and no initialized data directory. Anything beyond
+            # that provably-safe shape is left in place - the retry then
+            # runs against whatever is there, and the normal validation
+            # still decides the outcome.
+            $pgServiceExistsNow      = [bool](Get-Service -Name $Script:PostgresServiceName -ErrorAction SilentlyContinue)
+            $pgDataDirInitializedNow = Test-Path -LiteralPath (Join-Path -Path $Script:PostgresDataDirectory -ChildPath 'PG_VERSION')
+
+            $safeToClean = Test-PostgresFreshInstallCleanupSafe `
+                -InstallPrefixExistedBeforeSetup $pgPrefixExistedBeforeSetup `
+                -DataDirectoryExistedBeforeSetup $pgDataDirExistedBeforeSetup `
+                -ServiceExistedBeforeSetup $pgServiceExistedBeforeSetup `
+                -ServiceExistsNow $pgServiceExistsNow `
+                -DataDirectoryInitializedNow $pgDataDirInitializedNow
+
+            if (-not $safeToClean) {
+                Write-Detail 'Not a confirmed fresh-install partial failure (a pre-existing installation, a registered service, or an initialized data directory is present) - nothing will be removed.'
+                return
+            }
+
+            foreach ($partialPath in @($Script:PostgresDataDirectory, $Script:PostgresInstallPrefix)) {
+                if (Test-Path -LiteralPath $partialPath) {
+                    Write-Detail "Removing the incomplete directory created by the failed attempt: $partialPath"
+                    try {
+                        Remove-Item -LiteralPath $partialPath -Recurse -Force -ErrorAction Stop
+                    }
+                    catch {
+                        Write-Detail "Could not remove it completely ($($_.Exception.Message)) - continuing with the retry anyway."
+                    }
+                }
+            }
+        }
 
     Write-Step 'Refreshing environment variables for this session...'
     Update-SessionEnvironmentPath
@@ -2828,8 +3008,12 @@ function Install-PostGISBundle {
       appears, and it auto-detects the target PostgreSQL installation via
       registry rather than needing --prefix/--datadir-style arguments.
       Like the PostgreSQL installer, NSIS documents no exit-code table
-      beyond "0 = success", so any non-zero code is an unconditional
-      failure here.
+      beyond "0 = success", so any non-zero code is treated as a failed
+      attempt. Runs ONE attempt only and RETURNS the exit code rather
+      than stopping setup itself - Install-PostGIS wraps this in
+      Invoke-DeltaComponentInstallWithRetry (lib\DeltaInstaller.Common.ps1),
+      which owns the bounded one-retry policy and the final failure
+      handling.
     #>
     param([Parameter(Mandatory)][string]$InstallerPath)
 
@@ -2842,11 +3026,11 @@ function Install-PostGISBundle {
 
     $process = Start-ProcessWithActivityIndicator -FilePath $InstallerPath -ArgumentList '/S' -ActivityName 'Installing PostGIS'
 
-    if ($process.ExitCode -ne 0) {
-        Stop-Setup "The PostGIS installer returned exit code $($process.ExitCode)."
+    if ($process.ExitCode -eq 0) {
+        Write-Success '    Installer reported success (exit code 0).'
     }
 
-    Write-Success '    Installer reported success (exit code 0).'
+    return $process.ExitCode
 }
 
 # ---------------------------------------------------------------------------
@@ -2892,7 +3076,32 @@ function Install-PostGIS {
 
     $installerPath = Get-PostGISInstaller -DestinationDirectory $Script:InstallersDirectory
     Test-PostGISInstallerIntegrity -InstallerPath $installerPath
-    Install-PostGISBundle -InstallerPath $installerPath
+
+    # Reaching this point already proves PostGIS was NOT usable before
+    # this run (the Test-PostGISAvailable idempotency check above) - a
+    # previously working PostGIS installation never gets here, so nothing
+    # a retry does can affect one.
+    Invoke-DeltaComponentInstallWithRetry -ComponentName 'PostGIS' `
+        -FailureLogHint 'The PostGIS bundle installer writes no log file of its own; the psql validation diagnostics printed above are the primary record for both attempts.' `
+        -InstallAction {
+            param($Attempt)
+            Install-PostGISBundle -InstallerPath $installerPath
+        } `
+        -TestComponentUsable {
+            # The existing functional definition of "installed": psql
+            # CREATE EXTENSION IF NOT EXISTS postgis +
+            # SELECT PostGIS_Full_Version() actually succeeding.
+            return [bool]((Test-PostGISAvailable -PsqlPath $existing.PsqlPath -SuperuserPassword $superuserPassword).Available)
+        } `
+        -CleanupAction {
+            # Deliberately no file cleanup: the bundle's payload lands
+            # inside the PostgreSQL installation tree (which may pre-date
+            # this setup run), so deleting files there could damage
+            # PostgreSQL itself - and the NSIS installer overwrites its
+            # own payload on a re-run anyway, making deletion unnecessary
+            # for a clean retry.
+            Write-Detail 'No file cleanup is performed for PostGIS - the bundle installer safely overwrites its own files on retry.'
+        }
 
     Write-Step 'Validating installation...'
     $confirmed = Test-PostGISAvailable -PsqlPath $existing.PsqlPath -SuperuserPassword $superuserPassword
