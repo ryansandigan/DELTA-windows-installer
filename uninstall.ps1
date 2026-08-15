@@ -30,7 +30,11 @@
     DELTA is still running can kill the server process without killing
     its launcher (Windows has no parent/child lifetime coupling), leaving
     an orphaned cmd.exe holding the DELTA runtime's redirected
-    stdout/stderr log handles open indefinitely.
+    stdout/stderr log handles open indefinitely. It also stops the
+    DeltaApp Windows service through the Service Control Manager before
+    any of that process-level cleanup, and is the one phase that removes
+    a DeltaApp registration outliving its own application directory -
+    every other service decision belongs to Phase 0.7, below.
 
     Phase 0.5 (Uninstall-DeltaNginx) and Phase 0.6 (Uninstall-DeltaIis) run
     next, in that order, and are each independently optional - neither
@@ -346,22 +350,37 @@ function Stop-DeltaRuntimeBeforeUninstall {
       Stop-RunningDeltaInstance's own existing behavior, reused unchanged
       here - see that function's own header.
 
-      A no-op, idempotently, whenever no DELTA installation can be found
-      on this machine at all (Get-DeltaInstallPath) - uninstalling
-      PostGIS/PostgreSQL/Node.js on a machine that never had DELTA
-      deployed, or where the runtime directory is simply gone, has
-      nothing here to detect or stop - and equally when a DELTA
-      installation IS found but nothing matching it is currently
-      running, which is the normal case for a routine uninstall.
+      The process-level half of this phase is a no-op, idempotently,
+      whenever no DELTA installation can be found on this machine at all
+      (Get-DeltaInstallPath) - uninstalling PostGIS/PostgreSQL/Node.js on
+      a machine that never had DELTA deployed, or where the runtime
+      directory is simply gone, has nothing there to detect or stop - and
+      equally when a DELTA installation IS found but nothing matching it
+      is currently running, which is the normal case for a routine
+      uninstall.
+
+      The DeltaApp service half is deliberately NOT gated on that, because
+      a service registration can outlive the directory it points at. See
+      the comment on the check itself for why that case is both real and
+      only reachable here.
     #>
     Write-PhaseBanner 'Phase 0 - DELTA Runtime'
 
     $deltaInstallPath = Get-DeltaInstallPath
-    if (-not $deltaInstallPath) {
-        Write-Detail 'No DELTA installation found on this machine - nothing to stop.'
-        return
-    }
 
+    # The Windows service is handled BEFORE the "no installation found"
+    # early return below, not after it. A registration can outlive the
+    # directory it points at - an operator who deleted the DELTA directory
+    # by hand, or an earlier uninstall whose own removal only got as far as
+    # "marked for deletion" with no reboot since - and in that state
+    # Get-DeltaInstallPath correctly returns nothing (lib\DeltaInstaller.
+    # Common.ps1: the registry's InstallPath must still pass Test-Path, and
+    # C:\DELTA\.env must exist, for either fallback to resolve). Checking
+    # the service only after that return is what previously left such a
+    # registration untouched by the entire uninstall - still Automatic,
+    # pointed at a DeltaApp.exe that no longer exists, failing at every
+    # boot, and reported as 'N/A' in the summary.
+    #
     # The Windows service is stopped FIRST, through the Service Control
     # Manager, before any process-level cleanup is attempted. Two reasons,
     # both specific to this phase:
@@ -374,9 +393,12 @@ function Stop-DeltaRuntimeBeforeUninstall {
     #     directory deletion. A supervised restart loop during an uninstall
     #     would make that worse, not better.
     #
-    # The service is only STOPPED here, never removed - removal is tied to
-    # the application directory's own fate (Uninstall-DeltaApplicationDirectory,
-    # Phase 0.7), since that is where its executable and configuration live.
+    # When a DELTA installation IS present the service is only STOPPED here,
+    # never removed - removal stays tied to the application directory's own
+    # fate (Uninstall-DeltaApplicationDirectory, Phase 0.7), since that is
+    # where its executable and configuration live, and since an operator who
+    # keeps the directory gets the registration preserved-and-disabled
+    # rather than destroyed.
     if (Test-DeltaServiceInstalled) {
         Write-Step "Stopping the $($Script:DeltaServiceName) Windows service..."
         if (Stop-DeltaWindowsService) {
@@ -386,6 +408,38 @@ function Stop-DeltaRuntimeBeforeUninstall {
             Write-Host ''
             Write-Host 'The DELTA service did not stop within the timeout - continuing with direct process cleanup.' -ForegroundColor Yellow
         }
+
+        if (-not $deltaInstallPath) {
+            # An orphaned registration is the one case removed here rather
+            # than in Phase 0.7: that phase resolves the same install path
+            # and returns just as early, so this is the only point in the
+            # run where it can be cleaned up at all. Nothing is prompted
+            # for, because none of the reasons Phase 0.7 asks apply - there
+            # is no directory to preserve, no database to back up first,
+            # and no reinstall path to protect. Leaving the registration is
+            # strictly worse for the operator than removing it.
+            #
+            # -AppRoot $null deliberately: with no directory there is no
+            # WinSW executable to unregister through, which is exactly the
+            # sc.exe delete fallback Uninstall-DeltaWindowsService already
+            # implements for a partially-removed installation. Its own
+            # verification and reboot-hint warning are reused unchanged, so
+            # a registration that survives removal reports the same way it
+            # does in Phase 0.7 rather than failing the run.
+            Write-Host ''
+            Write-Detail 'No DELTA installation directory is associated with this service registration.'
+            $Script:DeltaServiceResult = if (Uninstall-DeltaWindowsService -AppRoot $null) {
+                'Removed (orphaned registration - no DELTA installation found)'
+            }
+            else {
+                'Removal requested (registration still present - may clear after reboot)'
+            }
+        }
+    }
+
+    if (-not $deltaInstallPath) {
+        Write-Detail 'No DELTA installation found on this machine - nothing to stop.'
+        return
     }
 
     Write-Step 'Detecting running DELTA instance...'
