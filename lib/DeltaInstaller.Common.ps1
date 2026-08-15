@@ -66,6 +66,16 @@ $Script:DeltaSkipManagedInstanceRestart = $false
 # than three separately-hardcoded copies of it.
 $Script:DefaultDeltaRuntimeRoot = 'C:\DELTA'
 
+# The single, authoritative registry location every DELTA installer utility
+# reads and writes - setup.ps1 (Register-DeltaInstallation's InstallPath/
+# Version, Get-/Set-DeltaManagedInstanceRestartPolicy's operator preference),
+# Get-DeltaInstallPath below, and lib\DeltaInstaller.Service.ps1's
+# intentional-disable marker (Set-/Clear-/Test-DeltaServiceDisabledByUninstall).
+# Defined HERE, in the shared file every one of those loads, rather than
+# separately in each - the path had already been written out by hand in two
+# places before this, which is exactly the drift this constant removes.
+$Script:DeltaRegistryKeyPath = 'HKLM:\SOFTWARE\PreventionWeb\DELTA'
+
 # ---------------------------------------------------------------------------
 # Console output vocabulary
 # ---------------------------------------------------------------------------
@@ -747,8 +757,7 @@ function Get-DeltaInstallPath {
         3. $null if neither of the above found anything real.
     #>
 
-    $registryKeyPath = 'HKLM:\SOFTWARE\PreventionWeb\DELTA'
-    $registryEntry = Get-ItemProperty -LiteralPath $registryKeyPath -Name 'InstallPath' -ErrorAction SilentlyContinue
+    $registryEntry = Get-ItemProperty -LiteralPath $Script:DeltaRegistryKeyPath -Name 'InstallPath' -ErrorAction SilentlyContinue
     $registryInstallPath = Get-RegistryPropertyValue -InputObject $registryEntry -Name 'InstallPath'
     if ($registryInstallPath -and (Test-Path -LiteralPath $registryInstallPath)) {
         return $registryInstallPath
@@ -1332,6 +1341,25 @@ function Confirm-DeltaRuntimeNotRunning {
     }
 
     Write-Step 'Checking for an already-running DELTA instance...'
+
+    # Service-managed installations are stopped through the Service Control
+    # Manager FIRST, never by terminating the process. Killing a supervised
+    # process would simply cause WinSW to restart it - the installer would
+    # be fighting the supervisor it installed, and the "port is now free"
+    # check below could pass or fail depending purely on timing.
+    #
+    # Direct termination is still attempted afterwards, but only ever as a
+    # narrowly-scoped cleanup of what the SCM stop cannot reach: a legacy
+    # instance from before this installation was service-managed, an
+    # orphaned cmd.exe launcher, or a stop that genuinely timed out.
+    # Stop-RunningDeltaInstance is a no-op when nothing matches, so this
+    # stays correct for a service-managed installation that stopped cleanly.
+    if (Test-DeltaServiceInstalled) {
+        if (-not (Stop-DeltaWindowsService)) {
+            Write-Detail 'The DELTA service did not stop within the timeout - falling back to direct process cleanup.'
+        }
+    }
+
     Stop-RunningDeltaInstance -DeltaRuntimeRoot $Script:DeltaRuntimeRoot
 
     $portCheck = Test-TcpPortAvailable -Port $Script:DeltaBackendPort
@@ -1360,6 +1388,20 @@ function Get-DeltaStartupLogPaths {
       again, on a restart triggered from setup-nginx.ps1/setup-iis.ps1 any
       more than on setup.ps1's own original call.
     #>
+    # Once DELTA is service-managed, its stdout/stderr are captured by WinSW
+    # under different names in the same directory - the legacy
+    # delta-startup-*.log files are no longer written at all, so pointing a
+    # failure diagnostic at them would send an operator to a stale file from
+    # a previous, pre-service run. Resolved here, at the one place both the
+    # writer and the reader agree on these paths.
+    if (Test-DeltaServiceInstalled) {
+        $serviceLogPaths = Get-DeltaServiceLogPaths -AppRoot $Script:DeltaRuntimeRoot
+        return [PSCustomObject]@{
+            StdOut = $serviceLogPaths.StdOut
+            StdErr = $serviceLogPaths.StdErr
+        }
+    }
+
     $logsDirectory = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath 'logs'
     return [PSCustomObject]@{
         StdOut = Join-Path -Path $logsDirectory -ChildPath 'delta-startup-stdout.log'
@@ -1413,6 +1455,19 @@ function Start-DeltaRuntimeForValidation {
     $logPaths = Get-DeltaStartupLogPaths
     Write-Detail "Standard output: $($logPaths.StdOut)"
     Write-Detail "Standard error : $($logPaths.StdErr)"
+
+    # Service-managed installations start through the Service Control
+    # Manager. The detached Start-Process path below is retained ONLY for
+    # installations that predate the Windows Service (and for the window
+    # during migration before the service has been registered) - the two
+    # must never both be trying to own DELTA's lifecycle, which is why this
+    # is an either/or rather than an additional step.
+    if (Test-DeltaServiceInstalled) {
+        Write-Detail "Service: $($Script:DeltaServiceName)"
+        Start-DeltaWindowsService
+        Write-Success '    DELTA service started.'
+        return
+    }
 
     try {
         Start-Process -FilePath 'cmd.exe' `
@@ -1546,7 +1601,19 @@ function Confirm-DeltaRuntimeStarted {
             $hasBeenObservedRunning = $true
         }
         elseif ($hasBeenObservedRunning) {
-            Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it finished starting.')
+            # "Was running, now isn't" means the process died - but under a
+            # supervisor that is not automatically fatal, because WinSW may
+            # legitimately be restarting it (its configured restart delay is
+            # 10 seconds, comfortably inside this wait). Failing here would
+            # turn a successful recovery into a reported installation
+            # failure. The service itself still being Running is what
+            # distinguishes "being restarted" from "gave up": once the
+            # restart policy is exhausted the SCM stops the service, and the
+            # check below then fails exactly as it always did.
+            if (-not (Test-DeltaSupervisedRestartInProgress)) {
+                Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it finished starting.')
+            }
+            $hasBeenObservedRunning = $false
         }
         if (-not (Test-TcpPortAvailable -Port $Script:DeltaBackendPort).Available) {
             $isListening = $true
@@ -1565,7 +1632,12 @@ function Confirm-DeltaRuntimeStarted {
     $isResponding = $false
     while ((Get-Date) -lt $httpDeadline) {
         if (-not (Get-RunningDeltaProcesses -DeltaRuntimeRoot $Script:DeltaRuntimeRoot)) {
-            Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it responded over HTTP.')
+            # Same supervisor allowance as the port loop above - see there
+            # for why a momentarily-absent process is not proof of failure
+            # once something is actively restarting it.
+            if (-not (Test-DeltaSupervisedRestartInProgress)) {
+                Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it responded over HTTP.')
+            }
         }
         if (Test-DeltaHttpEndpoint -Url $url) {
             $isResponding = $true
@@ -1733,7 +1805,111 @@ function Backup-DeltaEnvironmentFile {
 
     $backupPath = "$Path.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
     Copy-Item -LiteralPath $Path -Destination $backupPath -Force
+
+    # The backup is a byte-for-byte copy of a file holding DATABASE_URL,
+    # SESSION_SECRET and SMTP_PASS, and Copy-Item creates a NEW file, which
+    # therefore inherits the application directory's own ACL rather than the
+    # hardened one the source file carries. Without this the hardening
+    # applied to .env would be trivially defeated by reading the .bak file
+    # sitting next to it - so every backup is hardened the same way, at the
+    # one place backups are actually created.
+    Protect-DeltaSecretFile -Path $backupPath
+
     Write-Detail "Existing .env backed up to: $backupPath"
+}
+
+function Protect-DeltaSecretFile {
+    <#
+      Restricts $Path to Administrators + SYSTEM (+ any $ReadAccounts), so a
+      file containing deployment secrets is not readable by every ordinary
+      local user.
+
+      Why this exists: a deployed .env inherits the application directory's
+      ACL, which on a default installation grants BUILTIN\Users
+      ReadAndExecute - confirmed directly against a real deployment, where
+      DATABASE_URL (including the database password), SESSION_SECRET and
+      SMTP_PASS were all readable by any local account on the machine. That
+      predates the Windows Service work and is independent of it, but the
+      service work is what introduces a dedicated, least-privileged identity
+      that needs an explicit grant here anyway, which makes this the right
+      place to close it.
+
+      Mechanics, in order:
+        1. /inheritance:d converts the inherited ACEs into explicit ones, so
+           the entries that should survive (Administrators, SYSTEM) are
+           preserved on the file itself before anything is removed. Removing
+           an inherited ACE directly is not possible - it has to be
+           materialized first.
+        2. /remove:g drops the broad principals. Each is attempted
+           independently and an absent principal is simply a no-op, so this
+           is idempotent and safe to re-run on an already-hardened file.
+        3. Administrators/SYSTEM are re-granted explicitly rather than
+           merely assumed to have survived step 1 - a file whose owner had
+           already stripped them would otherwise be left unmanageable by the
+           installer itself, and by backup/update/reinstall tooling.
+
+      $ReadAccounts receives Read (not Modify): the DELTA service account
+      only ever needs to read .env, never write it - .env is installer- and
+      operator-owned.
+
+      Deliberately NON-FATAL on failure (a warning, never Stop-Setup). This
+      hardens an existing file's permissions; it is not a precondition for a
+      working installation, and aborting a complete, otherwise-successful
+      install because icacls could not adjust an ACL (an unusual volume, a
+      restrictive parent policy) would trade a real working deployment for a
+      permissions nicety. The failure is reported loudly instead of being
+      swallowed, so it is never invisible.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$ReadAccounts = @()
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return
+    }
+
+    $broadPrincipals = @('BUILTIN\Users', 'Everyone', 'NT AUTHORITY\Authenticated Users')
+
+    try {
+        $output = & icacls.exe $Path /inheritance:d /C 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "icacls /inheritance:d failed: $(($output | Out-String).Trim())"
+        }
+
+        foreach ($principal in $broadPrincipals) {
+            # An identity that isn't on the ACL at all is a normal, expected
+            # outcome here (most files never carry an Everyone ACE), so a
+            # non-zero exit from an individual removal is not treated as a
+            # failure of the whole operation.
+            $null = & icacls.exe $Path /remove:g $principal /C 2>&1
+        }
+
+        $grants = @('BUILTIN\Administrators:(F)', 'NT AUTHORITY\SYSTEM:(F)')
+        foreach ($account in $ReadAccounts) {
+            if ($account) { $grants += "${account}:(R)" }
+        }
+
+        foreach ($grant in $grants) {
+            $output = & icacls.exe $Path /grant $grant /C 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "icacls /grant $grant failed: $(($output | Out-String).Trim())"
+            }
+        }
+
+        Write-Detail "Restricted to Administrators/SYSTEM$(if ($ReadAccounts) { ' + ' + ($ReadAccounts -join ', ') }): $Path"
+    }
+    catch {
+        Write-Host ''
+        Write-Host 'WARNING' -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host "Could not restrict permissions on a file containing secrets:" -ForegroundColor Yellow
+        Write-Host "  $Path" -ForegroundColor Yellow
+        Write-Host "  $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host 'Installation continues, but this file may be readable by ordinary local users.' -ForegroundColor Yellow
+        Write-Host ''
+    }
 }
 
 function Update-ManagedEnvironmentLines {
@@ -3911,3 +4087,35 @@ function Test-DeltaDatabaseExists {
 
     return (($output | Out-String).Trim() -eq '1')
 }
+
+# ---------------------------------------------------------------------------
+# DELTA Windows Service
+# ---------------------------------------------------------------------------
+#
+# Loaded LAST, deliberately, and from here rather than from each entry-point
+# script.
+#
+# Several functions above are now service-aware - Confirm-DeltaRuntimeNotRunning
+# (stop through the Service Control Manager before ever terminating a
+# process), Start-DeltaRuntimeForValidation (start the service instead of a
+# detached cmd.exe), Confirm-DeltaRuntimeStarted (don't mistake a supervised
+# restart for a crash), and Get-DeltaStartupLogPaths (point at WinSW's own
+# capture). Restart-DeltaRuntimeForReverseProxy composes exactly those three
+# and therefore became service-aware without changing a line of its own.
+#
+# That last point is what makes this the right place for the dot-source:
+# setup-nginx.ps1, setup-iis.ps1, and doctor.ps1 all reach this file (directly
+# or through lib\DeltaDoctor.*.ps1) and load nothing else, so pulling the
+# service module in here gives every one of them correct service behaviour
+# with no change to any of them - which is precisely the constraint that the
+# reverse proxy scripts stay independent of DELTA process management.
+#
+# Loaded at the END of this file, not the top, because the service module
+# calls back into the helpers defined above (Write-Step, Stop-Setup,
+# Wait-Until, Get-EnvFileValue, ConvertFrom-DatabaseUrl, Test-TcpPortAvailable,
+# Get-RunningDeltaProcesses, Protect-DeltaSecretFile). PowerShell resolves
+# function calls at invocation time rather than at parse time, so the order
+# only actually matters for the code the service module runs *while loading* -
+# but keeping the dependency direction visible and one-way here is what stops
+# this from becoming a dot-source cycle later.
+. (Join-Path -Path $Script:ProjectRoot -ChildPath 'lib\DeltaInstaller.Service.ps1')

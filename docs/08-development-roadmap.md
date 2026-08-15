@@ -46,7 +46,7 @@ Keeping these as three separate functions (rather than one large `Install-Postgr
 | Phase 2C — Database Initialization | ⬜ Planned | Absorbs the [UTF-8/locale risk](06-deployment-risks.md#utf-8-and-locale-at-database-creation). |
 | Phase 3 — Yarn & Dependencies | 🔶 In progress | Renumbered from Phase 4 when PostgreSQL split into 2A/2B/2C. Wraps `init_website.bat` idempotently rather than fixing it directly — see phase detail below. |
 | Phase 4 — Environment Configuration | ⬜ Planned | Renumbered from Phase 6. `.env` PORT resolution/update (`Resolve-DeltaApplicationPort`, `Update-DeltaApplicationPortEnvironment`) landed early as part of the startup-validation work below, ahead of the rest of this phase. |
-| Phase 5 — Windows Service | ⬜ Planned | Renumbered from Phase 7. An **interim, non-supervised stand-in** already exists (`Start-DeltaRuntimeForValidation` / `Confirm-DeltaRuntimeStarted`, see that section's own detail below) — `setup.ps1` starts and verifies DELTA automatically today, but with no restart policy, crash supervision, or watchdog. This phase supersedes that stand-in; it doesn't start from nothing. |
+| Phase 5 — Windows Service | ✅ Implemented | `lib\DeltaInstaller.Service.ps1` + `templates\service\delta-service.xml`, installed by `setup.ps1`'s `Install-DeltaWindowsService`. WinSW-supervised `DeltaApp` service running `node.exe` directly under `NT SERVICE\DeltaApp`, Automatic. Supersedes the interim stand-in — `Start-DeltaRuntimeForValidation` now starts the service, and `Confirm-DeltaRuntimeStarted` still owns readiness. Pending end-to-end reboot validation on a real target. |
 | Phase 6 — Validation | ⬜ Planned | Renumbered from Phase 8. |
 
 Legend: ✅ Completed · 🔶 In progress · ⬜ Planned
@@ -293,7 +293,20 @@ Legend: ✅ Completed · 🔶 In progress · ⬜ Planned
 
 ## Phase 5 — Windows Service
 
-**Status:** ⬜ Planned
+**Status:** ✅ Implemented (pending end-to-end reboot validation on a real target)
+
+**Decision recorded — WinSW, not NSSM.** WinSW's declarative XML fits this repository's existing template-rendering convention (`templates\nginx\*`, `templates\iis\web.config`), which is what makes "regenerate and compare, rewrite only on change" idempotency provable rather than asserted; NSSM's imperative `nssm set` registry writes cannot give that. WinSW is also a single pinned, SHA-256-verified download, matching how every other component is acquired (`.env.installer` + `installers\` cache). The `WinSW.NET461.exe` build is used (656 KB, versus ~18 MB self-contained) because .NET Framework 4.6.1+ ships with Server 2022/2025 and Windows 11. The binary is **not** code-signed, so the pinned digest is mandatory and a mismatch is fatal.
+
+**What was built:**
+
+- `lib\DeltaInstaller.Service.ps1` — acquisition, rendering, registration, identity, ACLs, lifecycle, and the unified `Get-DeltaRuntimeState`. No raw `sc.exe`/WinSW call exists anywhere else.
+- `templates\service\delta-service.xml` — the generated service definition.
+- `tools\test-delta-service-definition.ps1` — 46 cases covering rendering, spaced/XML-significant paths, no hardcoded `C:\DELTA` or port, and the runtime state mapping.
+
+**Resolved along the way:** the graceful-shutdown risk ([06 #5](06-deployment-risks.md#windows-service-shutdown-behavior)) is closed with observed evidence, and the CLI path documented in [02](02-windows-installation.md#windows-service-installation) (`dist\cli.js`) was found to be wrong for the shipped version — it is now resolved dynamically from the package's own `bin` field.
+
+<details>
+<summary>Original plan (for reference)</summary>
 
 **Objective:** Run the DELTA Node process as a supervised Windows Service — see [02 — Windows Service installation](02-windows-installation.md#windows-service-installation) for the manual reference procedure this phase automates, and [06 — Windows Service shutdown behavior](06-deployment-risks.md#windows-service-shutdown-behavior) for the one open risk this phase must specifically resolve, not just wrap.
 
@@ -313,11 +326,13 @@ Legend: ✅ Completed · 🔶 In progress · ⬜ Planned
 
 **Checklist:**
 
-- [ ] NSSM or WinSW evaluation (decision recorded here once made)
-- [ ] Service registration
-- [ ] Automatic restart
-- [ ] Logging
-- [ ] Graceful shutdown validation
+- [x] NSSM or WinSW evaluation (decision recorded above)
+- [x] Service registration
+- [x] Automatic restart
+- [x] Logging
+- [x] Graceful shutdown validation
+
+</details>
 
 ---
 

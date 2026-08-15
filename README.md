@@ -65,6 +65,7 @@ Set-ExecutionPolicy RemoteSigned
 - DELTA runtime deployment to a configurable application directory
 - Environment configuration (`.env` generation from `.env.example`)
 - Database initialization
+- Windows Service installation (`DeltaApp`) so DELTA starts automatically after a reboot, with no interactive login, and restarts automatically if it crashes
 - Optional native reverse proxy configuration (NGINX or IIS) in front of DELTA
 - Administrator password reset for an existing DELTA installation, without a full reinstall
 - Database upgrade utility for existing DELTA installations
@@ -188,6 +189,35 @@ Beyond the installation workflow above, the following scripts can be run indepen
 | `uninstall.ps1` | Removes the components `setup.ps1` installs (Node.js, PostgreSQL, PostGIS) from the machine. |
 
 Forgot the DELTA administrator password? No need to run any of these — `setup.ps1` itself offers a **Reset administrator password** option whenever it detects an existing installation.
+
+## The DELTA Windows Service
+
+After installation, DELTA runs as a Windows Service and **starts automatically when Windows boots — no interactive login is required**. Logging out or disconnecting an RDP session does not stop it.
+
+| Property | Value |
+|---|---|
+| Service name | `DeltaApp` |
+| Startup type | Automatic |
+| Runs as | `NT SERVICE\DeltaApp` (least-privileged virtual account, no password to manage) |
+| Location | `<application directory>\service\` |
+| Crash recovery | Automatic restart at 10s, 30s, then 60s; stops after that rather than looping forever |
+
+Run `setup.ps1` and use its management menu to **Start**, **Stop**, or **Restart** DELTA — it reports the service state together with DELTA's own process, port, and readiness checks. Standard Windows commands also work:
+
+```powershell
+Get-Service DeltaApp
+Restart-Service DeltaApp
+```
+
+Note that a service reporting `Running` only means the wrapper is up; DELTA is *ready* once it is listening on its configured port and answering HTTP. The management menu distinguishes the two.
+
+Service logs are written to `<application directory>\logs\DeltaApp.out.log`, `DeltaApp.err.log`, and `DeltaApp.wrapper.log`. The application's own logs are unaffected and continue to go to `LOG_DIR`.
+
+Existing installations created before this feature are migrated automatically the next time `setup.ps1` runs — no manual cleanup is needed.
+
+If the `DeltaApp` service is ever missing, damaged, or pointed at the wrong place, `setup.ps1` detects that when it starts and repairs it. **A missing service does not mean DELTA has to be updated or reinstalled**: as long as the deployment itself is intact, only the service is configured — your application files, dependencies, configuration, uploads, and database are left exactly as they are. If DELTA is running at the time, it is restarted under the service only after you confirm. Repair is only reported as successful once DELTA is listening and answering HTTP again.
+
+Two cases are handled differently on purpose. A service that was deliberately **disabled** — including by an uninstall that kept your application directory — is never re-enabled without asking, so an intentional "do not run" is never silently overturned. And if an unrelated process is holding DELTA's configured port, the installer reports the conflict and leaves that process alone rather than working around it.
 
 ## Release Philosophy
 
