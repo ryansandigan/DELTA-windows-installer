@@ -4089,6 +4089,220 @@ function Test-DeltaDatabaseExists {
 }
 
 # ---------------------------------------------------------------------------
+# Reusable dependency installers (sibling installer caches)
+# ---------------------------------------------------------------------------
+#
+# Every downloaded dependency in this project is cached in the entry-point
+# script's own .\installers directory (setup.ps1's $Script:InstallersDirectory
+# and the identical definitions in setup-nginx.ps1/setup-iis.ps1), and every
+# Get-*Installer/Get-*Package function follows the same two-step shape:
+# "return the cached file if it is already there, otherwise download it".
+#
+# Operators routinely keep several unpacked copies of this installer side by
+# side (an extracted 1.0.12 release next to a 1.0.13 one, a manual backup, a
+# scratch directory), each with its own populated installers\ cache holding
+# the very same ~350 MB PostgreSQL installer. The two functions below are the
+# single place that "otherwise" step first looks at those neighbouring caches,
+# so a re-download only happens when no copy of the file exists anywhere
+# beside this checkout.
+
+function Find-DeltaReusableInstaller {
+    <#
+      Returns every sibling-cached copy of $FileName that could be reused,
+      most obvious candidate first, or an empty array when there is none.
+
+      "Sibling" means a directory that sits next to the installer directory
+      that owns $DestinationDirectory - i.e. for a $DestinationDirectory of
+      C:\DELTA-windows-installer\installers, every C:\<anything>\installers.
+      The sibling's own NAME is deliberately irrelevant: operators name these
+      copies whatever they like (DELTA-windows-installer-1.0.12, old-delta,
+      installer-backup, potpot), and requiring a naming pattern would defeat
+      the point. The cache subdirectory name is taken from
+      $DestinationDirectory's own leaf rather than hardcoded as 'installers',
+      so this keeps matching whatever the callers cache into.
+
+      Three deliberate limits, each of which is what keeps this cheap and
+      predictable rather than a filesystem crawl:
+
+        - EXACT filename match only. This mirrors Get-NginxPackage's own
+          reasoning (setup-nginx.ps1): the whole point of pinning a version
+          is that the pinned file is what gets installed, so a
+          node-v22.*.msi left in a neighbouring cache must never satisfy a
+          request for node-v24.18.0-x64.msi.
+        - ONE level down, on both sides: the parent is listed non-recursively,
+          and only <sibling>\<cache>\<file> is probed. Nothing scans the drive.
+        - The caller's own installer directory is excluded, so the file that
+          is already missing from the local cache can never be "found" there.
+
+      Zero-length files are skipped: every download path in this project
+      already treats a zero-byte result as a failed download, so a truncated
+      neighbouring copy is not a candidate here either.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FileName,
+        [Parameter(Mandatory)][string]$DestinationDirectory
+    )
+
+    # Normalized once, up front, because both the sibling exclusion and the
+    # parent lookup below are path comparisons - and a caller that passed a
+    # relative path (or one with a trailing separator) must not silently
+    # compare unequal to the same directory written differently.
+    try {
+        $destinationFull = [System.IO.Path]::GetFullPath($DestinationDirectory).TrimEnd('\', '/')
+    }
+    catch {
+        return @()
+    }
+
+    $cacheDirectoryName = Split-Path -Path $destinationFull -Leaf
+    $installerRoot      = Split-Path -Path $destinationFull -Parent
+    if ([string]::IsNullOrWhiteSpace($cacheDirectoryName) -or [string]::IsNullOrWhiteSpace($installerRoot)) {
+        return @()
+    }
+
+    # The directory the siblings live in. Empty when $installerRoot is
+    # already a drive root, which simply means there are no siblings.
+    $searchRoot = Split-Path -Path $installerRoot -Parent
+    if ([string]::IsNullOrWhiteSpace($searchRoot) -or -not (Test-Path -LiteralPath $searchRoot -PathType Container)) {
+        return @()
+    }
+
+    $installerRootNormalized = $installerRoot.TrimEnd('\', '/')
+
+    # -ErrorAction SilentlyContinue, not error suppression for its own sake:
+    # the parent is frequently a drive root, whose entries include
+    # directories this process legitimately cannot open (System Volume
+    # Information and friends). An unreadable neighbour is simply not a
+    # candidate; it is not a reason to fail an installation.
+    $siblings = @(Get-ChildItem -LiteralPath $searchRoot -Directory -ErrorAction SilentlyContinue)
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    foreach ($sibling in $siblings) {
+        $siblingPath = $sibling.FullName.TrimEnd('\', '/')
+
+        if ($siblingPath.Equals($installerRootNormalized, [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+
+        $candidatePath = Join-Path -Path (Join-Path -Path $siblingPath -ChildPath $cacheDirectoryName) -ChildPath $FileName
+
+        if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf -ErrorAction SilentlyContinue)) {
+            continue
+        }
+
+        $candidateItem = Get-Item -LiteralPath $candidatePath -ErrorAction SilentlyContinue
+        if (-not $candidateItem -or $candidateItem.Length -eq 0) {
+            continue
+        }
+
+        # Test-Path/Join-Path are both purely textual, so a candidate that
+        # differs only in casing or separators from the destination would
+        # otherwise survive the sibling exclusion above.
+        if ($candidateItem.FullName.Equals((Join-Path -Path $destinationFull -ChildPath $FileName), [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+
+        $candidates.Add($candidateItem.FullName)
+    }
+
+    return @($candidates)
+}
+
+function Copy-DeltaReusableInstaller {
+    <#
+      Copies the first usable sibling-cached copy of $FileName into
+      $DestinationDirectory and returns its new path, or $null when there is
+      nothing to reuse - in which case the caller simply proceeds with its
+      existing download, unchanged.
+
+      Called ONLY when $FileName is missing from the local cache; the
+      "already cached" branch of each Get-*Installer function stays exactly
+      as it was. (A destination file that exists anyway is returned as-is
+      rather than overwritten - reuse must never destroy a good cached file.)
+
+      $Validate is the caller's OWN existing integrity check, passed in
+      rather than reimplemented here: WinSW's mandatory SHA-256 comparison
+      (lib\DeltaInstaller.Service.ps1) and PostGIS's published-MD5 check
+      (setup.ps1) are the two that exist today, and neither is weakened or
+      duplicated by this path. A candidate that fails it is deleted again and
+      the search continues with the next one, so a single stale neighbouring
+      copy cannot block reuse of a good one - and if every candidate fails,
+      this returns $null and the normal download runs. That is the whole
+      fallback contract: reuse is an optimization, never a new failure mode.
+
+      No prompt: this is automatic by design.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FileName,
+        [Parameter(Mandatory)][string]$DestinationDirectory,
+        [scriptblock]$Validate
+    )
+
+    $destinationPath = Join-Path -Path $DestinationDirectory -ChildPath $FileName
+
+    if (Test-Path -LiteralPath $destinationPath -PathType Leaf) {
+        return $destinationPath
+    }
+
+    $candidates = @(Find-DeltaReusableInstaller -FileName $FileName -DestinationDirectory $DestinationDirectory)
+
+    if ($candidates.Count -eq 0) {
+        return $null
+    }
+
+    Write-Step 'Installer not found in current cache. Searching sibling installer directories...'
+
+    foreach ($candidate in $candidates) {
+        Write-Detail "Found reusable installer: $candidate"
+        Write-Detail "Copying to current installer cache: $destinationPath"
+
+        if (-not (Test-Path -LiteralPath $DestinationDirectory -PathType Container)) {
+            New-Item -Path $DestinationDirectory -ItemType Directory -Force | Out-Null
+        }
+
+        try {
+            Copy-Item -LiteralPath $candidate -Destination $destinationPath -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Detail "Could not copy that file ($($_.Exception.Message)) - ignoring it."
+            Remove-Item -LiteralPath $destinationPath -Force -ErrorAction SilentlyContinue
+            continue
+        }
+
+        $copiedItem = Get-Item -LiteralPath $destinationPath -ErrorAction SilentlyContinue
+        if (-not $copiedItem -or $copiedItem.Length -eq 0) {
+            Write-Detail 'The copied file is missing or empty - ignoring it.'
+            Remove-Item -LiteralPath $destinationPath -Force -ErrorAction SilentlyContinue
+            continue
+        }
+
+        if ($Validate) {
+            $isValid = $false
+            try {
+                $isValid = [bool](& $Validate $destinationPath)
+            }
+            catch {
+                Write-Detail "Validation of the copied installer failed ($($_.Exception.Message))."
+                $isValid = $false
+            }
+
+            if (-not $isValid) {
+                Write-Detail 'The copied installer did not pass integrity validation - discarding it.'
+                Remove-Item -LiteralPath $destinationPath -Force -ErrorAction SilentlyContinue
+                continue
+            }
+        }
+
+        Write-Success '    Reused an already-downloaded installer.'
+        return $destinationPath
+    }
+
+    Write-Detail 'No reusable installer could be used - falling back to downloading it.'
+    return $null
+}
+
+# ---------------------------------------------------------------------------
 # DELTA Windows Service
 # ---------------------------------------------------------------------------
 #

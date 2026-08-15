@@ -2138,6 +2138,16 @@ function Get-NodeInstaller {
         return $installerPath
     }
 
+    # Before paying for the download: an identical copy may already sit in a
+    # neighbouring installer directory's own cache (Copy-DeltaReusableInstaller,
+    # lib\DeltaInstaller.Common.ps1). Exact filename only, so the pinned
+    # version is still the only one that can be installed. $null means there
+    # was nothing to reuse, and the original download below runs unchanged.
+    $reusedPath = Copy-DeltaReusableInstaller -FileName $Script:InstallerConfig.NODE_INSTALLER -DestinationDirectory $DestinationDirectory
+    if ($reusedPath) {
+        return $reusedPath
+    }
+
     Write-Step "Downloading Node.js v$($Script:RequiredNodeVersion) installer..."
     Write-Detail "Source: $($Script:NodeDownloadUrl)"
     Write-Detail "Target: $installerPath"
@@ -2359,6 +2369,15 @@ function Get-PostgresInstaller {
         Write-Step 'Using cached PostgreSQL installer...'
         Write-Detail "Cache: $installerPath"
         return $installerPath
+    }
+
+    # Sibling-cache reuse before downloading - see Get-NodeInstaller above.
+    # This is the file that makes the feature worth having: EDB's installer
+    # is the largest of the three, and its download URL is the least stable
+    # (see $Script:PostgresDownloadUrl).
+    $reusedPath = Copy-DeltaReusableInstaller -FileName $Script:InstallerConfig.POSTGRES_INSTALLER -DestinationDirectory $DestinationDirectory
+    if ($reusedPath) {
+        return $reusedPath
     }
 
     Write-Step "Downloading PostgreSQL $($Script:RequiredPostgresVersion) installer..."
@@ -3289,6 +3308,21 @@ function Get-PostGISInstaller {
         return $installerPath
     }
 
+    # Sibling-cache reuse before downloading - see Get-NodeInstaller above.
+    # Unlike Node/PostgreSQL, this component HAS an integrity check, so the
+    # reuse path runs that same check (Test-PostGISInstallerIntegrity, below)
+    # against the copied file before accepting it - in its -NonFatal form,
+    # because a bad neighbouring copy must fall back to a fresh download
+    # rather than abort the installation. The unchanged fatal check in
+    # Install-PostGIS still runs afterwards either way.
+    $reusedPath = Copy-DeltaReusableInstaller -FileName $Script:InstallerConfig.POSTGIS_INSTALLER -DestinationDirectory $DestinationDirectory -Validate {
+        param($CandidatePath)
+        Test-PostGISInstallerIntegrity -InstallerPath $CandidatePath -NonFatal
+    }
+    if ($reusedPath) {
+        return $reusedPath
+    }
+
     Write-Step "Downloading PostGIS $($Script:RequiredPostGISVersion) installer..."
     Write-Detail "Source: $($Script:PostGISDownloadUrl)"
     Write-Detail "Target: $installerPath"
@@ -3319,8 +3353,22 @@ function Test-PostGISInstallerIntegrity {
       available"). A checksum that WAS fetched but doesn't match is
       always fatal - never execute a binary that fails a check that was
       actually performed.
+
+      -NonFatal changes exactly one thing, for exactly one caller: instead of
+      stopping setup on a mismatch, the result is RETURNED as $true/$false.
+      Get-PostGISInstaller uses it to vet an installer copied out of a
+      neighbouring installer directory's cache (Copy-DeltaReusableInstaller,
+      lib\DeltaInstaller.Common.ps1), where a mismatch means "don't reuse
+      this file, download instead" rather than "abort". The checksum rule
+      itself is unchanged - same URL, same comparison, same "a missing
+      checksum file is skipped, not a failure" stance - and the fatal
+      default path is untouched, including emitting no output value at all,
+      so existing callers keep behaving identically.
     #>
-    param([Parameter(Mandatory)][string]$InstallerPath)
+    param(
+        [Parameter(Mandatory)][string]$InstallerPath,
+        [switch]$NonFatal
+    )
 
     Write-Step 'Verifying installer checksum...'
 
@@ -3329,6 +3377,7 @@ function Test-PostGISInstallerIntegrity {
     }
     catch {
         Write-Detail "Checksum file not available at $($Script:PostGISChecksumUrl) - skipping integrity verification."
+        if ($NonFatal) { return $true }
         return
     }
 
@@ -3345,10 +3394,15 @@ function Test-PostGISInstallerIntegrity {
     $actualHash = (Get-FileHash -Path $InstallerPath -Algorithm MD5).Hash.ToUpperInvariant()
 
     if ($expectedHash -ne $actualHash) {
+        if ($NonFatal) {
+            Write-Detail "Checksum mismatch for $InstallerPath. Expected $expectedHash but computed $actualHash."
+            return $false
+        }
         Stop-Setup "PostGIS installer checksum mismatch for $InstallerPath. Expected $expectedHash but computed $actualHash. Delete the cached file and re-run to force a fresh download."
     }
 
     Write-Success '    Checksum verified.'
+    if ($NonFatal) { return $true }
 }
 
 # ---------------------------------------------------------------------------

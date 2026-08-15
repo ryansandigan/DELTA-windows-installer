@@ -108,6 +108,8 @@ Two directories are populated automatically by `setup.ps1` at install time and a
 
 Both directories are excluded from GitHub release packages and from version control.
 
+If an installer binary is missing from `installers/`, setup first looks for the **exact same filename** in the `installers/` directory of any folder sitting beside this one (`C:\old-delta\installers\`, `C:\installer-backup\installers\`, whatever you happened to name it — the folder name does not matter) and copies it in rather than downloading it again. Only that one level is searched, only an exact filename match counts, and any copy that fails a component's checksum is discarded in favour of a fresh download. So keeping a previous unpacked release next to this one is enough to avoid re-downloading the ~350 MB PostgreSQL installer.
+
 ## Prerequisites
 
 - Administrator privileges on the target machine

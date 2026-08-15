@@ -543,28 +543,44 @@ function Get-DeltaWinSwBinary {
     while ($true) {
         $attempt++
 
-        if (-not (Test-Path -LiteralPath $cachedPath)) {
-            Write-Step "Downloading WinSW $($Script:InstallerConfig.WINSW_VERSION)..."
-            Write-Detail "Source: $sourceUrl"
-            Write-Detail "Target: $cachedPath"
-            try {
-                [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-                $previousProgress = $ProgressPreference
-                try {
-                    $ProgressPreference = 'SilentlyContinue'
-                    Invoke-WebRequest -Uri $sourceUrl -OutFile $cachedPath -UseBasicParsing -ErrorAction Stop
-                }
-                finally {
-                    $ProgressPreference = $previousProgress
-                }
-            }
-            catch {
-                Stop-Setup "Failed to download WinSW from $sourceUrl : $($_.Exception.Message)"
-            }
-        }
-        else {
+        if (Test-Path -LiteralPath $cachedPath) {
             Write-Step 'Using cached WinSW service wrapper...'
             Write-Detail "Cache: $cachedPath"
+        }
+        else {
+            # A neighbouring installer directory's own cache may already hold
+            # this exact binary (Copy-DeltaReusableInstaller,
+            # lib\DeltaInstaller.Common.ps1). The SHA-256 requirement above is
+            # not relaxed for that path in any way - the same expected digest
+            # is checked against the copied file before it is accepted, and
+            # again below with everything else. A neighbouring copy that fails
+            # it is discarded and the download runs instead, which is also what
+            # keeps the retry loop finite: a rejected candidate can never be
+            # re-copied into an endless verify/re-copy cycle.
+            $reusedPath = Copy-DeltaReusableInstaller -FileName $cacheFileName -DestinationDirectory $DestinationDirectory -Validate {
+                param($CandidatePath)
+                (Get-FileHash -Path $CandidatePath -Algorithm SHA256).Hash.ToUpperInvariant() -eq $expectedSha256.ToUpperInvariant()
+            }
+
+            if (-not $reusedPath) {
+                Write-Step "Downloading WinSW $($Script:InstallerConfig.WINSW_VERSION)..."
+                Write-Detail "Source: $sourceUrl"
+                Write-Detail "Target: $cachedPath"
+                try {
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                    $previousProgress = $ProgressPreference
+                    try {
+                        $ProgressPreference = 'SilentlyContinue'
+                        Invoke-WebRequest -Uri $sourceUrl -OutFile $cachedPath -UseBasicParsing -ErrorAction Stop
+                    }
+                    finally {
+                        $ProgressPreference = $previousProgress
+                    }
+                }
+                catch {
+                    Stop-Setup "Failed to download WinSW from $sourceUrl : $($_.Exception.Message)"
+                }
+            }
         }
 
         $actualSha256 = (Get-FileHash -Path $cachedPath -Algorithm SHA256).Hash.ToUpperInvariant()
