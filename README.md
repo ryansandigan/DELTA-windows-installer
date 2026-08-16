@@ -8,15 +8,18 @@ You have a fresh Windows Server or Windows 11 VM. Here's the whole process:
 2. **Unblock the ZIP** before extracting it (right-click → Properties → check **Unblock** → Apply).
 3. Extract the archive.
 4. Open **PowerShell as Administrator**.
-5. Run `setup.ps1`.
+5. Allow scripts to run in that PowerShell session, then run `setup.ps1` — both commands in the **same** window.
 6. Follow the installer prompts (application directory, database credentials, etc.).
 7. When offered, optionally configure a reverse proxy — **NGINX** or **IIS**.
 8. Browse to the DELTA URL shown in the installation summary.
 
 ```powershell
 cd DELTA-windows-installer
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\setup.ps1
 ```
+
+`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` is needed when Windows PowerShell would otherwise refuse to run `.ps1` files. It applies **only to the current PowerShell process** — nothing is changed for the machine or for your user account, and closing the window restores the normal execution-policy behaviour. It is safe to run it every time, including where the existing policy already permits `setup.ps1` to run. See [If PowerShell refuses to run the scripts](#if-powershell-refuses-to-run-the-scripts) for details.
 
 That's it. Everything else in this document is reference material — see [Before You Begin](#before-you-begin) if step 2 needs more explanation, or [Installation Workflow](#installation-workflow) for what `setup.ps1` actually does.
 
@@ -43,17 +46,34 @@ Unblock the ZIP **before** extracting it:
 3. Check **Unblock**.
 4. Click **Apply**.
 5. Extract the ZIP.
-6. Run `setup.ps1`.
+6. Run `setup.ps1` (see [If PowerShell refuses to run the scripts](#if-powershell-refuses-to-run-the-scripts)).
 
 > Windows adds a "Mark of the Web" (`Zone.Identifier`) to files downloaded from the Internet. If the ZIP is extracted before being unblocked, PowerShell may prevent unsigned scripts from running under the default `RemoteSigned` execution policy. Unblocking the ZIP before extraction removes this mark from the extracted files — without changing PowerShell's execution policy or disabling any Windows security feature.
 
 > **Note:** Unblocking only needs to be done once for each downloaded release ZIP. Files extracted from an already-unblocked ZIP do not need to be unblocked individually.
 
-If PowerShell still refuses to run the scripts after unblocking (for example, on a machine whose execution policy is more restrictive than `RemoteSigned`), run this once as Administrator:
+### If PowerShell refuses to run the scripts
+
+On some machines Windows PowerShell blocks `.ps1` files outright, and `setup.ps1` fails before the installer does anything:
+
+```
+setup.ps1 cannot be loaded because running scripts is disabled on this system.
+    + CategoryInfo          : SecurityError: (:) [], PSSecurityException
+    + FullyQualifiedErrorId : UnauthorizedAccess
+```
+
+In the **elevated PowerShell window you are about to install from**, run:
 
 ```powershell
-Set-ExecutionPolicy RemoteSigned
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\setup.ps1
 ```
+
+- `-Scope Process` applies the override to the **current PowerShell process only**. The machine-wide and user-level execution policies are left untouched.
+- The override lasts only as long as that window is open — `setup.ps1` must be started from the *same* session, and closing the window restores the normal effective execution-policy behaviour.
+- The same two commands can be used consistently on all supported Windows client and server environments, including those where the existing execution policy already allows `setup.ps1` to run.
+
+This is also the recommended sequence for the other scripts in this repository (`setup-nginx.ps1`, `setup-iis.ps1`, `doctor.ps1`, `init_db.ps1`, `upgrade_database.ps1`, `uninstall.ps1`) when the same error appears.
 
 ## Features
 

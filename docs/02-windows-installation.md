@@ -130,6 +130,15 @@ When run via `setup.ps1`, `init_website.bat` and `init_db.bat` are invoked autom
 .\init_db.bat
 ```
 
+> **Execution policy.** If Windows PowerShell refuses to run any of this repository's `.ps1` scripts (`setup.ps1 cannot be loaded because running scripts is disabled on this system`), lift the restriction for the current session only, then run the script from that same session:
+>
+> ```powershell
+> Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+> .\setup.ps1
+> ```
+>
+> `-Scope Process` leaves the machine-wide and user-level policies unchanged, and closing the window restores the normal effective execution-policy behaviour. See [README — If PowerShell refuses to run the scripts](../README.md#if-powershell-refuses-to-run-the-scripts).
+
 `init_website.bat` installs Yarn globally and runs `yarn install --production`. **Known gaps in this script** — missing `--force` on the Yarn install, and PATH handling that targets npm's global folder rather than Yarn Classic's own global bin (where `dotenv-cli`, needed by `start.bat`, actually lands) — are documented in [06 — Installation tooling gaps](06-deployment-risks.md#installation-tooling-gaps) and not yet fixed at the source (see [08 §Phase 3](08-development-roadmap.md#phase-3--yarn--dependencies)). Verify manually after running it standalone that a **new** shell can resolve the `dotenv` command:
 
 ```powershell
