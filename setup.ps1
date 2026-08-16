@@ -4421,34 +4421,48 @@ function Get-YarnGlobalBinDirectory {
     return ($output | Select-Object -First 1).ToString().Trim()
 }
 
-function Invoke-DeltaWebsiteInit {
+function Invoke-DeltaWebsiteInitProcess {
     <#
-      Runs dts_shared_binary's init_website.bat - unmodified, exactly as
-      shipped, with its existing error handling intact (see docs/06 -
-      Installation tooling gaps for its known, pre-existing quoting/PATH
-      issues, none of which this function works around). Three
-      accommodations are made purely so it can run as one step of an
-      otherwise unattended installer, none of which touches its
+      Runs dts_shared_binary's init_website.bat once - unmodified,
+      exactly as shipped, with its existing error handling intact (see
+      docs/06 - Installation tooling gaps for its known, pre-existing
+      quoting/PATH issues, none of which this function works around).
+      Returns the exit code alongside everything the script printed
+      (stdout and stderr both), which is what makes
+      Invoke-DeltaWebsiteInit's certificate-trust recovery possible
+      without any second-guessing of what the script itself did.
+
+      Four accommodations are made purely so it can run as one step of
+      an otherwise unattended installer, none of which touches its
       actual install logic or exit code:
 
-        - -WorkingDirectory $Script:DeltaRuntimeRoot: `yarn install` and
+        - WorkingDirectory $Script:DeltaRuntimeRoot: `yarn install` and
           `yarn global add` both act on the current working directory,
           and init_website.bat itself never `cd`s anywhere (it was
           always meant to be run from inside the unpacked artifact) - so
           this MUST run with C:\DELTA as the working directory, or
           node_modules would silently land in the wrong place entirely.
-        - -RedirectStandardInput from an empty file: init_website.bat
-          ends in a bare `pause`, which would otherwise block waiting
-          for a keypress that never comes. Start-Process's
-          -RedirectStandardInput requires an actual file path (the
-          literal device name 'NUL' is not accepted - confirmed
-          directly: it fails with FileNotFoundException rather than
-          being treated as the NUL device the way cmd.exe's own `<`
-          redirection would), so an empty, zero-byte file is created for
-          this purpose instead. Reading it gives `pause` an immediate
-          EOF, which is enough for it to fall through without an
-          operator present - it does not change what the script
-          actually installs or how it reports failure.
+        - Redirected standard input, closed immediately:
+          init_website.bat ends in a bare `pause`, which would otherwise
+          block waiting for a keypress that never comes. Closing the
+          redirected stdin pipe straight after start gives `pause` the
+          immediate EOF it needs to fall through without an operator
+          present - the same effect the previous empty-file redirection
+          had (Start-Process's -RedirectStandardInput requires an actual
+          file path; driving System.Diagnostics.Process directly does
+          not, so no placeholder file is needed any more), and equally
+          without changing what the script installs or how it reports
+          failure.
+        - Merged, captured output: the child is started as
+          `cmd /c ""<path>" 2>&1"` with stdout redirected and read line
+          by line, each line echoed to the console as it arrives. The
+          operator still sees npm/yarn progress live exactly as before -
+          this is a tee, not a silencer - while the same lines are
+          retained for the caller to inspect. cmd itself merges stderr
+          into stdout so there is only ONE pipe to drain, which is what
+          keeps this deadlock-free: reading two redirected streams
+          sequentially from a single thread can block forever once the
+          unread one fills its buffer.
         - $env:YARN_NETWORK_TIMEOUT set to 300000 for the duration of
           this one call: Yarn Classic's default TCP timeout is 30
           seconds (NETWORK_TIMEOUT in its own bundle), which a tester on
@@ -4474,32 +4488,50 @@ function Invoke-DeltaWebsiteInit {
           so the variable does not leak into anything else this run
           starts, including the DELTA runtime itself.
     #>
-    Write-Step 'Installing Yarn and application dependencies (init_website.bat)...'
+    param([Parameter(Mandatory)][string]$InitWebsitePath)
 
-    $initWebsitePath = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath 'init_website.bat'
-    if (-not (Test-Path -LiteralPath $initWebsitePath)) {
-        Stop-Setup "init_website.bat not found at $initWebsitePath."
-    }
-
-    $emptyStdinPath = Join-Path -Path $Script:WorkingDirectory -ChildPath 'empty.stdin'
-    if (-not (Test-Path -LiteralPath $emptyStdinPath)) {
-        New-Item -Path $emptyStdinPath -ItemType File -Force | Out-Null
-    }
+    $capturedLines = New-Object System.Collections.Generic.List[string]
+    $exitCode = $null
 
     # Scoped to this one call only - see this function's header for why
     # Yarn's 30-second default is the actual failure being addressed, and
     # why an environment variable (which both `yarn install` and `yarn
     # global add` pick up) is used rather than patching the .bat file.
-    # Start-Process has no -Environment parameter on Windows PowerShell
-    # 5.1 (it arrived in 7.4), but the child cmd.exe inherits this
-    # process's environment block either way, so setting it here reaches
-    # yarn identically on 5.1 and 7.x.
+    # The child cmd.exe inherits this process's environment block, so
+    # setting it here reaches yarn identically on 5.1 and 7.x.
     $previousYarnNetworkTimeout = $env:YARN_NETWORK_TIMEOUT
     $env:YARN_NETWORK_TIMEOUT = '300000'
 
     try {
-        $process = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$initWebsitePath`"" `
-            -WorkingDirectory $Script:DeltaRuntimeRoot -RedirectStandardInput $emptyStdinPath -Wait -PassThru -NoNewWindow
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName               = 'cmd.exe'
+        $startInfo.Arguments              = "/c `"`"$InitWebsitePath`" 2>&1`""
+        $startInfo.WorkingDirectory       = $Script:DeltaRuntimeRoot
+        $startInfo.UseShellExecute        = $false
+        $startInfo.CreateNoWindow         = $true
+        $startInfo.RedirectStandardInput  = $true
+        $startInfo.RedirectStandardOutput = $true
+        # Whatever this console itself uses - so captured text matches
+        # what an operator watching the same run would have seen.
+        $startInfo.StandardOutputEncoding = [Console]::OutputEncoding
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        [void]$process.Start()
+
+        # Immediate EOF for the trailing `pause` - see the header.
+        $process.StandardInput.Close()
+
+        while ($null -ne ($line = $process.StandardOutput.ReadLine())) {
+            Write-Host $line
+            [void]$capturedLines.Add($line)
+        }
+
+        # The parameterless overload guarantees the exit code is readable
+        # on return (the same .NET synchronization note
+        # Start-ProcessWithActivityIndicator documents).
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
     }
     finally {
         # Restoring "unset" has to be a Remove-Item, not an assignment:
@@ -4514,8 +4546,375 @@ function Invoke-DeltaWebsiteInit {
         }
     }
 
-    if ($process.ExitCode -ne 0) {
-        Stop-Setup "init_website.bat failed with exit code $($process.ExitCode). See its output above for details."
+    return [PSCustomObject]@{
+        ExitCode = $exitCode
+        Output   = ($capturedLines -join [Environment]::NewLine)
+    }
+}
+
+# Certificate-validation failures ONLY - the single failure class the
+# strict-SSL workaround below can actually rescue. Every entry is a
+# message npm or Yarn emits when OpenSSL refused to validate the registry
+# certificate chain, which is what a TLS-inspecting corporate proxy
+# (whose issuing CA the Node runtime does not trust) produces:
+#
+#   - the two OpenSSL forms of "the issuing CA is not in the trust store"
+#     (npm prints the human-readable text, Node the error code);
+#   - the self-signed-chain forms of the same underlying situation, whose
+#     only fix is likewise trusting the CA or bypassing verification.
+#
+# Deliberately NOT here, and deliberately never matched loosely enough to
+# catch them by accident: ESOCKETTIMEDOUT, connection timeouts, DNS
+# failures, registry 4xx/5xx responses, or any generic "failed to install
+# dependencies" line. Disabling certificate verification cannot fix any of
+# those, so offering it for them would trade real security for nothing.
+$Script:DeltaCertificateTrustFailurePatterns = @(
+    'unable to get local issuer certificate'
+    'UNABLE_TO_GET_ISSUER_CERT_LOCALLY'
+    'self signed certificate in certificate chain'
+    'self-signed certificate in certificate chain'
+    'SELF_SIGNED_CERT_IN_CHAIN'
+)
+
+function Test-DeltaCertificateTrustFailure {
+    <#
+      True only when init_website.bat's captured output contains one of
+      the certificate-validation failures listed above. Plain
+      case-insensitive substring matching (not regex) so no pattern can
+      accidentally widen itself, and so the OpenSSL error codes match
+      whatever casing the emitting tool used.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$OutputText)
+
+    if ([string]::IsNullOrWhiteSpace($OutputText)) {
+        return $false
+    }
+
+    foreach ($pattern in $Script:DeltaCertificateTrustFailurePatterns) {
+        if ($OutputText.IndexOf($pattern, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Test-NpmAvailable {
+    <#
+      Get-Command 'npm' rather than 'npm.cmd' (the shape
+      Test-YarnAvailable uses): npm ships as npm.cmd on Windows and
+      PATHEXT resolves the bare name to it, and the bare name is also
+      what init_website.bat itself calls.
+    #>
+    return [bool](Get-Command -Name 'npm' -ErrorAction SilentlyContinue)
+}
+
+function Get-NpmStrictSslState {
+    <#
+      Reads npm's CURRENT strict-ssl situation before anything is changed,
+      which is what makes the change reversible:
+
+        EffectiveValue         - what `npm config get strict-ssl` reports
+                                 ('true' unless someone changed it, since
+                                 that is npm's built-in default), or $null
+                                 if npm could not be asked.
+        IsExplicitlyConfigured - whether strict-ssl appears in
+                                 `npm config list`. That command prints
+                                 only the values actually written to a
+                                 config file, never npm's own defaults
+                                 (those need `npm config list -l`), so it
+                                 is exactly the "did an administrator set
+                                 this themselves?" answer needed to decide
+                                 between restoring a value and deleting
+                                 the key again afterwards.
+
+      Never throws: npm being absent or unhappy is reported as "unknown",
+      and Resolve-NpmStrictSslWorkaroundPlan decides what that means.
+    #>
+    $state = [PSCustomObject]@{
+        Available              = $false
+        EffectiveValue         = $null
+        IsExplicitlyConfigured = $false
+    }
+
+    if (-not (Test-NpmAvailable)) {
+        return $state
+    }
+    $state.Available = $true
+
+    try {
+        $value = & npm config get strict-ssl 2>$null
+        if ($value) {
+            $state.EffectiveValue = ($value | Select-Object -First 1).ToString().Trim()
+        }
+    }
+    catch {
+        $state.EffectiveValue = $null
+    }
+
+    try {
+        $configList = & npm config list 2>$null
+        if ($configList) {
+            $state.IsExplicitlyConfigured = [bool](($configList -join "`n") -match '(?im)^\s*strict-ssl\s*=')
+        }
+    }
+    catch {
+        $state.IsExplicitlyConfigured = $false
+    }
+
+    return $state
+}
+
+function Resolve-NpmStrictSslWorkaroundPlan {
+    <#
+      The whole configuration-safety decision, kept as one pure function
+      so it is testable without npm and cannot drift from the restore
+      logic that consumes it:
+
+        - npm unavailable            -> change nothing (init_website.bat
+                                        could not have got as far as a
+                                        registry certificate anyway).
+        - strict-ssl already 'false' -> change nothing, and above all
+                                        restore nothing afterwards.
+                                        Re-enabling verification an
+                                        administrator had deliberately
+                                        turned off would be this
+                                        installer silently reversing
+                                        their decision.
+        - explicitly configured      -> set it to false for the retry,
+          (e.g. 'true' in .npmrc)       then write that exact value back.
+        - not configured at all      -> set it to false for the retry,
+                                        then DELETE the key rather than
+                                        writing 'true'. Deleting restores
+                                        the original state - npm's default
+                                        - whereas writing 'true' would
+                                        leave behind an .npmrc entry that
+                                        was never there before.
+    #>
+    param(
+        [Parameter(Mandatory)][bool]$NpmAvailable,
+        [AllowNull()][AllowEmptyString()][string]$EffectiveValue,
+        [bool]$IsExplicitlyConfigured
+    )
+
+    $plan = [PSCustomObject]@{
+        NeedsChange      = $false
+        AlreadyDisabled  = $false
+        RestoreAction    = 'None'
+        RestoreValue     = $null
+    }
+
+    if (-not $NpmAvailable) {
+        return $plan
+    }
+
+    if ($EffectiveValue -and $EffectiveValue.Trim().ToLowerInvariant() -eq 'false') {
+        $plan.AlreadyDisabled = $true
+        return $plan
+    }
+
+    $plan.NeedsChange = $true
+    if ($IsExplicitlyConfigured -and $EffectiveValue) {
+        $plan.RestoreAction = 'Set'
+        $plan.RestoreValue  = $EffectiveValue.Trim()
+    }
+    else {
+        $plan.RestoreAction = 'Delete'
+    }
+
+    return $plan
+}
+
+function Set-NpmStrictSslDisabled {
+    <#
+      The single configuration change the workaround makes:
+      `npm config set strict-ssl false`, confirmed by reading the value
+      back rather than by trusting an exit code (npm reports plenty of
+      things without failing outright). Returns $false - never throws -
+      if the setting did not actually take, so the caller can say so and
+      still run the retry, which then simply fails the same way it would
+      have anyway.
+    #>
+    try {
+        & npm config set strict-ssl false 2>&1 | Out-Null
+    }
+    catch {
+        Write-Detail "Could not change npm's strict-ssl setting: $($_.Exception.Message)"
+        return $false
+    }
+
+    $applied = Get-NpmStrictSslState
+    if ($applied.EffectiveValue -and $applied.EffectiveValue.Trim().ToLowerInvariant() -eq 'false') {
+        return $true
+    }
+
+    Write-Detail 'npm did not accept the strict-ssl change - retrying with the existing configuration instead.'
+    return $false
+}
+
+function Restore-NpmStrictSslState {
+    <#
+      Puts strict-ssl back exactly as Resolve-NpmStrictSslWorkaroundPlan
+      recorded it. Always called from a finally block, so it runs whether
+      the retry succeeded or failed. Failures here are reported and never
+      thrown: the retry's own outcome is what the operator needs to act
+      on, and hiding it behind a configuration-restore error would help
+      nobody.
+    #>
+    param([Parameter(Mandatory)]$Plan)
+
+    try {
+        switch ($Plan.RestoreAction) {
+            'Set' {
+                & npm config set strict-ssl $Plan.RestoreValue 2>&1 | Out-Null
+                Write-Detail "Restored npm strict-ssl to its previous value ($($Plan.RestoreValue))."
+            }
+            'Delete' {
+                & npm config delete strict-ssl 2>&1 | Out-Null
+                Write-Detail 'Restored npm strict SSL certificate verification (setting removed again).'
+            }
+            default { }
+        }
+    }
+    catch {
+        Write-Detail "Could not restore npm's previous strict-ssl setting: $($_.Exception.Message)"
+        Write-Detail 'Check `npm config get strict-ssl` and restore it manually if required.'
+    }
+}
+
+function Read-DeltaCertificateTrustWorkaroundConfirmation {
+    <#
+      The one prompt this recovery flow adds, built on the shared
+      Read-DeltaYesNoConfirmation frame (rule / body / '[y/N]' / rule) and
+      Show-Warning's warning screen, exactly like every other consequential
+      confirmation in this installer. Bare Enter - and anything other than
+      Y/y - means No, so an operator who is not paying attention gets the
+      secure outcome: no configuration change, and the original failure
+      reported as-is.
+    #>
+    return Read-DeltaYesNoConfirmation -Body {
+        Show-Warning -Message @(
+            'A certificate trust error was detected while downloading DELTA dependencies.'
+            "The current network environment may prevent npm/Yarn from validating`nthe package registry certificate."
+            "DELTA can retry the dependency installation with strict SSL certificate`nverification disabled."
+            "Disabling certificate verification reduces the security of package`ndownloads and should only be used if you trust the current network."
+        )
+        Write-Host 'Disable strict SSL verification and retry?'
+    }
+}
+
+function Invoke-DeltaWebsiteInitWithStrictSslDisabled {
+    <#
+      The accepted workaround: disable strict SSL certificate
+      verification for BOTH package managers init_website.bat drives, run
+      the very same script again (never a hand-reproduced copy of the
+      commands inside it), and put the configuration back afterwards.
+
+      Two different mechanisms, each the minimum for its tool:
+
+        - npm (`npm install --global yarn`) reads strict-ssl from its
+          config files, so the config is changed - and, per
+          Resolve-NpmStrictSslWorkaroundPlan, only when it is not already
+          disabled, and always restored to its exact prior state in the
+          finally block below, retry failure included.
+        - Yarn Classic (`yarn install --production`,
+          `yarn global add dotenv-cli`) merges any YARN_* environment
+          variable into its own config - the same documented mechanism
+          Invoke-DeltaWebsiteInitProcess already relies on for
+          YARN_NETWORK_TIMEOUT - so YARN_STRICT_SSL=false covers Yarn for
+          the duration of this one child process without writing to
+          ~/.yarnrc at all. Verified directly against Yarn 1.22.22:
+          `yarn config get strict-ssl` reports `true` normally, `false`
+          with this variable set, and `true` again once it is removed.
+          Nothing to restore beyond the variable itself, which is exactly
+          why it is preferred here over `yarn config set` (which would
+          write a persistent ~/.yarnrc entry that was never there
+          before).
+
+      Returns the retry's own result object unchanged; the caller decides
+      what a non-zero exit code means.
+    #>
+    param([Parameter(Mandatory)][string]$InitWebsitePath)
+
+    $state = Get-NpmStrictSslState
+    $plan  = Resolve-NpmStrictSslWorkaroundPlan -NpmAvailable $state.Available `
+        -EffectiveValue $state.EffectiveValue -IsExplicitlyConfigured $state.IsExplicitlyConfigured
+
+    if ($plan.AlreadyDisabled) {
+        Write-Detail 'npm strict SSL verification is already disabled - leaving the existing configuration unchanged.'
+    }
+    elseif ($plan.NeedsChange) {
+        Write-Step 'Disabling strict SSL certificate verification for the retry...'
+        [void](Set-NpmStrictSslDisabled)
+    }
+
+    $previousYarnStrictSsl = $env:YARN_STRICT_SSL
+    $env:YARN_STRICT_SSL = 'false'
+
+    try {
+        Write-Step 'Retrying dependency installation (init_website.bat)...'
+        return Invoke-DeltaWebsiteInitProcess -InitWebsitePath $InitWebsitePath
+    }
+    finally {
+        if ($null -eq $previousYarnStrictSsl) {
+            Remove-Item -LiteralPath 'Env:\YARN_STRICT_SSL' -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:YARN_STRICT_SSL = $previousYarnStrictSsl
+        }
+
+        if ($plan.NeedsChange) {
+            Restore-NpmStrictSslState -Plan $plan
+        }
+    }
+}
+
+function Invoke-DeltaWebsiteInit {
+    <#
+      Phase 3's dependency installation: run init_website.bat, and - only
+      for the one failure class a configuration change can actually
+      rescue - offer the administrator a single retry with strict SSL
+      certificate verification disabled.
+
+      The successful path is completely unchanged: one run, no prompt, no
+      configuration read or written. So is every failure that is not a
+      certificate-validation failure (ESOCKETTIMEDOUT, DNS, a plain
+      dependency resolution error, ...) - those still stop the installer
+      immediately with the same message as before.
+
+      Strictly one automatic retry, and the retry's own output is never
+      re-inspected for certificate errors: whatever it reports is final.
+      That is what makes an infinite recovery loop structurally
+      impossible rather than merely unlikely.
+    #>
+    Write-Step 'Installing Yarn and application dependencies (init_website.bat)...'
+
+    $initWebsitePath = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath 'init_website.bat'
+    if (-not (Test-Path -LiteralPath $initWebsitePath)) {
+        Stop-Setup "init_website.bat not found at $initWebsitePath."
+    }
+
+    $result = Invoke-DeltaWebsiteInitProcess -InitWebsitePath $initWebsitePath
+
+    if ($result.ExitCode -ne 0) {
+        # The original failure, preserved verbatim: it is what gets
+        # reported unless the administrator explicitly asks for the
+        # workaround AND the retry then fails on its own terms.
+        $originalFailureMessage = "init_website.bat failed with exit code $($result.ExitCode). See its output above for details."
+
+        if (-not (Test-DeltaCertificateTrustFailure -OutputText $result.Output)) {
+            Stop-Setup $originalFailureMessage
+        }
+
+        if (-not (Read-DeltaCertificateTrustWorkaroundConfirmation)) {
+            Write-Detail 'Strict SSL certificate verification left enabled - no npm or Yarn configuration was changed.'
+            Stop-Setup $originalFailureMessage
+        }
+
+        $result = Invoke-DeltaWebsiteInitWithStrictSslDisabled -InitWebsitePath $initWebsitePath
+        if ($result.ExitCode -ne 0) {
+            Stop-Setup "init_website.bat failed with exit code $($result.ExitCode) after retrying with strict SSL certificate verification disabled. See its output above for details."
+        }
     }
 
     Write-Success '    Runtime dependencies installed.'

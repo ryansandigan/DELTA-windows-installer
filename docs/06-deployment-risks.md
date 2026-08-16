@@ -22,6 +22,7 @@
 | 13 | [EDB installer exit codes are undocumented beyond `0`](#edb-installer-exit-codes-are-undocumented) | Low | Windows | Treat any non-zero exit code as failure; validate actual post-install state (service, binaries, version) rather than trusting exit-code semantics. |
 | 14 | [PostgreSQL superuser password is exposed via process command line](#postgresql-superuser-password-process-exposure) | Medium | Windows | Documented, accepted limitation of the installer's design; revisit if EDB's `--optionfile` mechanism is verified as a safer alternative. |
 | 15 | [Yarn Classic's 30-second default network timeout](#yarn-network-timeout) | Medium | Both | ✅ Mitigated at the installer level (Windows): `setup.ps1`'s `Invoke-DeltaWebsiteInit` (Phase 3) sets `YARN_NETWORK_TIMEOUT=300000` for the duration of the `init_website.bat` call only. `init_website.bat`/`.sh` are unmodified; a standalone or Linux run still has the underlying gap — see below. |
+| 16 | [Package registry certificate cannot be validated](#package-registry-certificate-validation) | Medium | Both | ✅ Handled at the installer level (Windows): `setup.ps1`'s `Invoke-DeltaWebsiteInit` (Phase 3) detects this specific failure in `init_website.bat`'s output and offers the administrator **one** retry with strict SSL verification disabled, defaulting to No and restoring the previous configuration afterwards. Never applied automatically — see below. |
 
 ---
 
@@ -54,7 +55,7 @@ None of these block a human operator running the scripts interactively and corre
 error Error: https://registry.yarnpkg.com/drizzle-orm/-/drizzle-orm-0.45.2.tgz: ESOCKETTIMEDOUT
 ```
 
-This is not an installer timeout — `Invoke-DeltaWebsiteInit` runs `init_website.bat` under `Start-Process -Wait`, with no time limit of its own. It is Yarn's own TCP socket timeout, which **defaults to 30 seconds** (`NETWORK_TIMEOUT = 30 * 1000` in Yarn's bundle). Yarn does classify `ESOCKETTIMEDOUT` as a retryable "possible offline" error, but each retry re-uses the same 30-second ceiling, so retrying does not rescue a consistently slow or throttled link — only raising the ceiling does.
+This is not an installer timeout — `Invoke-DeltaWebsiteInit` runs `init_website.bat` to completion, with no time limit of its own. It is Yarn's own TCP socket timeout, which **defaults to 30 seconds** (`NETWORK_TIMEOUT = 30 * 1000` in Yarn's bundle). Yarn does classify `ESOCKETTIMEDOUT` as a retryable "possible offline" error, but each retry re-uses the same 30-second ceiling, so retrying does not rescue a consistently slow or throttled link — only raising the ceiling does.
 
 Both registry-fetching commands in `init_website.bat` are exposed to this, not just one:
 
@@ -71,6 +72,29 @@ Row 43 matters as much as row 34: `dotenv-cli` is what `start.bat` depends on (`
 Because Yarn builds this configuration the same way for every subcommand, one environment variable covers both `yarn install --production` and `yarn global add dotenv-cli` — which a per-command edit to the `.bat` file would not, and which is the main reason this was chosen over rewriting the script or running a patched temporary copy of it. An explicit `--network-timeout` flag would still take precedence if `init_website.bat` ever grows one, which is the correct ordering. The value is a ceiling on an *idle socket*, not on total install duration, so a healthy network never reaches it; the only cost is that a genuinely dead connection takes 5 minutes to surface instead of 30 seconds.
 
 **Residual risk:** `init_website.sh` on Linux, and either script run standalone outside `setup.ps1`, still use Yarn's 30-second default. Committing `yarn.lock` (Risk 1) reduces exposure by removing the resolution round-trips, but does not remove the tarball fetches themselves.
+
+## Package registry certificate validation
+
+**Inferred**, and specific to the network a given server sits on rather than to anything in the artifact. On a network that intercepts TLS (a corporate proxy or filtering appliance re-signing traffic with its own CA), npm and Yarn cannot validate `registry.npmjs.org` / `registry.yarnpkg.com` against Node's bundled trust store, and `init_website.bat` fails during dependency download with one of:
+
+```
+error An unexpected error occurred: "https://registry.yarnpkg.com/…: unable to get local issuer certificate".
+npm error code UNABLE_TO_GET_ISSUER_CERT_LOCALLY
+```
+
+The correct fix is to trust the intercepting CA on the server (`NODE_EXTRA_CA_CERTS`, or importing it into the machine store where the tooling reads it). That is an environment decision, not something an installer can make on the operator's behalf — but the failure otherwise leaves an administrator with an installation that cannot proceed and an error whose cause is not obvious.
+
+**Handled at the `setup.ps1` level, and only ever with explicit consent.** `Invoke-DeltaWebsiteInit` (Phase 3) captures `init_website.bat`'s output while streaming it to the console, and on failure inspects it for certificate-validation errors specifically (`unable to get local issuer certificate`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, and the self-signed-chain forms of the same). Only then does it explain the trade-off and ask whether to retry with strict SSL verification disabled. The rules that keep this narrow:
+
+| Rule | Behaviour |
+|---|---|
+| Recognition is exact | Nothing else triggers it — `ESOCKETTIMEDOUT`, connection timeouts, DNS failures, and generic dependency failures all fail exactly as before. Disabling verification cannot fix any of them. |
+| The default is No | Bare Enter declines. Declining changes no configuration and reports the original failure unchanged. |
+| One retry, never a loop | Accepting re-runs `init_website.bat` itself (never a hand-reproduced copy of its commands) exactly once. If the retry fails — even with the same certificate error — the installer stops and reports that failure. |
+| Minimum configuration | `npm config set strict-ssl false` for npm, and `YARN_STRICT_SSL=false` in the environment for Yarn Classic — the same `YARN_*` merge mechanism used for `YARN_NETWORK_TIMEOUT` above, so nothing is written to `~/.yarnrc`. Verified against 1.22.22: `yarn config get strict-ssl` reports `false` only while the variable is set. |
+| Pre-existing configuration is preserved | The prior state is read first (`npm config get strict-ssl`, plus `npm config list` to tell an explicitly configured value from npm's default). An explicit value is written back afterwards; a value that was never configured is deleted again rather than being invented as `true`; and an administrator who had already disabled `strict-ssl` before DELTA setup has it neither changed nor re-enabled. Restoration runs whether the retry succeeded or failed. |
+
+**Residual risk:** a successful install through this path downloaded its packages without certificate verification, which is a real reduction in supply-chain assurance — it is offered as a deliberate, informed choice for a trusted network, not as a fix. Trusting the intercepting CA remains the correct resolution, and Linux (`init_website.sh`) has no equivalent handling. Regression coverage: `tools\test-delta-certificate-trust-recovery.ps1`.
 
 ## UTF-8 and locale at database creation
 
