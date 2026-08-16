@@ -809,6 +809,17 @@ function Get-NginxPackage {
         New-Item -Path $Script:InstallersDirectory -ItemType Directory -Force | Out-Null
     }
 
+    # A neighbouring installer directory's own cache may already hold this
+    # exact package (Copy-DeltaReusableInstaller, lib\DeltaInstaller.Common.ps1).
+    # The exact-filename rule described above is what that helper matches on
+    # too, so reuse cannot introduce the differently-versioned package this
+    # function has always refused. $null means nothing was reusable and the
+    # download below runs unchanged.
+    $reusedPath = Copy-DeltaReusableInstaller -FileName $Script:InstallerConfig.NGINX_INSTALLER -DestinationDirectory $Script:InstallersDirectory
+    if ($reusedPath) {
+        return $reusedPath
+    }
+
     Write-Step "Downloading NGINX $($Script:NginxVersion) (official Windows ZIP distribution)..."
     Write-Detail "Source: $($Script:NginxDownloadUrl)"
     Write-Detail "Target: $packagePath"

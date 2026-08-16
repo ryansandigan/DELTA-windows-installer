@@ -745,6 +745,15 @@ function Get-DeltaArrComponentPackage {
         New-Item -Path $Script:InstallersDirectory -ItemType Directory -Force | Out-Null
     }
 
+    # Same sibling-cache reuse Get-NginxPackage now performs before its own
+    # download (Copy-DeltaReusableInstaller, lib\DeltaInstaller.Common.ps1) -
+    # exact filename only, and $null simply means the download below runs
+    # unchanged.
+    $reusedPath = Copy-DeltaReusableInstaller -FileName $Definition.PackageFileName -DestinationDirectory $Script:InstallersDirectory
+    if ($reusedPath) {
+        return $reusedPath
+    }
+
     Write-Step "Downloading $($Definition.Name)..."
     Write-Detail "Source: $($Definition.DownloadUrl)"
     Write-Detail "Target: $packagePath"

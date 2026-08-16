@@ -423,6 +423,231 @@ function Show-ComponentStatus {
     }
 }
 
+function Get-DeltaServiceStatusLine {
+    <#
+      How the DeltaApp registration is described to an administrator, in one
+      place, because two screens now show it: the management menu and the
+      repair screen that can precede it. Two independently-worded versions of
+      the same fact is exactly how a service reported as "not installed" on
+      one screen ends up described as something subtly different on the next.
+
+      Produces "DeltaApp (Running, Automatic)" or "DeltaApp (Stopped,
+      Automatic)" - the SCM's own status and start mode, nothing added.
+      ServiceStartTypeDescription rather than ServiceStartType only so a
+      service with no readable start type reads as "Unknown" instead of
+      leaving an empty pair of parentheses on screen.
+    #>
+    param([Parameter(Mandatory)][PSCustomObject]$RuntimeState)
+
+    if (-not $RuntimeState.ServiceInstalled) {
+        return 'not installed'
+    }
+
+    return "$($Script:DeltaServiceName) ($($RuntimeState.ServiceStatus), $($RuntimeState.ServiceStartTypeDescription))"
+}
+
+function Resolve-DeltaServiceRepairPlan {
+    <#
+      The complete assessment behind Show-MainMenu's automatic
+      migration/repair behaviour, in the order that keeps the menu instant.
+
+      Two stages, and the split is the point. Stage one
+      (Get-DeltaServiceRepairCondition) is pure and answers "is there
+      anything wrong with the registration at all?" from values
+      Get-DeltaRuntimeState has already read - no process is spawned, no
+      file is opened, and for a healthy installation (the overwhelmingly
+      common case) that is the entire cost. Only when it reports an actual
+      condition does stage two run the prerequisite survey
+      (Get-DeltaServicePrerequisiteReport), which resolves node.exe and asks
+      Node to resolve the serve CLI - worth ~a process spawn, which is fine
+      once but not on every redraw of a menu the operator is navigating.
+
+      Returns Get-DeltaServiceRepairPlan's own plan object unchanged; this
+      function only decides what to feed it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$AppRoot,
+        [Parameter(Mandatory)][PSCustomObject]$RuntimeState,
+        [AllowNull()][AllowEmptyString()][string]$RawPort
+    )
+
+    $condition = Get-DeltaServiceRepairCondition `
+        -ServiceInstalled $RuntimeState.ServiceInstalled `
+        -ServiceStartType $RuntimeState.ServiceStartType `
+        -DelayedAutoStart $RuntimeState.DelayedAutoStart `
+        -ExecutablePresent $RuntimeState.ServiceExecutablePresent `
+        -DefinitionPresent $RuntimeState.ServiceDefinitionPresent `
+        -DefinitionValid $RuntimeState.ServiceDefinitionValid `
+        -BinaryPathMatches $RuntimeState.ServiceBinaryPathMatches `
+        -ServiceAccount $RuntimeState.ServiceAccount
+
+    if ($condition -eq 'None') {
+        return Get-DeltaServiceRepairPlan -Condition 'None'
+    }
+
+    # A startup-mode correction needs nothing from the deployment, so the
+    # survey is skipped for it too - see Get-DeltaServiceRepairPlan, which
+    # decides Configure before it ever looks at prerequisites.
+    $prerequisitesSatisfied = $true
+    $missingPrerequisites   = @()
+    if ($condition -ne 'StartTypeDrift') {
+        $report = Get-DeltaServicePrerequisiteReport -AppRoot $AppRoot -RawPort $RawPort
+        $prerequisitesSatisfied = $report.Satisfied
+        $missingPrerequisites   = $report.Missing
+    }
+
+    # "Running" here means DELTA is actually serving right now, by the same
+    # process-ownership evidence the menu itself displays - it decides only
+    # whether the operator is asked before the repair interrupts it.
+    $runtimeRunning = ($RuntimeState.State -in @('Running', 'Starting')) -or ($RuntimeState.ProcessCount -gt 0)
+
+    return Get-DeltaServiceRepairPlan `
+        -Condition $condition `
+        -PrerequisitesSatisfied $prerequisitesSatisfied `
+        -MissingPrerequisites $missingPrerequisites `
+        -UnrelatedPortOwner $RuntimeState.UnrelatedPortOwner `
+        -RuntimeRunning $runtimeRunning `
+        -DisabledByUninstall $RuntimeState.ServiceDisabledByUninstall
+}
+
+function Invoke-DeltaServiceLifecycleRepair {
+    <#
+      Carries out a repair plan. The doing half of the lifecycle repair;
+      Get-DeltaServiceRepairPlan (lib\DeltaInstaller.Service.ps1) owns every
+      decision, and this function owns none - it presents the plan, takes
+      the operator's answer where one is required, and then composes
+      EXISTING phases.
+
+      The composition is the whole implementation, and its shape is
+      deliberate:
+
+          Install-DeltaWindowsService   (WinSW acquire/verify -> binary ->
+                                         definition -> register -> ACLs,
+                                         each already idempotent)
+          Confirm-DeltaRuntimeNotRunning (SCM stop, then the narrow legacy/
+                                          orphan cleanup, then the refusal
+                                          if an unrelated process holds the
+                                          port)
+          Start-DeltaRuntimeForValidation (starts THROUGH the SCM, because
+                                           by now the service exists)
+          Confirm-DeltaRuntimeStarted    (process -> port -> real HTTP
+                                          round trip)
+
+      That is exactly the tail of setup.ps1's own orchestration block, with
+      every phase that deploys, installs, migrates or rewrites something
+      left out - which is precisely the claim this feature makes: a missing
+      service is repaired without redeploying the runtime, reinstalling
+      dependencies, touching .env, or going near the database. Nothing new
+      is implemented here to achieve that; the phases that do the work are
+      the same ones a full install runs, unchanged.
+
+      Note what is NOT called: Suspend-DeltaRuntimeForDeployment. Its job is
+      protecting application FILES that are about to be replaced, and it
+      aborts the whole run when declined. Neither applies here - no file of
+      the application is touched, and declining a repair must return the
+      operator to the menu they came from, with the installation exactly as
+      it was found.
+
+      Returns what the caller should do next:
+        'Repaired' - the repair ran and passed readiness; redraw the menu.
+        'Declined' - the operator said no; nothing was changed.
+        'Update'   - a prerequisite is missing; the caller should let the
+                     normal full installation flow proceed.
+        'Blocked'  - refused, with the reason already printed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$AppRoot,
+        [AllowNull()][System.Nullable[int]]$Port,
+        [Parameter(Mandatory)][PSCustomObject]$Plan,
+        [Parameter(Mandatory)][PSCustomObject]$RuntimeState
+    )
+
+    # Deliberately the same opening the management menu itself uses. This
+    # screen replaces that menu on a repair run, and an operator who ran
+    # setup.ps1 against an existing installation needs to see WHICH
+    # installation was found and what its service currently looks like before
+    # being asked anything about it - not a bare instruction about a service
+    # they may not know exists.
+    Show-Section -Title 'DELTA Windows Service'
+
+    Write-Host 'Existing DELTA installation detected.'
+    Write-Host ''
+    Write-Host 'Location:'
+    Write-Host $AppRoot
+    Write-Host ''
+    Write-Host "Windows service: $(Get-DeltaServiceStatusLine -RuntimeState $RuntimeState)"
+    Write-Host ''
+    Write-Host $Plan.Headline
+    if ($Plan.Details.Count -gt 0) {
+        Write-Host ''
+        foreach ($line in $Plan.Details) {
+            Write-Host $line
+        }
+    }
+
+    if ($Plan.Action -eq 'Blocked') {
+        Write-Host ''
+        return 'Blocked'
+    }
+
+    if ($Plan.RequiresConfirmation) {
+        $confirmed = Read-DeltaYesNoConfirmation -Body {
+            Write-Host 'Continue?'
+        }
+        if (-not $confirmed) {
+            Write-Host ''
+            Write-Detail 'No changes were made.'
+            return 'Declined'
+        }
+    }
+    else {
+        Write-Host ''
+        Read-Host -Prompt 'Press Enter to continue' | Out-Null
+    }
+
+    if ($Plan.Action -eq 'Update') {
+        return 'Update'
+    }
+
+    if (-not (Test-IsAdministrator)) {
+        Stop-Setup 'Administrator privileges are required to configure the DELTA Windows Service. Re-run this script from an elevated PowerShell session.'
+    }
+
+    if ($Plan.Action -eq 'Configure') {
+        # The minimum operation that exists: one sc.exe start-mode change.
+        # No stop, no start, no re-registration, no rewritten definition -
+        # a DELTA that is serving keeps serving straight through this.
+        Write-Host ''
+        Set-DeltaServiceStartMode
+        return 'Repaired'
+    }
+
+    # Both variables the phases below read are set from what this menu has
+    # already discovered, rather than re-resolved - the same passing-through
+    # Show-MainMenu's own Start/Restart actions already do for
+    # Restart-DeltaRuntimeForReverseProxy. A $null port cannot reach here:
+    # the prerequisite survey rejects an invalid PORT, and an absent one was
+    # already resolved to the default by the caller.
+    $Script:DeltaRuntimeRoot = $AppRoot
+    $Script:DeltaBackendPort = $Port
+    # Explicitly cleared: this flag suppresses both the stop and the
+    # readiness verification, and a repair that skipped its own verification
+    # would report success it never established.
+    $Script:DeltaSkipManagedInstanceRestart = $false
+
+    Install-DeltaWindowsService
+    Confirm-DeltaRuntimeNotRunning
+    Start-DeltaRuntimeForValidation
+    Confirm-DeltaRuntimeStarted
+
+    Show-Section -Title 'DELTA Windows Service Ready'
+    Write-Host "DELTA now runs as the $($Script:DeltaServiceName) Windows service and will start"
+    Write-Host 'automatically when Windows boots.'
+    Write-Host ''
+
+    return 'Repaired'
+}
+
 function Show-MainMenu {
     <#
       The first screen shown after the installer banner (Initialize-
@@ -447,6 +672,18 @@ function Show-MainMenu {
       prompt, or "Exit" on the existing-install menu) - the caller
       exits immediately in that case, before any installation action
       has run.
+
+      Before the existing-installation menu is drawn, the DeltaApp service
+      registration is assessed (Resolve-DeltaServiceRepairPlan) and, where
+      it is missing, damaged, misdirected or disabled, repaired or migrated
+      (Invoke-DeltaServiceLifecycleRepair) rather than presented as one more
+      thing for the operator to diagnose. That is a lifecycle decision, not
+      a presentation one, which is why neither the condition nor the action
+      is decided in this file - both come from the pure decision table in
+      lib\DeltaInstaller.Service.ps1, and the work itself is done by the
+      same installation phases a full run uses. A healthy service-managed
+      installation reaches none of it and sees the identical menu it always
+      did.
 
       The existing-installation menu also shows the DELTA application's
       current runtime state and offers the matching runtime actions
@@ -503,17 +740,15 @@ function Show-MainMenu {
 
     $existingEnvPath = Join-Path -Path $existingInstallPath -ChildPath '.env'
 
-    while ($true) {
-        $serverProcesses = @(Get-RunningDeltaProcesses -DeltaRuntimeRoot $existingInstallPath)
-        $isRunning = $serverProcesses.Count -gt 0
-        # A launcher (cmd.exe) process without its server process is the
-        # documented orphaned-launcher failure mode (see
-        # Test-DeltaLauncherProcessCommandLine's own header) - neither
-        # Running nor cleanly Stopped. Stop-RunningDeltaInstance already
-        # knows how to clean it up, so the Running-state menu (Stop/
-        # Restart) is offered for it, under an explicit Broken status.
-        $isLauncherOnly = (-not $isRunning) -and (@(Get-RunningDeltaLauncherProcesses).Count -gt 0)
+    # Which repair conditions have already had their turn in THIS menu
+    # session. A repair that succeeds does not recur (the condition is gone
+    # when the state is re-derived), so this exists for the two cases where
+    # it would: an operator who declined, and a repair that reported success
+    # without actually resolving the condition. Either way the operator gets
+    # the ordinary menu on the next pass instead of the same prompt forever.
+    $handledRepairConditions = @()
 
+    while ($true) {
         $portNumber = $null
         $rawPort = Get-EnvFileValue -Path $existingEnvPath -Key 'PORT'
         if ([string]::IsNullOrWhiteSpace($rawPort)) {
@@ -524,31 +759,109 @@ function Show-MainMenu {
         }
         $portDisplay = if ($null -ne $portNumber) { "$portNumber" } else { "'$rawPort' (invalid - PORT in .env must be 1-65535)" }
 
-        $unrelatedPortOwner = $null
-        if ($null -ne $portNumber) {
-            $portCheck = Test-TcpPortAvailable -Port $portNumber
-            if (-not $portCheck.Available) {
-                $isDeltaOwned = @($serverProcesses | Where-Object { [int]$_.ProcessId -eq [int]$portCheck.OwningProcessId }).Count -gt 0
-                if (-not $isDeltaOwned) {
-                    $unrelatedPortOwner = $portCheck.OwnerDescription
-                }
+        # One call replaces what used to be three separate derivations here
+        # (process ownership, launcher orphan detection, port cross-
+        # reference) and adds Service Control Manager state alongside them -
+        # see Get-DeltaRuntimeState in lib\DeltaInstaller.Service.ps1. The
+        # underlying evidence is unchanged: "Running" still requires this
+        # installation's OWN process, matched by command line, and an
+        # unrelated process on the configured port is still reported rather
+        # than touched. No HTTP probe here - the menu redraws on every
+        # action and must stay instant.
+        $runtimeState = Get-DeltaRuntimeState -AppRoot $existingInstallPath -Port $portNumber
+
+        # A DELTA deployment whose Windows Service is missing, damaged, or
+        # disabled is a migration/repair condition, not a runtime state to
+        # present as a choice: the service IS the supported way DELTA runs,
+        # so an administrator should not have to know what WinSW is, or pick
+        # "Update DELTA", merely to obtain it. Assessed before the menu is
+        # drawn, and free for a healthy installation - see
+        # Resolve-DeltaServiceRepairPlan for why the expensive half of the
+        # assessment only runs once something is actually wrong.
+        #
+        # Nothing here decides anything itself: the condition, the action,
+        # and whether the operator is asked all come from the pure decision
+        # table in lib\DeltaInstaller.Service.ps1.
+        $repairPlan = Resolve-DeltaServiceRepairPlan `
+            -AppRoot $existingInstallPath `
+            -RuntimeState $runtimeState `
+            -RawPort $rawPort
+
+        if ($repairPlan.Action -ne 'None' -and $repairPlan.Condition -notin $handledRepairConditions) {
+            $handledRepairConditions += $repairPlan.Condition
+
+            $outcome = Invoke-DeltaServiceLifecycleRepair `
+                -AppRoot $existingInstallPath `
+                -Port $portNumber `
+                -Plan $repairPlan `
+                -RuntimeState $runtimeState
+
+            # 'Update' is the only outcome that leaves this menu: the
+            # existing full installation flow is what owns restoring a
+            # missing prerequisite, and returning $true is how this function
+            # has always handed control to it. 'Repaired' and 'Declined'
+            # both fall back into this loop, which re-derives the state from
+            # scratch and draws the ordinary menu. 'Blocked' does the same,
+            # having already printed why - the operator still has Update,
+            # Reinstall and Exit available.
+            if ($outcome -eq 'Update') {
+                return $true
             }
+
+            continue
         }
 
-        $stateDisplay = if ($isRunning) { 'Running' } elseif ($isLauncherOnly) { 'Broken' } else { 'Stopped' }
+        # Whether DELTA has any runtime presence at all decides which menu
+        # layout is shown - the same distinction the previous
+        # ($isRunning -or $isLauncherOnly) test drew, now covering the
+        # service-managed states too.
+        $hasRuntimePresence = $runtimeState.State -in @('Running', 'Starting', 'Broken')
+        $unrelatedPortOwner = $runtimeState.UnrelatedPortOwner
 
         Write-Host 'Existing DELTA installation detected.'
         Write-Host ''
         Write-Host 'Location:'
         Write-Host $existingInstallPath
         Write-Host ''
-        Write-Host "DELTA application: $stateDisplay"
-        Write-Host "Port: $portDisplay"
-        if ($isLauncherOnly) {
-            Write-Host ''
-            Write-Host 'A DELTA launcher process is still running, but no DELTA server process was found.' -ForegroundColor Yellow
-            Write-Host 'Choose "Stop DELTA" to clean it up, or "Restart DELTA" to recover.' -ForegroundColor Yellow
+        # Shared with the repair screen (Get-DeltaServiceStatusLine), plus the
+        # consequence, which only this screen is in a position to state: from
+        # here the operator is choosing what to do next.
+        $serviceLine = Get-DeltaServiceStatusLine -RuntimeState $runtimeState
+        if (-not $runtimeState.ServiceInstalled) {
+            $serviceLine += ' (DELTA will not start automatically at boot)'
         }
+        Write-Host "Windows service  : $serviceLine"
+        Write-Host "DELTA application: $($runtimeState.State)"
+        Write-Host "Port: $portDisplay"
+
+        switch ($runtimeState.State) {
+            'Broken' {
+                Write-Host ''
+                if ($runtimeState.ServiceInstalled -and $runtimeState.ServiceStatus -eq 'Running' -and $runtimeState.ProcessCount -eq 0) {
+                    Write-Host 'The DELTA service is running, but no DELTA application process was found.' -ForegroundColor Yellow
+                }
+                elseif ($runtimeState.LegacyLauncherCount -gt 0) {
+                    Write-Host 'A DELTA launcher process is still running, but no DELTA server process was found.' -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host 'A DELTA process is running without its Windows service supervising it.' -ForegroundColor Yellow
+                }
+                Write-Host 'Choose "Stop DELTA" to clean it up, or "Restart DELTA" to recover.' -ForegroundColor Yellow
+            }
+            'Damaged' {
+                # Only reached when the automatic repair above was declined,
+                # blocked, or already attempted this session - it is the
+                # normal handler for this state otherwise.
+                Write-Host ''
+                Write-Host "The $($Script:DeltaServiceName) service is registered, but its service files are missing or invalid." -ForegroundColor Yellow
+                Write-Host 'Choose "Start DELTA" to repair the service, or "Update DELTA" to redeploy DELTA as well.' -ForegroundColor Yellow
+            }
+            'Starting' {
+                Write-Host ''
+                Write-Host 'DELTA is starting - it is running but not yet listening on its configured port.' -ForegroundColor Yellow
+            }
+        }
+
         if ($unrelatedPortOwner) {
             Write-Host ''
             Write-Host "Port $portNumber is currently in use by another process: $unrelatedPortOwner" -ForegroundColor Yellow
@@ -559,7 +872,7 @@ function Show-MainMenu {
         Write-Host ''
         Write-Host '1. Update DELTA'
         Write-Host '2. Reinstall DELTA'
-        if ($isRunning -or $isLauncherOnly) {
+        if ($hasRuntimePresence) {
             Write-Host '3. Stop DELTA'
             Write-Host '4. Restart DELTA'
             Write-Host '5. Configure email / SMTP'
@@ -584,7 +897,7 @@ function Show-MainMenu {
         # not $null, for an unmatched choice - switch over $null iterates
         # zero times and would skip even its own default branch.
         $action = ''
-        if ($isRunning -or $isLauncherOnly) {
+        if ($hasRuntimePresence) {
             switch ($choice.Trim()) {
                 '1' { $action = 'Update' }
                 '2' { $action = 'Reinstall' }
@@ -618,6 +931,22 @@ function Show-MainMenu {
                 # its own non-exiting actions) re-enters this while loop,
                 # which re-derives the runtime state and redisplays the
                 # menu. Same for Restart/Start/ResetPassword below.
+                #
+                # Service-managed installations stop through the Service
+                # Control Manager. Terminating a supervised process instead
+                # would achieve nothing - WinSW restarts it - so direct
+                # termination is reached only for what the SCM cannot stop:
+                # a legacy instance, an orphaned launcher, or a service stop
+                # that genuinely exceeded its timeout.
+                if ($runtimeState.ServiceInstalled) {
+                    Write-Step "Stopping the $($Script:DeltaServiceName) service..."
+                    if (Stop-DeltaWindowsService) {
+                        Write-Success '    DELTA service stopped.'
+                    }
+                    else {
+                        Write-Host 'The service did not stop within the timeout - cleaning up its processes directly.' -ForegroundColor Yellow
+                    }
+                }
                 Stop-RunningDeltaInstance -DeltaRuntimeRoot $existingInstallPath
             }
             'Restart' {
@@ -632,10 +961,34 @@ function Show-MainMenu {
                 Restart-DeltaRuntimeForReverseProxy
             }
             'Start' {
+                # Starting DELTA means starting the service. This branch is
+                # only reachable without one when the operator declined the
+                # repair offered above (or it was blocked), and answering
+                # "Start DELTA" is a clear statement that they do want DELTA
+                # running - so the supported way to get there is offered
+                # again rather than quietly falling back to the legacy
+                # cmd.exe -> dotenv -> yarn -> node chain, which would start
+                # DELTA in a form that does not survive a reboot and is not
+                # what this installer now deploys.
+                #
+                # Clearing the suppression list and falling out of this case
+                # (no `return`) re-enters the loop, which re-derives the
+                # state and re-offers the repair - the same fall-through the
+                # Stop case above documents.
+                if (-not $runtimeState.ServiceInstalled -or $runtimeState.ServiceDamaged) {
+                    $handledRepairConditions = @()
+                    continue
+                }
+
                 # Re-checked at selection time, not trusted from the menu
                 # render above - if a DELTA instance appeared in between,
                 # Start must refuse rather than let the restart helper's
                 # own stop stage silently turn "Start" into a restart.
+                # Deliberately still the process-ownership check rather than
+                # the service's own status: what must not be duplicated is a
+                # running DELTA, and the service reporting Running while no
+                # DELTA process exists is the Broken state, which Start
+                # should be allowed to recover from.
                 if (@(Get-RunningDeltaProcesses -DeltaRuntimeRoot $existingInstallPath).Count -gt 0) {
                     Write-Host 'DELTA is already running - not starting a second instance.' -ForegroundColor Yellow
                     Write-Host ''
@@ -1785,6 +2138,16 @@ function Get-NodeInstaller {
         return $installerPath
     }
 
+    # Before paying for the download: an identical copy may already sit in a
+    # neighbouring installer directory's own cache (Copy-DeltaReusableInstaller,
+    # lib\DeltaInstaller.Common.ps1). Exact filename only, so the pinned
+    # version is still the only one that can be installed. $null means there
+    # was nothing to reuse, and the original download below runs unchanged.
+    $reusedPath = Copy-DeltaReusableInstaller -FileName $Script:InstallerConfig.NODE_INSTALLER -DestinationDirectory $DestinationDirectory
+    if ($reusedPath) {
+        return $reusedPath
+    }
+
     Write-Step "Downloading Node.js v$($Script:RequiredNodeVersion) installer..."
     Write-Detail "Source: $($Script:NodeDownloadUrl)"
     Write-Detail "Target: $installerPath"
@@ -2006,6 +2369,15 @@ function Get-PostgresInstaller {
         Write-Step 'Using cached PostgreSQL installer...'
         Write-Detail "Cache: $installerPath"
         return $installerPath
+    }
+
+    # Sibling-cache reuse before downloading - see Get-NodeInstaller above.
+    # This is the file that makes the feature worth having: EDB's installer
+    # is the largest of the three, and its download URL is the least stable
+    # (see $Script:PostgresDownloadUrl).
+    $reusedPath = Copy-DeltaReusableInstaller -FileName $Script:InstallerConfig.POSTGRES_INSTALLER -DestinationDirectory $DestinationDirectory
+    if ($reusedPath) {
+        return $reusedPath
     }
 
     Write-Step "Downloading PostgreSQL $($Script:RequiredPostgresVersion) installer..."
@@ -2936,6 +3308,21 @@ function Get-PostGISInstaller {
         return $installerPath
     }
 
+    # Sibling-cache reuse before downloading - see Get-NodeInstaller above.
+    # Unlike Node/PostgreSQL, this component HAS an integrity check, so the
+    # reuse path runs that same check (Test-PostGISInstallerIntegrity, below)
+    # against the copied file before accepting it - in its -NonFatal form,
+    # because a bad neighbouring copy must fall back to a fresh download
+    # rather than abort the installation. The unchanged fatal check in
+    # Install-PostGIS still runs afterwards either way.
+    $reusedPath = Copy-DeltaReusableInstaller -FileName $Script:InstallerConfig.POSTGIS_INSTALLER -DestinationDirectory $DestinationDirectory -Validate {
+        param($CandidatePath)
+        Test-PostGISInstallerIntegrity -InstallerPath $CandidatePath -NonFatal
+    }
+    if ($reusedPath) {
+        return $reusedPath
+    }
+
     Write-Step "Downloading PostGIS $($Script:RequiredPostGISVersion) installer..."
     Write-Detail "Source: $($Script:PostGISDownloadUrl)"
     Write-Detail "Target: $installerPath"
@@ -2966,8 +3353,22 @@ function Test-PostGISInstallerIntegrity {
       available"). A checksum that WAS fetched but doesn't match is
       always fatal - never execute a binary that fails a check that was
       actually performed.
+
+      -NonFatal changes exactly one thing, for exactly one caller: instead of
+      stopping setup on a mismatch, the result is RETURNED as $true/$false.
+      Get-PostGISInstaller uses it to vet an installer copied out of a
+      neighbouring installer directory's cache (Copy-DeltaReusableInstaller,
+      lib\DeltaInstaller.Common.ps1), where a mismatch means "don't reuse
+      this file, download instead" rather than "abort". The checksum rule
+      itself is unchanged - same URL, same comparison, same "a missing
+      checksum file is skipped, not a failure" stance - and the fatal
+      default path is untouched, including emitting no output value at all,
+      so existing callers keep behaving identically.
     #>
-    param([Parameter(Mandatory)][string]$InstallerPath)
+    param(
+        [Parameter(Mandatory)][string]$InstallerPath,
+        [switch]$NonFatal
+    )
 
     Write-Step 'Verifying installer checksum...'
 
@@ -2976,6 +3377,7 @@ function Test-PostGISInstallerIntegrity {
     }
     catch {
         Write-Detail "Checksum file not available at $($Script:PostGISChecksumUrl) - skipping integrity verification."
+        if ($NonFatal) { return $true }
         return
     }
 
@@ -2992,10 +3394,15 @@ function Test-PostGISInstallerIntegrity {
     $actualHash = (Get-FileHash -Path $InstallerPath -Algorithm MD5).Hash.ToUpperInvariant()
 
     if ($expectedHash -ne $actualHash) {
+        if ($NonFatal) {
+            Write-Detail "Checksum mismatch for $InstallerPath. Expected $expectedHash but computed $actualHash."
+            return $false
+        }
         Stop-Setup "PostGIS installer checksum mismatch for $InstallerPath. Expected $expectedHash but computed $actualHash. Delete the cached file and re-run to force a fresh download."
     }
 
     Write-Success '    Checksum verified.'
+    if ($NonFatal) { return $true }
 }
 
 # ---------------------------------------------------------------------------
@@ -3573,6 +3980,20 @@ function New-DeltaEnvironmentFile {
 
     Set-Content -LiteralPath $envTargetPath -Value $updatedLines -Encoding utf8
 
+    # .env holds DATABASE_URL (with the database password), SESSION_SECRET,
+    # and SMTP_PASS. A freshly-created file inherits the application
+    # directory's ACL, which grants BUILTIN\Users read - so without this,
+    # every local account on the machine can read those secrets. Hardened
+    # here, at the moment the file is written, rather than only later during
+    # service installation, so the exposure window is not left open across
+    # the database and port phases that run in between.
+    #
+    # No service account is passed: the DeltaApp service is registered later
+    # in the run (Install-DeltaWindowsService), and its own Read grant is
+    # applied there. Protect-DeltaSecretFile is idempotent, so applying it
+    # twice is harmless.
+    Protect-DeltaSecretFile -Path $envTargetPath
+
     Write-Success '    Environment file ready.'
     Write-Detail "Location: $envTargetPath"
 }
@@ -4000,34 +4421,471 @@ function Get-YarnGlobalBinDirectory {
     return ($output | Select-Object -First 1).ToString().Trim()
 }
 
-function Invoke-DeltaWebsiteInit {
+function Invoke-DeltaWebsiteInitProcess {
     <#
-      Runs dts_shared_binary's init_website.bat - unmodified, exactly as
-      shipped, with its existing error handling intact (see docs/06 -
-      Installation tooling gaps for its known, pre-existing quoting/PATH
-      issues, none of which this function works around). Two
-      accommodations are made purely so it can run as one step of an
-      otherwise unattended installer, neither of which touches its
+      Runs dts_shared_binary's init_website.bat once - unmodified,
+      exactly as shipped, with its existing error handling intact (see
+      docs/06 - Installation tooling gaps for its known, pre-existing
+      quoting/PATH issues, none of which this function works around).
+      Returns the exit code alongside everything the script printed
+      (stdout and stderr both), which is what makes
+      Invoke-DeltaWebsiteInit's certificate-trust recovery possible
+      without any second-guessing of what the script itself did.
+
+      Four accommodations are made purely so it can run as one step of
+      an otherwise unattended installer, none of which touches its
       actual install logic or exit code:
 
-        - -WorkingDirectory $Script:DeltaRuntimeRoot: `yarn install` and
+        - WorkingDirectory $Script:DeltaRuntimeRoot: `yarn install` and
           `yarn global add` both act on the current working directory,
           and init_website.bat itself never `cd`s anywhere (it was
           always meant to be run from inside the unpacked artifact) - so
           this MUST run with C:\DELTA as the working directory, or
           node_modules would silently land in the wrong place entirely.
-        - -RedirectStandardInput from an empty file: init_website.bat
-          ends in a bare `pause`, which would otherwise block waiting
-          for a keypress that never comes. Start-Process's
-          -RedirectStandardInput requires an actual file path (the
-          literal device name 'NUL' is not accepted - confirmed
-          directly: it fails with FileNotFoundException rather than
-          being treated as the NUL device the way cmd.exe's own `<`
-          redirection would), so an empty, zero-byte file is created for
-          this purpose instead. Reading it gives `pause` an immediate
-          EOF, which is enough for it to fall through without an
-          operator present - it does not change what the script
-          actually installs or how it reports failure.
+        - Redirected standard input, closed immediately:
+          init_website.bat ends in a bare `pause`, which would otherwise
+          block waiting for a keypress that never comes. Closing the
+          redirected stdin pipe straight after start gives `pause` the
+          immediate EOF it needs to fall through without an operator
+          present - the same effect the previous empty-file redirection
+          had (Start-Process's -RedirectStandardInput requires an actual
+          file path; driving System.Diagnostics.Process directly does
+          not, so no placeholder file is needed any more), and equally
+          without changing what the script installs or how it reports
+          failure.
+        - Merged, captured output: the child is started as
+          `cmd /c ""<path>" 2>&1"` with stdout redirected and read line
+          by line, each line echoed to the console as it arrives. The
+          operator still sees npm/yarn progress live exactly as before -
+          this is a tee, not a silencer - while the same lines are
+          retained for the caller to inspect. cmd itself merges stderr
+          into stdout so there is only ONE pipe to drain, which is what
+          keeps this deadlock-free: reading two redirected streams
+          sequentially from a single thread can block forever once the
+          unread one fills its buffer.
+        - $env:YARN_NETWORK_TIMEOUT set to 300000 for the duration of
+          this one call: Yarn Classic's default TCP timeout is 30
+          seconds (NETWORK_TIMEOUT in its own bundle), which a tester on
+          a slow link hit as
+          `error ... drizzle-orm-0.45.2.tgz: ESOCKETTIMEDOUT` during
+          `yarn install`. Yarn retries that error class, but every retry
+          re-uses the same 30-second ceiling, so retrying alone does not
+          rescue a consistently slow connection. Yarn Classic merges any
+          `YARN_*` environment variable into its own config
+          (BaseRegistry.mergeEnv('yarn_'), which maps `_` to `-`), so
+          YARN_NETWORK_TIMEOUT lands as the `network-timeout` option -
+          verified directly against 1.22.22: `yarn config get
+          network-timeout` reports `undefined` normally and `300000`
+          with this variable set. That covers *both* registry-fetching
+          commands in the script (`yarn install --production` and
+          `yarn global add dotenv-cli`), which is why this is set here
+          rather than appended to one command. An explicit
+          `--network-timeout` flag would still win over this if
+          init_website.bat ever grows one, which is the correct
+          precedence. This is a ceiling on an idle socket, not on total
+          install duration - a healthy network never reaches it. The
+          previous value (usually none) is restored in a finally block
+          so the variable does not leak into anything else this run
+          starts, including the DELTA runtime itself.
+    #>
+    param([Parameter(Mandatory)][string]$InitWebsitePath)
+
+    $capturedLines = New-Object System.Collections.Generic.List[string]
+    $exitCode = $null
+
+    # Scoped to this one call only - see this function's header for why
+    # Yarn's 30-second default is the actual failure being addressed, and
+    # why an environment variable (which both `yarn install` and `yarn
+    # global add` pick up) is used rather than patching the .bat file.
+    # The child cmd.exe inherits this process's environment block, so
+    # setting it here reaches yarn identically on 5.1 and 7.x.
+    $previousYarnNetworkTimeout = $env:YARN_NETWORK_TIMEOUT
+    $env:YARN_NETWORK_TIMEOUT = '300000'
+
+    try {
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName               = 'cmd.exe'
+        $startInfo.Arguments              = "/c `"`"$InitWebsitePath`" 2>&1`""
+        $startInfo.WorkingDirectory       = $Script:DeltaRuntimeRoot
+        $startInfo.UseShellExecute        = $false
+        $startInfo.CreateNoWindow         = $true
+        $startInfo.RedirectStandardInput  = $true
+        $startInfo.RedirectStandardOutput = $true
+        # Whatever this console itself uses - so captured text matches
+        # what an operator watching the same run would have seen.
+        $startInfo.StandardOutputEncoding = [Console]::OutputEncoding
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        [void]$process.Start()
+
+        # Immediate EOF for the trailing `pause` - see the header.
+        $process.StandardInput.Close()
+
+        while ($null -ne ($line = $process.StandardOutput.ReadLine())) {
+            Write-Host $line
+            [void]$capturedLines.Add($line)
+        }
+
+        # The parameterless overload guarantees the exit code is readable
+        # on return (the same .NET synchronization note
+        # Start-ProcessWithActivityIndicator documents).
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+    }
+    finally {
+        # Restoring "unset" has to be a Remove-Item, not an assignment:
+        # assigning $null or '' leaves an empty-but-present variable
+        # behind, which is not the same starting state a repeat run
+        # would otherwise see.
+        if ($null -eq $previousYarnNetworkTimeout) {
+            Remove-Item -LiteralPath 'Env:\YARN_NETWORK_TIMEOUT' -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:YARN_NETWORK_TIMEOUT = $previousYarnNetworkTimeout
+        }
+    }
+
+    return [PSCustomObject]@{
+        ExitCode = $exitCode
+        Output   = ($capturedLines -join [Environment]::NewLine)
+    }
+}
+
+# Certificate-validation failures ONLY - the single failure class the
+# strict-SSL workaround below can actually rescue. Every entry is a
+# message npm or Yarn emits when OpenSSL refused to validate the registry
+# certificate chain, which is what a TLS-inspecting corporate proxy
+# (whose issuing CA the Node runtime does not trust) produces:
+#
+#   - the two OpenSSL forms of "the issuing CA is not in the trust store"
+#     (npm prints the human-readable text, Node the error code);
+#   - the self-signed-chain forms of the same underlying situation, whose
+#     only fix is likewise trusting the CA or bypassing verification.
+#
+# Deliberately NOT here, and deliberately never matched loosely enough to
+# catch them by accident: ESOCKETTIMEDOUT, connection timeouts, DNS
+# failures, registry 4xx/5xx responses, or any generic "failed to install
+# dependencies" line. Disabling certificate verification cannot fix any of
+# those, so offering it for them would trade real security for nothing.
+$Script:DeltaCertificateTrustFailurePatterns = @(
+    'unable to get local issuer certificate'
+    'UNABLE_TO_GET_ISSUER_CERT_LOCALLY'
+    'self signed certificate in certificate chain'
+    'self-signed certificate in certificate chain'
+    'SELF_SIGNED_CERT_IN_CHAIN'
+)
+
+function Test-DeltaCertificateTrustFailure {
+    <#
+      True only when init_website.bat's captured output contains one of
+      the certificate-validation failures listed above. Plain
+      case-insensitive substring matching (not regex) so no pattern can
+      accidentally widen itself, and so the OpenSSL error codes match
+      whatever casing the emitting tool used.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$OutputText)
+
+    if ([string]::IsNullOrWhiteSpace($OutputText)) {
+        return $false
+    }
+
+    foreach ($pattern in $Script:DeltaCertificateTrustFailurePatterns) {
+        if ($OutputText.IndexOf($pattern, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Test-NpmAvailable {
+    <#
+      Get-Command 'npm' rather than 'npm.cmd' (the shape
+      Test-YarnAvailable uses): npm ships as npm.cmd on Windows and
+      PATHEXT resolves the bare name to it, and the bare name is also
+      what init_website.bat itself calls.
+    #>
+    return [bool](Get-Command -Name 'npm' -ErrorAction SilentlyContinue)
+}
+
+function Get-NpmStrictSslState {
+    <#
+      Reads npm's CURRENT strict-ssl situation before anything is changed,
+      which is what makes the change reversible:
+
+        EffectiveValue         - what `npm config get strict-ssl` reports
+                                 ('true' unless someone changed it, since
+                                 that is npm's built-in default), or $null
+                                 if npm could not be asked.
+        IsExplicitlyConfigured - whether strict-ssl appears in
+                                 `npm config list`. That command prints
+                                 only the values actually written to a
+                                 config file, never npm's own defaults
+                                 (those need `npm config list -l`), so it
+                                 is exactly the "did an administrator set
+                                 this themselves?" answer needed to decide
+                                 between restoring a value and deleting
+                                 the key again afterwards.
+
+      Never throws: npm being absent or unhappy is reported as "unknown",
+      and Resolve-NpmStrictSslWorkaroundPlan decides what that means.
+    #>
+    $state = [PSCustomObject]@{
+        Available              = $false
+        EffectiveValue         = $null
+        IsExplicitlyConfigured = $false
+    }
+
+    if (-not (Test-NpmAvailable)) {
+        return $state
+    }
+    $state.Available = $true
+
+    try {
+        $value = & npm config get strict-ssl 2>$null
+        if ($value) {
+            $state.EffectiveValue = ($value | Select-Object -First 1).ToString().Trim()
+        }
+    }
+    catch {
+        $state.EffectiveValue = $null
+    }
+
+    try {
+        $configList = & npm config list 2>$null
+        if ($configList) {
+            $state.IsExplicitlyConfigured = [bool](($configList -join "`n") -match '(?im)^\s*strict-ssl\s*=')
+        }
+    }
+    catch {
+        $state.IsExplicitlyConfigured = $false
+    }
+
+    return $state
+}
+
+function Resolve-NpmStrictSslWorkaroundPlan {
+    <#
+      The whole configuration-safety decision, kept as one pure function
+      so it is testable without npm and cannot drift from the restore
+      logic that consumes it:
+
+        - npm unavailable            -> change nothing (init_website.bat
+                                        could not have got as far as a
+                                        registry certificate anyway).
+        - strict-ssl already 'false' -> change nothing, and above all
+                                        restore nothing afterwards.
+                                        Re-enabling verification an
+                                        administrator had deliberately
+                                        turned off would be this
+                                        installer silently reversing
+                                        their decision.
+        - explicitly configured      -> set it to false for the retry,
+          (e.g. 'true' in .npmrc)       then write that exact value back.
+        - not configured at all      -> set it to false for the retry,
+                                        then DELETE the key rather than
+                                        writing 'true'. Deleting restores
+                                        the original state - npm's default
+                                        - whereas writing 'true' would
+                                        leave behind an .npmrc entry that
+                                        was never there before.
+    #>
+    param(
+        [Parameter(Mandatory)][bool]$NpmAvailable,
+        [AllowNull()][AllowEmptyString()][string]$EffectiveValue,
+        [bool]$IsExplicitlyConfigured
+    )
+
+    $plan = [PSCustomObject]@{
+        NeedsChange      = $false
+        AlreadyDisabled  = $false
+        RestoreAction    = 'None'
+        RestoreValue     = $null
+    }
+
+    if (-not $NpmAvailable) {
+        return $plan
+    }
+
+    if ($EffectiveValue -and $EffectiveValue.Trim().ToLowerInvariant() -eq 'false') {
+        $plan.AlreadyDisabled = $true
+        return $plan
+    }
+
+    $plan.NeedsChange = $true
+    if ($IsExplicitlyConfigured -and $EffectiveValue) {
+        $plan.RestoreAction = 'Set'
+        $plan.RestoreValue  = $EffectiveValue.Trim()
+    }
+    else {
+        $plan.RestoreAction = 'Delete'
+    }
+
+    return $plan
+}
+
+function Set-NpmStrictSslDisabled {
+    <#
+      The single configuration change the workaround makes:
+      `npm config set strict-ssl false`, confirmed by reading the value
+      back rather than by trusting an exit code (npm reports plenty of
+      things without failing outright). Returns $false - never throws -
+      if the setting did not actually take, so the caller can say so and
+      still run the retry, which then simply fails the same way it would
+      have anyway.
+    #>
+    try {
+        & npm config set strict-ssl false 2>&1 | Out-Null
+    }
+    catch {
+        Write-Detail "Could not change npm's strict-ssl setting: $($_.Exception.Message)"
+        return $false
+    }
+
+    $applied = Get-NpmStrictSslState
+    if ($applied.EffectiveValue -and $applied.EffectiveValue.Trim().ToLowerInvariant() -eq 'false') {
+        return $true
+    }
+
+    Write-Detail 'npm did not accept the strict-ssl change - retrying with the existing configuration instead.'
+    return $false
+}
+
+function Restore-NpmStrictSslState {
+    <#
+      Puts strict-ssl back exactly as Resolve-NpmStrictSslWorkaroundPlan
+      recorded it. Always called from a finally block, so it runs whether
+      the retry succeeded or failed. Failures here are reported and never
+      thrown: the retry's own outcome is what the operator needs to act
+      on, and hiding it behind a configuration-restore error would help
+      nobody.
+    #>
+    param([Parameter(Mandatory)]$Plan)
+
+    try {
+        switch ($Plan.RestoreAction) {
+            'Set' {
+                & npm config set strict-ssl $Plan.RestoreValue 2>&1 | Out-Null
+                Write-Detail "Restored npm strict-ssl to its previous value ($($Plan.RestoreValue))."
+            }
+            'Delete' {
+                & npm config delete strict-ssl 2>&1 | Out-Null
+                Write-Detail 'Restored npm strict SSL certificate verification (setting removed again).'
+            }
+            default { }
+        }
+    }
+    catch {
+        Write-Detail "Could not restore npm's previous strict-ssl setting: $($_.Exception.Message)"
+        Write-Detail 'Check `npm config get strict-ssl` and restore it manually if required.'
+    }
+}
+
+function Read-DeltaCertificateTrustWorkaroundConfirmation {
+    <#
+      The one prompt this recovery flow adds, built on the shared
+      Read-DeltaYesNoConfirmation frame (rule / body / '[y/N]' / rule) and
+      Show-Warning's warning screen, exactly like every other consequential
+      confirmation in this installer. Bare Enter - and anything other than
+      Y/y - means No, so an operator who is not paying attention gets the
+      secure outcome: no configuration change, and the original failure
+      reported as-is.
+    #>
+    return Read-DeltaYesNoConfirmation -Body {
+        Show-Warning -Message @(
+            'A certificate trust error was detected while downloading DELTA dependencies.'
+            "The current network environment may prevent npm/Yarn from validating`nthe package registry certificate."
+            "DELTA can retry the dependency installation with strict SSL certificate`nverification disabled."
+            "Disabling certificate verification reduces the security of package`ndownloads and should only be used if you trust the current network."
+        )
+        Write-Host 'Disable strict SSL verification and retry?'
+    }
+}
+
+function Invoke-DeltaWebsiteInitWithStrictSslDisabled {
+    <#
+      The accepted workaround: disable strict SSL certificate
+      verification for BOTH package managers init_website.bat drives, run
+      the very same script again (never a hand-reproduced copy of the
+      commands inside it), and put the configuration back afterwards.
+
+      Two different mechanisms, each the minimum for its tool:
+
+        - npm (`npm install --global yarn`) reads strict-ssl from its
+          config files, so the config is changed - and, per
+          Resolve-NpmStrictSslWorkaroundPlan, only when it is not already
+          disabled, and always restored to its exact prior state in the
+          finally block below, retry failure included.
+        - Yarn Classic (`yarn install --production`,
+          `yarn global add dotenv-cli`) merges any YARN_* environment
+          variable into its own config - the same documented mechanism
+          Invoke-DeltaWebsiteInitProcess already relies on for
+          YARN_NETWORK_TIMEOUT - so YARN_STRICT_SSL=false covers Yarn for
+          the duration of this one child process without writing to
+          ~/.yarnrc at all. Verified directly against Yarn 1.22.22:
+          `yarn config get strict-ssl` reports `true` normally, `false`
+          with this variable set, and `true` again once it is removed.
+          Nothing to restore beyond the variable itself, which is exactly
+          why it is preferred here over `yarn config set` (which would
+          write a persistent ~/.yarnrc entry that was never there
+          before).
+
+      Returns the retry's own result object unchanged; the caller decides
+      what a non-zero exit code means.
+    #>
+    param([Parameter(Mandatory)][string]$InitWebsitePath)
+
+    $state = Get-NpmStrictSslState
+    $plan  = Resolve-NpmStrictSslWorkaroundPlan -NpmAvailable $state.Available `
+        -EffectiveValue $state.EffectiveValue -IsExplicitlyConfigured $state.IsExplicitlyConfigured
+
+    if ($plan.AlreadyDisabled) {
+        Write-Detail 'npm strict SSL verification is already disabled - leaving the existing configuration unchanged.'
+    }
+    elseif ($plan.NeedsChange) {
+        Write-Step 'Disabling strict SSL certificate verification for the retry...'
+        [void](Set-NpmStrictSslDisabled)
+    }
+
+    $previousYarnStrictSsl = $env:YARN_STRICT_SSL
+    $env:YARN_STRICT_SSL = 'false'
+
+    try {
+        Write-Step 'Retrying dependency installation (init_website.bat)...'
+        return Invoke-DeltaWebsiteInitProcess -InitWebsitePath $InitWebsitePath
+    }
+    finally {
+        if ($null -eq $previousYarnStrictSsl) {
+            Remove-Item -LiteralPath 'Env:\YARN_STRICT_SSL' -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:YARN_STRICT_SSL = $previousYarnStrictSsl
+        }
+
+        if ($plan.NeedsChange) {
+            Restore-NpmStrictSslState -Plan $plan
+        }
+    }
+}
+
+function Invoke-DeltaWebsiteInit {
+    <#
+      Phase 3's dependency installation: run init_website.bat, and - only
+      for the one failure class a configuration change can actually
+      rescue - offer the administrator a single retry with strict SSL
+      certificate verification disabled.
+
+      The successful path is completely unchanged: one run, no prompt, no
+      configuration read or written. So is every failure that is not a
+      certificate-validation failure (ESOCKETTIMEDOUT, DNS, a plain
+      dependency resolution error, ...) - those still stop the installer
+      immediately with the same message as before.
+
+      Strictly one automatic retry, and the retry's own output is never
+      re-inspected for certificate errors: whatever it reports is final.
+      That is what makes an infinite recovery loop structurally
+      impossible rather than merely unlikely.
     #>
     Write-Step 'Installing Yarn and application dependencies (init_website.bat)...'
 
@@ -4036,16 +4894,27 @@ function Invoke-DeltaWebsiteInit {
         Stop-Setup "init_website.bat not found at $initWebsitePath."
     }
 
-    $emptyStdinPath = Join-Path -Path $Script:WorkingDirectory -ChildPath 'empty.stdin'
-    if (-not (Test-Path -LiteralPath $emptyStdinPath)) {
-        New-Item -Path $emptyStdinPath -ItemType File -Force | Out-Null
-    }
+    $result = Invoke-DeltaWebsiteInitProcess -InitWebsitePath $initWebsitePath
 
-    $process = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$initWebsitePath`"" `
-        -WorkingDirectory $Script:DeltaRuntimeRoot -RedirectStandardInput $emptyStdinPath -Wait -PassThru -NoNewWindow
+    if ($result.ExitCode -ne 0) {
+        # The original failure, preserved verbatim: it is what gets
+        # reported unless the administrator explicitly asks for the
+        # workaround AND the retry then fails on its own terms.
+        $originalFailureMessage = "init_website.bat failed with exit code $($result.ExitCode). See its output above for details."
 
-    if ($process.ExitCode -ne 0) {
-        Stop-Setup "init_website.bat failed with exit code $($process.ExitCode). See its output above for details."
+        if (-not (Test-DeltaCertificateTrustFailure -OutputText $result.Output)) {
+            Stop-Setup $originalFailureMessage
+        }
+
+        if (-not (Read-DeltaCertificateTrustWorkaroundConfirmation)) {
+            Write-Detail 'Strict SSL certificate verification left enabled - no npm or Yarn configuration was changed.'
+            Stop-Setup $originalFailureMessage
+        }
+
+        $result = Invoke-DeltaWebsiteInitWithStrictSslDisabled -InitWebsitePath $initWebsitePath
+        if ($result.ExitCode -ne 0) {
+            Stop-Setup "init_website.bat failed with exit code $($result.ExitCode) after retrying with strict SSL certificate verification disabled. See its output above for details."
+        }
     }
 
     Write-Success '    Runtime dependencies installed.'
@@ -4450,6 +5319,230 @@ function Update-DeltaApplicationPortEnvironment {
     }
 }
 
+# ---------------------------------------------------------------------------
+# DELTA Windows Service (Phase 5)
+#
+# Supersedes the interim, unsupervised startup this section originally
+# provided. The service itself - naming, acquisition, configuration
+# rendering, registration, identity, ACLs, lifecycle, and state - lives
+# entirely in lib\DeltaInstaller.Service.ps1; the two functions below are
+# only the orchestration phases that call into it, so no raw sc.exe or WinSW
+# invocation appears anywhere in this script.
+# ---------------------------------------------------------------------------
+
+function Suspend-DeltaRuntimeForDeployment {
+    <#
+      Stops any running DELTA - service-managed or legacy - BEFORE anything
+      touches the application directory.
+
+      Placement is the entire point of this function, and it runs earlier
+      than any other lifecycle step for two concrete reasons:
+
+        - Install-DeltaRuntime replaces the deployed application files with
+          Copy-Item -Force. Under a supervisor, a running DELTA is not
+          merely reading those files: WinSW will restart the process if it
+          exits mid-copy, so the runtime can be relaunched against a
+          half-replaced tree. Stopping first is what makes the deployment
+          atomic from the application's point of view.
+        - Resolve-ExistingDeltaDeployment (which runs immediately after
+          this) can MOVE the entire application directory aside for the
+          "Completely fresh installation" lifecycle choice. Moving a
+          directory out from under a live, supervised process is worse
+          still, so this has to precede even that.
+
+      A no-op when nothing is running, which is the normal case for a fresh
+      installation and for any re-run against an already-stopped deployment.
+
+      The operator's remembered restart preference
+      (Resolve-DeltaManagedInstanceRestartDecision) is still honoured, just
+      consulted here rather than later in the flow. Declining now ABORTS the
+      run instead of proceeding, and that is deliberate: deploying over a
+      live service is exactly what this function exists to prevent, and at
+      this point nothing whatsoever has been modified - no files copied, no
+      directory moved, no .env written - so aborting is a genuinely clean
+      no-op rather than a half-finished installation. The previous behaviour
+      (deploy the files anyway, leave the old process serving old code from
+      memory) was defensible only because nothing was supervising that
+      process; it is not defensible once something is.
+    #>
+    Show-Section -Title 'DELTA Runtime Suspension'
+
+    $serviceInstalled = Test-DeltaServiceInstalled
+    $serviceRunning   = $false
+    if ($serviceInstalled) {
+        $service = Get-Service -Name $Script:DeltaServiceName -ErrorAction SilentlyContinue
+        $serviceRunning = ($service -and $service.Status -ne 'Stopped')
+    }
+
+    $legacyProcesses = @(Get-RunningDeltaProcesses -DeltaRuntimeRoot $Script:DeltaRuntimeRoot).Count +
+                       @(Get-RunningDeltaLauncherProcesses).Count
+
+    if (-not $serviceRunning -and $legacyProcesses -eq 0) {
+        Write-Detail 'No running DELTA instance detected - nothing to stop before deployment.'
+        return
+    }
+
+    Write-Host ''
+    Write-Host 'A running DELTA instance was detected.'
+    Write-Host ''
+    if ($serviceRunning) {
+        Write-Host "Managed by the Windows service: $($Script:DeltaServiceName)"
+    }
+    if ($legacyProcesses -gt 0) {
+        Write-Host "Directly-launched DELTA processes: $legacyProcesses"
+    }
+    Write-Host ''
+    Write-Host 'DELTA must be stopped before its application files can be replaced.'
+
+    if (-not (Resolve-DeltaManagedInstanceRestartDecision)) {
+        Stop-Setup @'
+Deployment canceled - DELTA is still running.
+
+The DELTA application files cannot be safely replaced while DELTA is running, so this run has stopped without changing anything.
+
+Nothing has been modified: no files were copied, no configuration was written, and the running DELTA instance was left untouched.
+
+Re-run setup.ps1 and choose to stop DELTA when prompted, or stop it yourself first.
+'@
+    }
+
+    Write-Host ''
+    Write-Step 'Stopping DELTA before deployment...'
+
+    if ($serviceInstalled) {
+        if (-not (Stop-DeltaWindowsService)) {
+            Write-Detail 'The DELTA service did not stop within the timeout - falling back to direct process cleanup.'
+        }
+        else {
+            Write-Detail "Service stopped: $($Script:DeltaServiceName)"
+        }
+    }
+
+    # Always runs, even after a clean service stop: this is what removes a
+    # LEGACY instance (the pre-service cmd.exe -> dotenv -> yarn -> node
+    # chain) during migration, and any orphaned launcher left behind by one.
+    # A no-op when the service stop already accounted for everything.
+    Stop-RunningDeltaInstance -DeltaRuntimeRoot $Script:DeltaRuntimeRoot
+
+    Write-Success '    DELTA stopped.'
+}
+
+function Install-DeltaWindowsService {
+    <#
+      Phase 5 - registers (or repairs, or leaves entirely alone) the DeltaApp
+      Windows Service for this deployment.
+
+      Runs after .env exists and the application port has been resolved,
+      because the generated service definition embeds the resolved .env path
+      and the ACL step needs .env present to secure it. Runs before
+      Confirm-DeltaRuntimeNotRunning/Start-DeltaRuntimeForValidation, which
+      then start DELTA *through* the service rather than as a detached
+      process.
+
+      Idempotency is decided from real, observable inputs, never from a
+      "have we done this before" marker: the service is re-registered only
+      when it is missing, damaged, running under the wrong identity, not set
+      to automatic start, or when the WinSW binary or the rendered XML
+      actually changed. An unchanged deployment therefore re-registers
+      nothing and rewrites nothing.
+
+      Permissions are re-applied on every run regardless. They are cheap,
+      idempotent, and are the one thing most likely to have been altered
+      out-of-band (a restored backup, a hand-edited ACL, a new uploads
+      subdirectory created before the grant existed) - so "repair the
+      permissions" is the correct default rather than something gated behind
+      a change check.
+    #>
+    Show-Section -Title 'DELTA Windows Service'
+
+    if (-not (Test-IsAdministrator)) {
+        Stop-Setup 'Administrator privileges are required to install the DELTA Windows Service. Re-run this script from an elevated PowerShell session.'
+    }
+
+    $nodeExecutable = Find-NodeExecutable
+    if (-not $nodeExecutable) {
+        Stop-Setup 'node.exe could not be located, so the DELTA Windows Service cannot be configured to run it.'
+    }
+
+    Write-Step 'Resolving the DELTA runtime entry point...'
+    $serveCliPath = Resolve-DeltaServeCliPath -AppRoot $Script:DeltaRuntimeRoot -NodeExecutable $nodeExecutable
+    Write-Detail "Node       : $nodeExecutable"
+    Write-Detail "Serve CLI  : $serveCliPath"
+
+    $winswSource = Get-DeltaWinSwBinary -DestinationDirectory $Script:InstallersDirectory
+
+    Write-Step 'Preparing the service directory...'
+    $binaryChanged = Install-DeltaServiceBinary -AppRoot $Script:DeltaRuntimeRoot -SourcePath $winswSource
+    Write-Detail "Location: $(Get-DeltaServiceDirectory -AppRoot $Script:DeltaRuntimeRoot)"
+
+    Write-Step 'Generating the service configuration...'
+    $envPath = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath '.env'
+    $postgresDependency = Get-DeltaPostgresServiceDependency -EnvPath $envPath
+    if ($postgresDependency) {
+        Write-Detail "Service dependency: $postgresDependency"
+    }
+    else {
+        Write-Detail 'Service dependency: none (the database is not a local PostgreSQL service)'
+    }
+
+    $definitionContent = Get-DeltaServiceDefinitionContent `
+        -TemplatePath (Join-Path -Path $Script:ProjectRoot -ChildPath 'templates\service\delta-service.xml') `
+        -AppRoot $Script:DeltaRuntimeRoot `
+        -NodeExecutable $nodeExecutable `
+        -ServeCliPath $serveCliPath `
+        -EnvPath $envPath `
+        -LogDirectory (Get-DeltaServiceLogDirectory -AppRoot $Script:DeltaRuntimeRoot) `
+        -PostgresServiceName $postgresDependency
+
+    $definitionChanged = Save-DeltaServiceDefinition -AppRoot $Script:DeltaRuntimeRoot -Content $definitionContent
+    if ($definitionChanged) {
+        Write-Success "    Service configuration written: $(Get-DeltaServiceDefinitionPath -AppRoot $Script:DeltaRuntimeRoot)"
+    }
+    else {
+        Write-Detail 'Service configuration already up to date - left unchanged.'
+    }
+
+    $registration = Get-DeltaServiceRegistration -AppRoot $Script:DeltaRuntimeRoot
+    $needsRegistration =
+        $binaryChanged -or
+        $definitionChanged -or
+        (-not $registration.Exists) -or
+        $registration.Damaged -or
+        # A registration pointing at a DIFFERENT application root supervises
+        # the wrong deployment, which nothing else here would notice: the
+        # binary and definition it names may well exist, just not the ones
+        # this run just wrote.
+        (-not $registration.BinaryPathMatches) -or
+        ($registration.StartName -ne $Script:DeltaServiceAccount) -or
+        ($registration.StartType -ne 'Automatic')
+
+    if ($needsRegistration) {
+        Write-Step 'Registering the DELTA Windows Service...'
+        Register-DeltaWindowsService -AppRoot $Script:DeltaRuntimeRoot
+        Write-Success "    Service registered: $($Script:DeltaServiceName)"
+    }
+    elseif ($registration.DelayedAutoStart) {
+        # Already Automatic (so the re-registration test above passed) but
+        # still carrying the delayed-autostart flag, which lives in a separate
+        # registry value and is therefore invisible to that test. This is the
+        # state EVERY deployment made by an earlier version of this installer
+        # is in, so it is a migration rather than a rare drift - and the
+        # correction is a single sc.exe call plus clearing that value. Tearing
+        # down and rebuilding a working registration for it would restart a
+        # DELTA that has no reason to be restarted.
+        Write-Step 'Correcting the DELTA service startup mode...'
+        Set-DeltaServiceStartMode
+    }
+    else {
+        Write-Detail "Service registration already correct - left unchanged: $($Script:DeltaServiceName)"
+    }
+
+    Grant-DeltaServiceFileSystemPermission -AppRoot $Script:DeltaRuntimeRoot -EnvPath $envPath
+
+    Write-Host ''
+    Write-Host 'DELTA will now start automatically when Windows boots, with no interactive login required.'
+}
+
 # Get-DeltaStartupLogPaths, Start-DeltaRuntimeForValidation,
 # Test-DeltaHttpEndpoint, Get-DeltaStartupFailureMessage, and
 # Confirm-DeltaRuntimeStarted now live in lib\DeltaInstaller.Common.ps1
@@ -4762,7 +5855,11 @@ function Resolve-ExistingDeltaDeployment {
 # operator PREFERENCE only, never used to identify which process is
 # DELTA's (that stays exclusively Get-RunningDeltaProcesses' job, see
 # Resolve-DeltaApplicationPort/Resolve-DeltaManagedInstanceRestartDecision).
-$Script:DeltaRegistryKeyPath = 'HKLM:\SOFTWARE\PreventionWeb\DELTA'
+#
+# $Script:DeltaRegistryKeyPath itself now lives in lib\DeltaInstaller.Common.ps1
+# (dot-sourced above), where Get-DeltaInstallPath and the service layer's
+# intentional-disable marker also read it - one definition instead of the
+# hand-copied path string this file and that one previously each carried.
 
 function Register-DeltaInstallation {
     <#
@@ -4922,6 +6019,14 @@ try {
 
     Update-DeltaRuntimeArtifact -RuntimeDirectory $Script:DeltaRuntimeSourceDirectory -ProjectRoot $Script:ProjectRoot
     Resolve-DeltaAppRoot
+
+    # Must precede Resolve-ExistingDeltaDeployment, not merely
+    # Install-DeltaRuntime: the "Completely fresh installation" lifecycle
+    # choice MOVES the whole application directory aside, which is not
+    # something to do while a supervised DELTA is running out of it. See
+    # this function's own header.
+    Suspend-DeltaRuntimeForDeployment
+
     Resolve-ExistingDeltaDeployment
     Install-NodeJs
     Install-PostgreSql
@@ -4932,17 +6037,21 @@ try {
     Complete-DatabaseSetup
     Resolve-DeltaApplicationPort
     Update-DeltaApplicationPortEnvironment
+    Install-DeltaWindowsService
     Confirm-DeltaRuntimeNotRunning
     Start-DeltaRuntimeForValidation
     Confirm-DeltaRuntimeStarted
     Register-DeltaInstallation
 
+    # Phase 5 (Windows Service) is now Install-DeltaWindowsService, above.
+    # Start-DeltaRuntimeForValidation/Confirm-DeltaRuntimeStarted are
+    # deliberately still called after it and are NOT redundant: the first
+    # now starts DELTA through the Service Control Manager rather than as a
+    # detached process, and the second is unchanged in what it proves - a
+    # running service is not the same fact as a DELTA that has bound its
+    # port and answered an HTTP request.
+    #
     # Future phases (not yet implemented):
-    # Install-WindowsService (Phase 5) - supersedes Start-DeltaRuntimeForValidation/
-    #   Confirm-DeltaRuntimeStarted above, which exist only as an interim,
-    #   installation-validation convenience (no restart policy, no crash
-    #   supervision, no watchdog - see Start-DeltaRuntimeForValidation's own
-    #   header) until a real supervised service takes over DELTA's lifecycle.
     # Validate-Deployment    (Phase 6)
     #
     # Database upgrade path (detect an existing DELTA installation ->

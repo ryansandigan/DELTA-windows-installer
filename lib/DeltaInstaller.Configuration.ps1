@@ -95,7 +95,17 @@ $Script:RequiredInstallerConfigKeys = @(
     # NGINX
     'NGINX_VERSION',
     'NGINX_INSTALLER',
-    'NGINX_URL'
+    'NGINX_URL',
+
+    # WinSW (Windows Service Wrapper) - lib\DeltaInstaller.Service.ps1.
+    # WINSW_SHA256 is required, unlike the other components' (currently
+    # absent) digests: WinSW's published binaries are not Authenticode-
+    # signed, so a pinned digest is the only integrity check available and
+    # must never be silently skippable.
+    'WINSW_VERSION',
+    'WINSW_INSTALLER',
+    'WINSW_URL',
+    'WINSW_SHA256'
 )
 
 # Initialized here, unconditionally, rather than left for Import-

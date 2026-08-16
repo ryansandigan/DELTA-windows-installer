@@ -21,6 +21,8 @@
 | 12 | [EDB installer defaults to a known superuser password if unspecified](#edb-installer-default-superuser-password) | High | Windows | Never invoke the installer without an explicit `--superpassword`; always prompt interactively, never hardcode or silently default. |
 | 13 | [EDB installer exit codes are undocumented beyond `0`](#edb-installer-exit-codes-are-undocumented) | Low | Windows | Treat any non-zero exit code as failure; validate actual post-install state (service, binaries, version) rather than trusting exit-code semantics. |
 | 14 | [PostgreSQL superuser password is exposed via process command line](#postgresql-superuser-password-process-exposure) | Medium | Windows | Documented, accepted limitation of the installer's design; revisit if EDB's `--optionfile` mechanism is verified as a safer alternative. |
+| 15 | [Yarn Classic's 30-second default network timeout](#yarn-network-timeout) | Medium | Both | ✅ Mitigated at the installer level (Windows): `setup.ps1`'s `Invoke-DeltaWebsiteInit` (Phase 3) sets `YARN_NETWORK_TIMEOUT=300000` for the duration of the `init_website.bat` call only. `init_website.bat`/`.sh` are unmodified; a standalone or Linux run still has the underlying gap — see below. |
+| 16 | [Package registry certificate cannot be validated](#package-registry-certificate-validation) | Medium | Both | ✅ Handled at the installer level (Windows): `setup.ps1`'s `Invoke-DeltaWebsiteInit` (Phase 3) detects this specific failure in `init_website.bat`'s output and offers the administrator **one** retry with strict SSL verification disabled, defaulting to No and restoring the previous configuration afterwards. Never applied automatically — see below. |
 
 ---
 
@@ -45,6 +47,55 @@ None of these block a human operator running the scripts interactively and corre
 
 **The PATH-handling gap (row 4) is mitigated at the `setup.ps1` level, not by patching `init_website.bat`.** `Add-YarnGlobalBinToPersistentPath` (Phase 3, see [08 §Phase 3](08-development-roadmap.md#phase-3--yarn--dependencies)) runs after `init_website.bat` regardless of whether that run actually invoked it, resolves `yarn global bin` itself, and appends it to the persistent User PATH (`[Environment]::SetEnvironmentVariable(...,'User')`) if not already present — the exact `setx`-equivalent fix this row originally called for — then refreshes the current session's PATH so `dotenv` resolves immediately. This closes the end-user-visible symptom (`start.bat` failing with `'dotenv' is not recognized...` in a new console or after a reboot) without touching `init_website.bat` itself, which still has the underlying gap if run standalone (see [02 — Running the installer scripts](02-windows-installation.md#running-the-installer-scripts)).
 
+## Yarn network timeout
+
+**Verified**, reproduced by a tester during Windows validation and confirmed against the installed Yarn Classic 1.22.22 bundle. `yarn install` failed part-way through dependency fetching with:
+
+```
+error Error: https://registry.yarnpkg.com/drizzle-orm/-/drizzle-orm-0.45.2.tgz: ESOCKETTIMEDOUT
+```
+
+This is not an installer timeout — `Invoke-DeltaWebsiteInit` runs `init_website.bat` to completion, with no time limit of its own. It is Yarn's own TCP socket timeout, which **defaults to 30 seconds** (`NETWORK_TIMEOUT = 30 * 1000` in Yarn's bundle). Yarn does classify `ESOCKETTIMEDOUT` as a retryable "possible offline" error, but each retry re-uses the same 30-second ceiling, so retrying does not rescue a consistently slow or throttled link — only raising the ceiling does.
+
+Both registry-fetching commands in `init_website.bat` are exposed to this, not just one:
+
+| Line | Command | Governed by |
+|---|---|---|
+| 15 | `CALL npm install --global yarn` | npm's `fetch-timeout` (defaults to 300 s — not the failure seen here) |
+| 34 | `CALL yarn install --production` | Yarn `network-timeout` (defaults to **30 s**) |
+| 43 | `CALL yarn global add dotenv-cli` | Yarn `network-timeout` (defaults to **30 s**) |
+
+Row 43 matters as much as row 34: `dotenv-cli` is what `start.bat` depends on (`dotenv -e .env -- yarn start`), so a timeout there breaks startup rather than dependency installation.
+
+**Mitigated at the `setup.ps1` level, not by patching `init_website.bat`.** `Invoke-DeltaWebsiteInit` (Phase 3) sets `$env:YARN_NETWORK_TIMEOUT = '300000'` immediately before invoking the script and restores the previous value (normally: removes the variable) in a `finally` block, so it applies to that one call and does not leak into the DELTA runtime the installer later starts. Yarn Classic merges any `YARN_*` environment variable into its own configuration — `BaseRegistry.mergeEnv('yarn_')`, which strips the prefix and maps `_` to `-` — so `YARN_NETWORK_TIMEOUT` resolves as the `network-timeout` option that `RequestManager` uses for its socket timeout. Verified directly against 1.22.22: `yarn config get network-timeout` reports `undefined` normally and `300000` with the variable set.
+
+Because Yarn builds this configuration the same way for every subcommand, one environment variable covers both `yarn install --production` and `yarn global add dotenv-cli` — which a per-command edit to the `.bat` file would not, and which is the main reason this was chosen over rewriting the script or running a patched temporary copy of it. An explicit `--network-timeout` flag would still take precedence if `init_website.bat` ever grows one, which is the correct ordering. The value is a ceiling on an *idle socket*, not on total install duration, so a healthy network never reaches it; the only cost is that a genuinely dead connection takes 5 minutes to surface instead of 30 seconds.
+
+**Residual risk:** `init_website.sh` on Linux, and either script run standalone outside `setup.ps1`, still use Yarn's 30-second default. Committing `yarn.lock` (Risk 1) reduces exposure by removing the resolution round-trips, but does not remove the tarball fetches themselves.
+
+## Package registry certificate validation
+
+**Inferred**, and specific to the network a given server sits on rather than to anything in the artifact. On a network that intercepts TLS (a corporate proxy or filtering appliance re-signing traffic with its own CA), npm and Yarn cannot validate `registry.npmjs.org` / `registry.yarnpkg.com` against Node's bundled trust store, and `init_website.bat` fails during dependency download with one of:
+
+```
+error An unexpected error occurred: "https://registry.yarnpkg.com/…: unable to get local issuer certificate".
+npm error code UNABLE_TO_GET_ISSUER_CERT_LOCALLY
+```
+
+The correct fix is to trust the intercepting CA on the server (`NODE_EXTRA_CA_CERTS`, or importing it into the machine store where the tooling reads it). That is an environment decision, not something an installer can make on the operator's behalf — but the failure otherwise leaves an administrator with an installation that cannot proceed and an error whose cause is not obvious.
+
+**Handled at the `setup.ps1` level, and only ever with explicit consent.** `Invoke-DeltaWebsiteInit` (Phase 3) captures `init_website.bat`'s output while streaming it to the console, and on failure inspects it for certificate-validation errors specifically (`unable to get local issuer certificate`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, and the self-signed-chain forms of the same). Only then does it explain the trade-off and ask whether to retry with strict SSL verification disabled. The rules that keep this narrow:
+
+| Rule | Behaviour |
+|---|---|
+| Recognition is exact | Nothing else triggers it — `ESOCKETTIMEDOUT`, connection timeouts, DNS failures, and generic dependency failures all fail exactly as before. Disabling verification cannot fix any of them. |
+| The default is No | Bare Enter declines. Declining changes no configuration and reports the original failure unchanged. |
+| One retry, never a loop | Accepting re-runs `init_website.bat` itself (never a hand-reproduced copy of its commands) exactly once. If the retry fails — even with the same certificate error — the installer stops and reports that failure. |
+| Minimum configuration | `npm config set strict-ssl false` for npm, and `YARN_STRICT_SSL=false` in the environment for Yarn Classic — the same `YARN_*` merge mechanism used for `YARN_NETWORK_TIMEOUT` above, so nothing is written to `~/.yarnrc`. Verified against 1.22.22: `yarn config get strict-ssl` reports `false` only while the variable is set. |
+| Pre-existing configuration is preserved | The prior state is read first (`npm config get strict-ssl`, plus `npm config list` to tell an explicitly configured value from npm's default). An explicit value is written back afterwards; a value that was never configured is deleted again rather than being invented as `true`; and an administrator who had already disabled `strict-ssl` before DELTA setup has it neither changed nor re-enabled. Restoration runs whether the retry succeeded or failed. |
+
+**Residual risk:** a successful install through this path downloaded its packages without certificate verification, which is a real reduction in supply-chain assurance — it is offered as a deliberate, informed choice for a trusted network, not as a fix. Trusting the intercepting CA remains the correct resolution, and Linux (`init_website.sh`) has no equivalent handling. Regression coverage: `tools\test-delta-certificate-trust-recovery.ps1`.
+
 ## UTF-8 and locale at database creation
 
 **Inferred**, full detail in [04 — Database](04-database.md#utf-8-and-locale). Neither `createdb` invocation passes `-E UTF8`/`--locale`, so the new database silently inherits the PostgreSQL cluster's default. Given DELTA ships Arabic, Chinese, Russian, and Serbian locale files, a non-UTF8 cluster default is a real risk, not a theoretical one — and Windows PostgreSQL installers can default `initdb`'s locale to the host OS locale rather than a UTF8-guaranteed default some Linux distro packages use.
@@ -53,9 +104,18 @@ None of these block a human operator running the scripts interactively and corre
 
 ## Windows Service shutdown behavior
 
-**Inferred**, full detail in [05 — Windows service considerations](05-windows-compatibility-assessment.md#windows-service-considerations). The app's `SIGTERM`/`SIGINT` cleanup handler (`build/server/index.js:57586-57594`) may not fire under a headless NSSM/WinSW service configuration, since Windows has no native SIGTERM and NSSM's default stop escalation can fall through to a hard `TerminateProcess`.
+**RESOLVED — verified empirically.** This was previously *Inferred*: the concern was that the app's `SIGTERM`/`SIGINT` cleanup handler might not fire under a headless service wrapper, since Windows has no native SIGTERM and a stop can fall through to a hard `TerminateProcess`.
 
-**Mitigation:** during the [proof-of-concept validation](07-windows-poc.md#validation-checklist), explicitly stop the service and confirm the log-flush cleanup actually runs before relying on this in production. If it doesn't fire reliably, keep the service console-attached (NSSM's default) rather than configuring `AppNoConsole=1`.
+**What was actually observed**, against WinSW 2.12.0 running `node.exe` directly under the same configuration the installer now generates:
+
+- Stopping the service delivers a console CTRL+C, which Node surfaces as **`SIGINT`**. A dedicated signal-probe service recorded `SIGINT received` → `cleanup ran` → `exit handler ran code=0`.
+- Running DELTA itself under the service, WinSW logged `Process <pid> canceled with code 0` on a graceful stop. Exit code 0 is only reachable through the application's own `process.exit(0)` inside that handler — a `TerminateProcess` kill does not produce it.
+- The handler closes all cached Winston loggers plus `winston.loggers.close()` (and remote transports when `ENABLE_REMOTE_LOGGING` is set), so log flushing does occur on stop.
+- No orphaned `node.exe` remained after any stop, and the configured port was released.
+
+The service is therefore configured with a 30-second `<stoptimeout>` as the ceiling before WinSW would escalate — in practice the process exits in milliseconds.
+
+**Residual risk:** a stop that exceeds `<stoptimeout>` still escalates to a forced termination, as it must. That is the intended safety valve, not a defect.
 
 ## PostGIS installation
 

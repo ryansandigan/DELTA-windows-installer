@@ -30,7 +30,11 @@
     DELTA is still running can kill the server process without killing
     its launcher (Windows has no parent/child lifetime coupling), leaving
     an orphaned cmd.exe holding the DELTA runtime's redirected
-    stdout/stderr log handles open indefinitely.
+    stdout/stderr log handles open indefinitely. It also stops the
+    DeltaApp Windows service through the Service Control Manager before
+    any of that process-level cleanup, and is the one phase that removes
+    a DeltaApp registration outliving its own application directory -
+    every other service decision belongs to Phase 0.7, below.
 
     Phase 0.5 (Uninstall-DeltaNginx) and Phase 0.6 (Uninstall-DeltaIis) run
     next, in that order, and are each independently optional - neither
@@ -218,6 +222,14 @@ $Script:RebootRecommended   = $false
 # report.
 $Script:DeltaAppDirectoryResult = 'N/A'
 
+# The DELTA Windows Service's own outcome, reported separately from the
+# application directory's. They are genuinely different facts: the service
+# can be removed while the directory is preserved, or stopped and disabled
+# while everything else stays exactly where it is, and an operator reading
+# the summary needs to know which happened - particularly whether anything
+# will still try to start at the next boot.
+$Script:DeltaServiceResult = 'N/A'
+
 # The fixed backup destination root Uninstall-DeltaApplicationDirectory
 # compresses the DELTA application directory into before ever deleting it
 # - see that function's own header. A single, named constant rather than
@@ -245,6 +257,15 @@ $Script:DeltaBackupExclusionPatterns = @(
     '.next\cache'
     'tmp'
     'cache'
+    # The WinSW service wrapper and its generated XML. Excluded for the same
+    # reason node_modules is: both are fully reproducible rather than
+    # operator data - the wrapper is a pinned, checksum-verified download
+    # (.env.installer's WINSW_* keys) and the XML is regenerated from
+    # templates\service\delta-service.xml on every setup.ps1 run. Archiving
+    # a service binary that can only be restored into a service
+    # registration this backup does not contain would add weight to every
+    # backup for no recoverable value.
+    'service'
 )
 
 # Populated by Uninstall-DeltaNginx/Uninstall-DeltaIis. 'N/A' is the
@@ -329,17 +350,93 @@ function Stop-DeltaRuntimeBeforeUninstall {
       Stop-RunningDeltaInstance's own existing behavior, reused unchanged
       here - see that function's own header.
 
-      A no-op, idempotently, whenever no DELTA installation can be found
-      on this machine at all (Get-DeltaInstallPath) - uninstalling
-      PostGIS/PostgreSQL/Node.js on a machine that never had DELTA
-      deployed, or where the runtime directory is simply gone, has
-      nothing here to detect or stop - and equally when a DELTA
-      installation IS found but nothing matching it is currently
-      running, which is the normal case for a routine uninstall.
+      The process-level half of this phase is a no-op, idempotently,
+      whenever no DELTA installation can be found on this machine at all
+      (Get-DeltaInstallPath) - uninstalling PostGIS/PostgreSQL/Node.js on
+      a machine that never had DELTA deployed, or where the runtime
+      directory is simply gone, has nothing there to detect or stop - and
+      equally when a DELTA installation IS found but nothing matching it
+      is currently running, which is the normal case for a routine
+      uninstall.
+
+      The DeltaApp service half is deliberately NOT gated on that, because
+      a service registration can outlive the directory it points at. See
+      the comment on the check itself for why that case is both real and
+      only reachable here.
     #>
     Write-PhaseBanner 'Phase 0 - DELTA Runtime'
 
     $deltaInstallPath = Get-DeltaInstallPath
+
+    # The Windows service is handled BEFORE the "no installation found"
+    # early return below, not after it. A registration can outlive the
+    # directory it points at - an operator who deleted the DELTA directory
+    # by hand, or an earlier uninstall whose own removal only got as far as
+    # "marked for deletion" with no reboot since - and in that state
+    # Get-DeltaInstallPath correctly returns nothing (lib\DeltaInstaller.
+    # Common.ps1: the registry's InstallPath must still pass Test-Path, and
+    # C:\DELTA\.env must exist, for either fallback to resolve). Checking
+    # the service only after that return is what previously left such a
+    # registration untouched by the entire uninstall - still Automatic,
+    # pointed at a DeltaApp.exe that no longer exists, failing at every
+    # boot, and reported as 'N/A' in the summary.
+    #
+    # The Windows service is stopped FIRST, through the Service Control
+    # Manager, before any process-level cleanup is attempted. Two reasons,
+    # both specific to this phase:
+    #
+    #   - WinSW restarts a process that dies unexpectedly, so terminating a
+    #     supervised DELTA here would simply produce a new one, and the
+    #     "did everything stop" verification below would race it.
+    #   - This phase exists precisely because removing Node.js out from
+    #     under a running DELTA leaves file handles open and blocks later
+    #     directory deletion. A supervised restart loop during an uninstall
+    #     would make that worse, not better.
+    #
+    # When a DELTA installation IS present the service is only STOPPED here,
+    # never removed - removal stays tied to the application directory's own
+    # fate (Uninstall-DeltaApplicationDirectory, Phase 0.7), since that is
+    # where its executable and configuration live, and since an operator who
+    # keeps the directory gets the registration preserved-and-disabled
+    # rather than destroyed.
+    if (Test-DeltaServiceInstalled) {
+        Write-Step "Stopping the $($Script:DeltaServiceName) Windows service..."
+        if (Stop-DeltaWindowsService) {
+            Write-Success '    DELTA service stopped.'
+        }
+        else {
+            Write-Host ''
+            Write-Host 'The DELTA service did not stop within the timeout - continuing with direct process cleanup.' -ForegroundColor Yellow
+        }
+
+        if (-not $deltaInstallPath) {
+            # An orphaned registration is the one case removed here rather
+            # than in Phase 0.7: that phase resolves the same install path
+            # and returns just as early, so this is the only point in the
+            # run where it can be cleaned up at all. Nothing is prompted
+            # for, because none of the reasons Phase 0.7 asks apply - there
+            # is no directory to preserve, no database to back up first,
+            # and no reinstall path to protect. Leaving the registration is
+            # strictly worse for the operator than removing it.
+            #
+            # -AppRoot $null deliberately: with no directory there is no
+            # WinSW executable to unregister through, which is exactly the
+            # sc.exe delete fallback Uninstall-DeltaWindowsService already
+            # implements for a partially-removed installation. Its own
+            # verification and reboot-hint warning are reused unchanged, so
+            # a registration that survives removal reports the same way it
+            # does in Phase 0.7 rather than failing the run.
+            Write-Host ''
+            Write-Detail 'No DELTA installation directory is associated with this service registration.'
+            $Script:DeltaServiceResult = if (Uninstall-DeltaWindowsService -AppRoot $null) {
+                'Removed (orphaned registration - no DELTA installation found)'
+            }
+            else {
+                'Removal requested (registration still present - may clear after reboot)'
+            }
+        }
+    }
+
     if (-not $deltaInstallPath) {
         Write-Detail 'No DELTA installation found on this machine - nothing to stop.'
         return
@@ -778,12 +875,46 @@ function Uninstall-DeltaApplicationDirectory {
     if ($choice.Trim() -notin @('Y', 'y')) {
         Write-Host ''
         Write-Detail 'DELTA application directory preserved.'
+
+        # The application directory survives, but this uninstaller still
+        # removes Node.js unconditionally - so the DeltaApp service would be
+        # left set to Automatic, pointed at a node.exe that no longer
+        # exists, failing at every boot forever (with its bounded restart
+        # policy re-running that failure each time). Disabling it makes that
+        # state quiet without destroying anything: the registration, the
+        # service files, .env, uploads and the database all remain, and
+        # re-running setup.ps1 re-registers and re-enables the service, so
+        # reinstall-after-uninstall stays clean and idempotent.
+        if (Test-DeltaServiceInstalled) {
+            Write-Host ''
+            Write-Step 'Disabling the DELTA Windows Service...'
+            Set-DeltaServiceDisabled
+            $Script:DeltaServiceResult = 'Stopped and disabled (registration preserved)'
+            $Script:DeltaAppDirectoryResult = 'Preserved'
+            return
+        }
+
         $Script:DeltaAppDirectoryResult = 'Preserved'
         return
     }
 
     Write-Host ''
     $backupArchivePath = Backup-DeltaApplicationDirectory -DeltaInstallPath $deltaInstallPath
+
+    # Unregistered BEFORE the directory is deleted, never after: the WinSW
+    # executable and its XML live under <AppRoot>\service, so deleting the
+    # directory first would strip WinSW of the very binary needed to
+    # unregister cleanly and leave behind a service registration pointing at
+    # a missing file - removable only by hand with sc.exe.
+    Write-Host ''
+    if (Test-DeltaServiceInstalled) {
+        $Script:DeltaServiceResult = if (Uninstall-DeltaWindowsService -AppRoot $deltaInstallPath) {
+            'Removed'
+        }
+        else {
+            'Removal requested (registration still present - may clear after reboot)'
+        }
+    }
 
     Write-Host ''
     Write-Step 'Deleting the DELTA application directory...'
@@ -2359,6 +2490,9 @@ function Write-UninstallSummary {
     Write-Host ''
     Write-Host 'DELTA application directory:'
     Write-Host $Script:DeltaAppDirectoryResult
+    Write-Host ''
+    Write-Host 'DELTA Windows service:'
+    Write-Host $Script:DeltaServiceResult
     Write-Host ''
     Write-Host 'NGINX:'
     Write-Host $Script:NginxResult

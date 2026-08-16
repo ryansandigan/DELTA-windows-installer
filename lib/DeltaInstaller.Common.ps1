@@ -66,6 +66,16 @@ $Script:DeltaSkipManagedInstanceRestart = $false
 # than three separately-hardcoded copies of it.
 $Script:DefaultDeltaRuntimeRoot = 'C:\DELTA'
 
+# The single, authoritative registry location every DELTA installer utility
+# reads and writes - setup.ps1 (Register-DeltaInstallation's InstallPath/
+# Version, Get-/Set-DeltaManagedInstanceRestartPolicy's operator preference),
+# Get-DeltaInstallPath below, and lib\DeltaInstaller.Service.ps1's
+# intentional-disable marker (Set-/Clear-/Test-DeltaServiceDisabledByUninstall).
+# Defined HERE, in the shared file every one of those loads, rather than
+# separately in each - the path had already been written out by hand in two
+# places before this, which is exactly the drift this constant removes.
+$Script:DeltaRegistryKeyPath = 'HKLM:\SOFTWARE\PreventionWeb\DELTA'
+
 # ---------------------------------------------------------------------------
 # Console output vocabulary
 # ---------------------------------------------------------------------------
@@ -747,8 +757,7 @@ function Get-DeltaInstallPath {
         3. $null if neither of the above found anything real.
     #>
 
-    $registryKeyPath = 'HKLM:\SOFTWARE\PreventionWeb\DELTA'
-    $registryEntry = Get-ItemProperty -LiteralPath $registryKeyPath -Name 'InstallPath' -ErrorAction SilentlyContinue
+    $registryEntry = Get-ItemProperty -LiteralPath $Script:DeltaRegistryKeyPath -Name 'InstallPath' -ErrorAction SilentlyContinue
     $registryInstallPath = Get-RegistryPropertyValue -InputObject $registryEntry -Name 'InstallPath'
     if ($registryInstallPath -and (Test-Path -LiteralPath $registryInstallPath)) {
         return $registryInstallPath
@@ -1332,6 +1341,25 @@ function Confirm-DeltaRuntimeNotRunning {
     }
 
     Write-Step 'Checking for an already-running DELTA instance...'
+
+    # Service-managed installations are stopped through the Service Control
+    # Manager FIRST, never by terminating the process. Killing a supervised
+    # process would simply cause WinSW to restart it - the installer would
+    # be fighting the supervisor it installed, and the "port is now free"
+    # check below could pass or fail depending purely on timing.
+    #
+    # Direct termination is still attempted afterwards, but only ever as a
+    # narrowly-scoped cleanup of what the SCM stop cannot reach: a legacy
+    # instance from before this installation was service-managed, an
+    # orphaned cmd.exe launcher, or a stop that genuinely timed out.
+    # Stop-RunningDeltaInstance is a no-op when nothing matches, so this
+    # stays correct for a service-managed installation that stopped cleanly.
+    if (Test-DeltaServiceInstalled) {
+        if (-not (Stop-DeltaWindowsService)) {
+            Write-Detail 'The DELTA service did not stop within the timeout - falling back to direct process cleanup.'
+        }
+    }
+
     Stop-RunningDeltaInstance -DeltaRuntimeRoot $Script:DeltaRuntimeRoot
 
     $portCheck = Test-TcpPortAvailable -Port $Script:DeltaBackendPort
@@ -1360,6 +1388,20 @@ function Get-DeltaStartupLogPaths {
       again, on a restart triggered from setup-nginx.ps1/setup-iis.ps1 any
       more than on setup.ps1's own original call.
     #>
+    # Once DELTA is service-managed, its stdout/stderr are captured by WinSW
+    # under different names in the same directory - the legacy
+    # delta-startup-*.log files are no longer written at all, so pointing a
+    # failure diagnostic at them would send an operator to a stale file from
+    # a previous, pre-service run. Resolved here, at the one place both the
+    # writer and the reader agree on these paths.
+    if (Test-DeltaServiceInstalled) {
+        $serviceLogPaths = Get-DeltaServiceLogPaths -AppRoot $Script:DeltaRuntimeRoot
+        return [PSCustomObject]@{
+            StdOut = $serviceLogPaths.StdOut
+            StdErr = $serviceLogPaths.StdErr
+        }
+    }
+
     $logsDirectory = Join-Path -Path $Script:DeltaRuntimeRoot -ChildPath 'logs'
     return [PSCustomObject]@{
         StdOut = Join-Path -Path $logsDirectory -ChildPath 'delta-startup-stdout.log'
@@ -1413,6 +1455,19 @@ function Start-DeltaRuntimeForValidation {
     $logPaths = Get-DeltaStartupLogPaths
     Write-Detail "Standard output: $($logPaths.StdOut)"
     Write-Detail "Standard error : $($logPaths.StdErr)"
+
+    # Service-managed installations start through the Service Control
+    # Manager. The detached Start-Process path below is retained ONLY for
+    # installations that predate the Windows Service (and for the window
+    # during migration before the service has been registered) - the two
+    # must never both be trying to own DELTA's lifecycle, which is why this
+    # is an either/or rather than an additional step.
+    if (Test-DeltaServiceInstalled) {
+        Write-Detail "Service: $($Script:DeltaServiceName)"
+        Start-DeltaWindowsService
+        Write-Success '    DELTA service started.'
+        return
+    }
 
     try {
         Start-Process -FilePath 'cmd.exe' `
@@ -1546,7 +1601,19 @@ function Confirm-DeltaRuntimeStarted {
             $hasBeenObservedRunning = $true
         }
         elseif ($hasBeenObservedRunning) {
-            Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it finished starting.')
+            # "Was running, now isn't" means the process died - but under a
+            # supervisor that is not automatically fatal, because WinSW may
+            # legitimately be restarting it (its configured restart delay is
+            # 10 seconds, comfortably inside this wait). Failing here would
+            # turn a successful recovery into a reported installation
+            # failure. The service itself still being Running is what
+            # distinguishes "being restarted" from "gave up": once the
+            # restart policy is exhausted the SCM stops the service, and the
+            # check below then fails exactly as it always did.
+            if (-not (Test-DeltaSupervisedRestartInProgress)) {
+                Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it finished starting.')
+            }
+            $hasBeenObservedRunning = $false
         }
         if (-not (Test-TcpPortAvailable -Port $Script:DeltaBackendPort).Available) {
             $isListening = $true
@@ -1565,7 +1632,12 @@ function Confirm-DeltaRuntimeStarted {
     $isResponding = $false
     while ((Get-Date) -lt $httpDeadline) {
         if (-not (Get-RunningDeltaProcesses -DeltaRuntimeRoot $Script:DeltaRuntimeRoot)) {
-            Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it responded over HTTP.')
+            # Same supervisor allowance as the port loop above - see there
+            # for why a momentarily-absent process is not proof of failure
+            # once something is actively restarting it.
+            if (-not (Test-DeltaSupervisedRestartInProgress)) {
+                Stop-Setup (Get-DeltaStartupFailureMessage -Reason 'DELTA exited before it responded over HTTP.')
+            }
         }
         if (Test-DeltaHttpEndpoint -Url $url) {
             $isResponding = $true
@@ -1733,7 +1805,111 @@ function Backup-DeltaEnvironmentFile {
 
     $backupPath = "$Path.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
     Copy-Item -LiteralPath $Path -Destination $backupPath -Force
+
+    # The backup is a byte-for-byte copy of a file holding DATABASE_URL,
+    # SESSION_SECRET and SMTP_PASS, and Copy-Item creates a NEW file, which
+    # therefore inherits the application directory's own ACL rather than the
+    # hardened one the source file carries. Without this the hardening
+    # applied to .env would be trivially defeated by reading the .bak file
+    # sitting next to it - so every backup is hardened the same way, at the
+    # one place backups are actually created.
+    Protect-DeltaSecretFile -Path $backupPath
+
     Write-Detail "Existing .env backed up to: $backupPath"
+}
+
+function Protect-DeltaSecretFile {
+    <#
+      Restricts $Path to Administrators + SYSTEM (+ any $ReadAccounts), so a
+      file containing deployment secrets is not readable by every ordinary
+      local user.
+
+      Why this exists: a deployed .env inherits the application directory's
+      ACL, which on a default installation grants BUILTIN\Users
+      ReadAndExecute - confirmed directly against a real deployment, where
+      DATABASE_URL (including the database password), SESSION_SECRET and
+      SMTP_PASS were all readable by any local account on the machine. That
+      predates the Windows Service work and is independent of it, but the
+      service work is what introduces a dedicated, least-privileged identity
+      that needs an explicit grant here anyway, which makes this the right
+      place to close it.
+
+      Mechanics, in order:
+        1. /inheritance:d converts the inherited ACEs into explicit ones, so
+           the entries that should survive (Administrators, SYSTEM) are
+           preserved on the file itself before anything is removed. Removing
+           an inherited ACE directly is not possible - it has to be
+           materialized first.
+        2. /remove:g drops the broad principals. Each is attempted
+           independently and an absent principal is simply a no-op, so this
+           is idempotent and safe to re-run on an already-hardened file.
+        3. Administrators/SYSTEM are re-granted explicitly rather than
+           merely assumed to have survived step 1 - a file whose owner had
+           already stripped them would otherwise be left unmanageable by the
+           installer itself, and by backup/update/reinstall tooling.
+
+      $ReadAccounts receives Read (not Modify): the DELTA service account
+      only ever needs to read .env, never write it - .env is installer- and
+      operator-owned.
+
+      Deliberately NON-FATAL on failure (a warning, never Stop-Setup). This
+      hardens an existing file's permissions; it is not a precondition for a
+      working installation, and aborting a complete, otherwise-successful
+      install because icacls could not adjust an ACL (an unusual volume, a
+      restrictive parent policy) would trade a real working deployment for a
+      permissions nicety. The failure is reported loudly instead of being
+      swallowed, so it is never invisible.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$ReadAccounts = @()
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return
+    }
+
+    $broadPrincipals = @('BUILTIN\Users', 'Everyone', 'NT AUTHORITY\Authenticated Users')
+
+    try {
+        $output = & icacls.exe $Path /inheritance:d /C 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "icacls /inheritance:d failed: $(($output | Out-String).Trim())"
+        }
+
+        foreach ($principal in $broadPrincipals) {
+            # An identity that isn't on the ACL at all is a normal, expected
+            # outcome here (most files never carry an Everyone ACE), so a
+            # non-zero exit from an individual removal is not treated as a
+            # failure of the whole operation.
+            $null = & icacls.exe $Path /remove:g $principal /C 2>&1
+        }
+
+        $grants = @('BUILTIN\Administrators:(F)', 'NT AUTHORITY\SYSTEM:(F)')
+        foreach ($account in $ReadAccounts) {
+            if ($account) { $grants += "${account}:(R)" }
+        }
+
+        foreach ($grant in $grants) {
+            $output = & icacls.exe $Path /grant $grant /C 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "icacls /grant $grant failed: $(($output | Out-String).Trim())"
+            }
+        }
+
+        Write-Detail "Restricted to Administrators/SYSTEM$(if ($ReadAccounts) { ' + ' + ($ReadAccounts -join ', ') }): $Path"
+    }
+    catch {
+        Write-Host ''
+        Write-Host 'WARNING' -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host "Could not restrict permissions on a file containing secrets:" -ForegroundColor Yellow
+        Write-Host "  $Path" -ForegroundColor Yellow
+        Write-Host "  $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host 'Installation continues, but this file may be readable by ordinary local users.' -ForegroundColor Yellow
+        Write-Host ''
+    }
 }
 
 function Update-ManagedEnvironmentLines {
@@ -3911,3 +4087,249 @@ function Test-DeltaDatabaseExists {
 
     return (($output | Out-String).Trim() -eq '1')
 }
+
+# ---------------------------------------------------------------------------
+# Reusable dependency installers (sibling installer caches)
+# ---------------------------------------------------------------------------
+#
+# Every downloaded dependency in this project is cached in the entry-point
+# script's own .\installers directory (setup.ps1's $Script:InstallersDirectory
+# and the identical definitions in setup-nginx.ps1/setup-iis.ps1), and every
+# Get-*Installer/Get-*Package function follows the same two-step shape:
+# "return the cached file if it is already there, otherwise download it".
+#
+# Operators routinely keep several unpacked copies of this installer side by
+# side (an extracted 1.0.12 release next to a 1.0.13 one, a manual backup, a
+# scratch directory), each with its own populated installers\ cache holding
+# the very same ~350 MB PostgreSQL installer. The two functions below are the
+# single place that "otherwise" step first looks at those neighbouring caches,
+# so a re-download only happens when no copy of the file exists anywhere
+# beside this checkout.
+
+function Find-DeltaReusableInstaller {
+    <#
+      Returns every sibling-cached copy of $FileName that could be reused,
+      most obvious candidate first, or an empty array when there is none.
+
+      "Sibling" means a directory that sits next to the installer directory
+      that owns $DestinationDirectory - i.e. for a $DestinationDirectory of
+      C:\DELTA-windows-installer\installers, every C:\<anything>\installers.
+      The sibling's own NAME is deliberately irrelevant: operators name these
+      copies whatever they like (DELTA-windows-installer-1.0.12, old-delta,
+      installer-backup, potpot), and requiring a naming pattern would defeat
+      the point. The cache subdirectory name is taken from
+      $DestinationDirectory's own leaf rather than hardcoded as 'installers',
+      so this keeps matching whatever the callers cache into.
+
+      Three deliberate limits, each of which is what keeps this cheap and
+      predictable rather than a filesystem crawl:
+
+        - EXACT filename match only. This mirrors Get-NginxPackage's own
+          reasoning (setup-nginx.ps1): the whole point of pinning a version
+          is that the pinned file is what gets installed, so a
+          node-v22.*.msi left in a neighbouring cache must never satisfy a
+          request for node-v24.18.0-x64.msi.
+        - ONE level down, on both sides: the parent is listed non-recursively,
+          and only <sibling>\<cache>\<file> is probed. Nothing scans the drive.
+        - The caller's own installer directory is excluded, so the file that
+          is already missing from the local cache can never be "found" there.
+
+      Zero-length files are skipped: every download path in this project
+      already treats a zero-byte result as a failed download, so a truncated
+      neighbouring copy is not a candidate here either.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FileName,
+        [Parameter(Mandatory)][string]$DestinationDirectory
+    )
+
+    # Normalized once, up front, because both the sibling exclusion and the
+    # parent lookup below are path comparisons - and a caller that passed a
+    # relative path (or one with a trailing separator) must not silently
+    # compare unequal to the same directory written differently.
+    try {
+        $destinationFull = [System.IO.Path]::GetFullPath($DestinationDirectory).TrimEnd('\', '/')
+    }
+    catch {
+        return @()
+    }
+
+    $cacheDirectoryName = Split-Path -Path $destinationFull -Leaf
+    $installerRoot      = Split-Path -Path $destinationFull -Parent
+    if ([string]::IsNullOrWhiteSpace($cacheDirectoryName) -or [string]::IsNullOrWhiteSpace($installerRoot)) {
+        return @()
+    }
+
+    # The directory the siblings live in. Empty when $installerRoot is
+    # already a drive root, which simply means there are no siblings.
+    $searchRoot = Split-Path -Path $installerRoot -Parent
+    if ([string]::IsNullOrWhiteSpace($searchRoot) -or -not (Test-Path -LiteralPath $searchRoot -PathType Container)) {
+        return @()
+    }
+
+    $installerRootNormalized = $installerRoot.TrimEnd('\', '/')
+
+    # -ErrorAction SilentlyContinue, not error suppression for its own sake:
+    # the parent is frequently a drive root, whose entries include
+    # directories this process legitimately cannot open (System Volume
+    # Information and friends). An unreadable neighbour is simply not a
+    # candidate; it is not a reason to fail an installation.
+    $siblings = @(Get-ChildItem -LiteralPath $searchRoot -Directory -ErrorAction SilentlyContinue)
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    foreach ($sibling in $siblings) {
+        $siblingPath = $sibling.FullName.TrimEnd('\', '/')
+
+        if ($siblingPath.Equals($installerRootNormalized, [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+
+        $candidatePath = Join-Path -Path (Join-Path -Path $siblingPath -ChildPath $cacheDirectoryName) -ChildPath $FileName
+
+        if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf -ErrorAction SilentlyContinue)) {
+            continue
+        }
+
+        $candidateItem = Get-Item -LiteralPath $candidatePath -ErrorAction SilentlyContinue
+        if (-not $candidateItem -or $candidateItem.Length -eq 0) {
+            continue
+        }
+
+        # Test-Path/Join-Path are both purely textual, so a candidate that
+        # differs only in casing or separators from the destination would
+        # otherwise survive the sibling exclusion above.
+        if ($candidateItem.FullName.Equals((Join-Path -Path $destinationFull -ChildPath $FileName), [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+
+        $candidates.Add($candidateItem.FullName)
+    }
+
+    return @($candidates)
+}
+
+function Copy-DeltaReusableInstaller {
+    <#
+      Copies the first usable sibling-cached copy of $FileName into
+      $DestinationDirectory and returns its new path, or $null when there is
+      nothing to reuse - in which case the caller simply proceeds with its
+      existing download, unchanged.
+
+      Called ONLY when $FileName is missing from the local cache; the
+      "already cached" branch of each Get-*Installer function stays exactly
+      as it was. (A destination file that exists anyway is returned as-is
+      rather than overwritten - reuse must never destroy a good cached file.)
+
+      $Validate is the caller's OWN existing integrity check, passed in
+      rather than reimplemented here: WinSW's mandatory SHA-256 comparison
+      (lib\DeltaInstaller.Service.ps1) and PostGIS's published-MD5 check
+      (setup.ps1) are the two that exist today, and neither is weakened or
+      duplicated by this path. A candidate that fails it is deleted again and
+      the search continues with the next one, so a single stale neighbouring
+      copy cannot block reuse of a good one - and if every candidate fails,
+      this returns $null and the normal download runs. That is the whole
+      fallback contract: reuse is an optimization, never a new failure mode.
+
+      No prompt: this is automatic by design.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FileName,
+        [Parameter(Mandatory)][string]$DestinationDirectory,
+        [scriptblock]$Validate
+    )
+
+    $destinationPath = Join-Path -Path $DestinationDirectory -ChildPath $FileName
+
+    if (Test-Path -LiteralPath $destinationPath -PathType Leaf) {
+        return $destinationPath
+    }
+
+    $candidates = @(Find-DeltaReusableInstaller -FileName $FileName -DestinationDirectory $DestinationDirectory)
+
+    if ($candidates.Count -eq 0) {
+        return $null
+    }
+
+    Write-Step 'Installer not found in current cache. Searching sibling installer directories...'
+
+    foreach ($candidate in $candidates) {
+        Write-Detail "Found reusable installer: $candidate"
+        Write-Detail "Copying to current installer cache: $destinationPath"
+
+        if (-not (Test-Path -LiteralPath $DestinationDirectory -PathType Container)) {
+            New-Item -Path $DestinationDirectory -ItemType Directory -Force | Out-Null
+        }
+
+        try {
+            Copy-Item -LiteralPath $candidate -Destination $destinationPath -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Detail "Could not copy that file ($($_.Exception.Message)) - ignoring it."
+            Remove-Item -LiteralPath $destinationPath -Force -ErrorAction SilentlyContinue
+            continue
+        }
+
+        $copiedItem = Get-Item -LiteralPath $destinationPath -ErrorAction SilentlyContinue
+        if (-not $copiedItem -or $copiedItem.Length -eq 0) {
+            Write-Detail 'The copied file is missing or empty - ignoring it.'
+            Remove-Item -LiteralPath $destinationPath -Force -ErrorAction SilentlyContinue
+            continue
+        }
+
+        if ($Validate) {
+            $isValid = $false
+            try {
+                $isValid = [bool](& $Validate $destinationPath)
+            }
+            catch {
+                Write-Detail "Validation of the copied installer failed ($($_.Exception.Message))."
+                $isValid = $false
+            }
+
+            if (-not $isValid) {
+                Write-Detail 'The copied installer did not pass integrity validation - discarding it.'
+                Remove-Item -LiteralPath $destinationPath -Force -ErrorAction SilentlyContinue
+                continue
+            }
+        }
+
+        Write-Success '    Reused an already-downloaded installer.'
+        return $destinationPath
+    }
+
+    Write-Detail 'No reusable installer could be used - falling back to downloading it.'
+    return $null
+}
+
+# ---------------------------------------------------------------------------
+# DELTA Windows Service
+# ---------------------------------------------------------------------------
+#
+# Loaded LAST, deliberately, and from here rather than from each entry-point
+# script.
+#
+# Several functions above are now service-aware - Confirm-DeltaRuntimeNotRunning
+# (stop through the Service Control Manager before ever terminating a
+# process), Start-DeltaRuntimeForValidation (start the service instead of a
+# detached cmd.exe), Confirm-DeltaRuntimeStarted (don't mistake a supervised
+# restart for a crash), and Get-DeltaStartupLogPaths (point at WinSW's own
+# capture). Restart-DeltaRuntimeForReverseProxy composes exactly those three
+# and therefore became service-aware without changing a line of its own.
+#
+# That last point is what makes this the right place for the dot-source:
+# setup-nginx.ps1, setup-iis.ps1, and doctor.ps1 all reach this file (directly
+# or through lib\DeltaDoctor.*.ps1) and load nothing else, so pulling the
+# service module in here gives every one of them correct service behaviour
+# with no change to any of them - which is precisely the constraint that the
+# reverse proxy scripts stay independent of DELTA process management.
+#
+# Loaded at the END of this file, not the top, because the service module
+# calls back into the helpers defined above (Write-Step, Stop-Setup,
+# Wait-Until, Get-EnvFileValue, ConvertFrom-DatabaseUrl, Test-TcpPortAvailable,
+# Get-RunningDeltaProcesses, Protect-DeltaSecretFile). PowerShell resolves
+# function calls at invocation time rather than at parse time, so the order
+# only actually matters for the code the service module runs *while loading* -
+# but keeping the dependency direction visible and one-way here is what stops
+# this from becoming a dot-source cycle later.
+. (Join-Path -Path $Script:ProjectRoot -ChildPath 'lib\DeltaInstaller.Service.ps1')

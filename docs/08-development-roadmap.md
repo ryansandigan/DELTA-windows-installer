@@ -46,7 +46,7 @@ Keeping these as three separate functions (rather than one large `Install-Postgr
 | Phase 2C — Database Initialization | ⬜ Planned | Absorbs the [UTF-8/locale risk](06-deployment-risks.md#utf-8-and-locale-at-database-creation). |
 | Phase 3 — Yarn & Dependencies | 🔶 In progress | Renumbered from Phase 4 when PostgreSQL split into 2A/2B/2C. Wraps `init_website.bat` idempotently rather than fixing it directly — see phase detail below. |
 | Phase 4 — Environment Configuration | ⬜ Planned | Renumbered from Phase 6. `.env` PORT resolution/update (`Resolve-DeltaApplicationPort`, `Update-DeltaApplicationPortEnvironment`) landed early as part of the startup-validation work below, ahead of the rest of this phase. |
-| Phase 5 — Windows Service | ⬜ Planned | Renumbered from Phase 7. An **interim, non-supervised stand-in** already exists (`Start-DeltaRuntimeForValidation` / `Confirm-DeltaRuntimeStarted`, see that section's own detail below) — `setup.ps1` starts and verifies DELTA automatically today, but with no restart policy, crash supervision, or watchdog. This phase supersedes that stand-in; it doesn't start from nothing. |
+| Phase 5 — Windows Service | ✅ Implemented | `lib\DeltaInstaller.Service.ps1` + `templates\service\delta-service.xml`, installed by `setup.ps1`'s `Install-DeltaWindowsService`. WinSW-supervised `DeltaApp` service running `node.exe` directly under `NT SERVICE\DeltaApp`, Automatic. Supersedes the interim stand-in — `Start-DeltaRuntimeForValidation` now starts the service, and `Confirm-DeltaRuntimeStarted` still owns readiness. Pending end-to-end reboot validation on a real target. |
 | Phase 6 — Validation | ⬜ Planned | Renumbered from Phase 8. |
 
 Legend: ✅ Completed · 🔶 In progress · ⬜ Planned
@@ -243,10 +243,11 @@ Legend: ✅ Completed · 🔶 In progress · ⬜ Planned
 
 **Expected output:** `Install-DeltaDependencies` function; a working `node_modules/` and a resolvable `dotenv` command in the current session.
 
-**What's actually implemented (validation-phase approach, not the original plan):** `Install-DeltaDependencies` currently **wraps and invokes `init_website.bat` unmodified** rather than porting corrected logic into PowerShell — this was a deliberate, explicit choice during first-round Windows validation to unblock the fresh-install/repeat-install flow now, with the `.bat` file's own known gaps (missing `--force`, no lockfile check) still open. Two things it does add:
+**What's actually implemented (validation-phase approach, not the original plan):** `Install-DeltaDependencies` currently **wraps and invokes `init_website.bat` unmodified** rather than porting corrected logic into PowerShell — this was a deliberate, explicit choice during first-round Windows validation to unblock the fresh-install/repeat-install flow now, with the `.bat` file's own known gaps (missing `--force`, no lockfile check) still open. Three things it does add:
 
 - **Unconditional dependency reconciliation, not an existence-based gate:** an earlier revision of this phase used `Test-DeltaRuntimeDependenciesInstalled` (Yarn resolvable + `C:\DELTA\node_modules` non-empty + dotenv-cli present in Yarn's global bin) to skip `init_website.bat` entirely on a repeat run. That check was removed after a code review found it unsound for `Update`/`Reinstall`: `Install-DeltaRuntime` always redeploys the latest `package.json` immediately before this phase runs, but the existence check only asked whether *some* `node_modules` was present, never whether it matched the `package.json` that had just been overwritten — so a dependency bump in a new runtime version could silently be skipped, leaving stale `node_modules` in place. A follow-up implementation review of `init_website.bat` itself confirmed every operation it performs delegates to `npm install --global yarn`, `yarn install --production`, and `yarn global add dotenv-cli` - all natively idempotent, none of them destructive to application state - so `Install-DeltaDependencies` now runs `init_website.bat` unconditionally on every phase 3 invocation (fresh install, upgrade, and recreate alike) and lets Yarn itself determine whether anything actually needs installing, updating, or leaving unchanged, rather than the installer trying to predict that from `node_modules`' mere presence.
 - **The dotenv-cli PATH fix** (`Add-YarnGlobalBinToPersistentPath`): confirmed during Windows validation that dotenv-cli lands in Yarn Classic's own global bin, not npm's (the latter is already on PATH via Node's own installer) — nothing else puts Yarn's global bin on PATH, so `start.bat`'s `dotenv -e .env -- yarn start` failed to resolve `dotenv` not just in a fresh session but in *any* session after the one that ran `init_website.bat`, including after a reboot. A first version of this function only updated the current process's `$env:Path`, which is exactly why that gap survived past the run that installed dotenv-cli — confirmed by a full end-to-end validation pass that reproduced `start.bat` failing in a brand-new console even though `yarn global list` showed `dotenv-cli` genuinely installed. The fix now appends Yarn's global bin directory to the persistent *User* PATH (`[Environment]::SetEnvironmentVariable(...,'User')`, not just `$env:Path`) — idempotently, skipping the write entirely if the directory is already present — then refreshes the current session via `Update-SessionEnvironmentPath` so this run doesn't need a new shell either.
+- **Certificate-trust recovery** (`Invoke-DeltaWebsiteInit`): `init_website.bat`'s output is captured while it streams to the console, and a failure whose output names a certificate-validation error — `unable to get local issuer certificate`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, or the self-signed-chain forms — raises a single `[y/N]` prompt (defaulting to No) offering one retry with strict SSL verification disabled for npm (`npm config set strict-ssl false`) and Yarn (`YARN_STRICT_SSL=false`). The retry re-runs `init_website.bat` itself, exactly once, and the prior `strict-ssl` configuration is restored afterwards whether it succeeded or failed. No other failure class triggers it. Full rationale and the safety rules: [06 — Package registry certificate validation](06-deployment-risks.md#package-registry-certificate-validation); regression coverage in `tools\test-delta-certificate-trust-recovery.ps1`.
 
 **Work items still open:**
 
@@ -293,7 +294,20 @@ Legend: ✅ Completed · 🔶 In progress · ⬜ Planned
 
 ## Phase 5 — Windows Service
 
-**Status:** ⬜ Planned
+**Status:** ✅ Implemented (pending end-to-end reboot validation on a real target)
+
+**Decision recorded — WinSW, not NSSM.** WinSW's declarative XML fits this repository's existing template-rendering convention (`templates\nginx\*`, `templates\iis\web.config`), which is what makes "regenerate and compare, rewrite only on change" idempotency provable rather than asserted; NSSM's imperative `nssm set` registry writes cannot give that. WinSW is also a single pinned, SHA-256-verified download, matching how every other component is acquired (`.env.installer` + `installers\` cache). The `WinSW.NET461.exe` build is used (656 KB, versus ~18 MB self-contained) because .NET Framework 4.6.1+ ships with Server 2022/2025 and Windows 11. The binary is **not** code-signed, so the pinned digest is mandatory and a mismatch is fatal.
+
+**What was built:**
+
+- `lib\DeltaInstaller.Service.ps1` — acquisition, rendering, registration, identity, ACLs, lifecycle, and the unified `Get-DeltaRuntimeState`. No raw `sc.exe`/WinSW call exists anywhere else.
+- `templates\service\delta-service.xml` — the generated service definition.
+- `tools\test-delta-service-definition.ps1` — 46 cases covering rendering, spaced/XML-significant paths, no hardcoded `C:\DELTA` or port, and the runtime state mapping.
+
+**Resolved along the way:** the graceful-shutdown risk ([06 #5](06-deployment-risks.md#windows-service-shutdown-behavior)) is closed with observed evidence, and the CLI path documented in [02](02-windows-installation.md#windows-service-installation) (`dist\cli.js`) was found to be wrong for the shipped version — it is now resolved dynamically from the package's own `bin` field.
+
+<details>
+<summary>Original plan (for reference)</summary>
 
 **Objective:** Run the DELTA Node process as a supervised Windows Service — see [02 — Windows Service installation](02-windows-installation.md#windows-service-installation) for the manual reference procedure this phase automates, and [06 — Windows Service shutdown behavior](06-deployment-risks.md#windows-service-shutdown-behavior) for the one open risk this phase must specifically resolve, not just wrap.
 
@@ -313,11 +327,13 @@ Legend: ✅ Completed · 🔶 In progress · ⬜ Planned
 
 **Checklist:**
 
-- [ ] NSSM or WinSW evaluation (decision recorded here once made)
-- [ ] Service registration
-- [ ] Automatic restart
-- [ ] Logging
-- [ ] Graceful shutdown validation
+- [x] NSSM or WinSW evaluation (decision recorded above)
+- [x] Service registration
+- [x] Automatic restart
+- [x] Logging
+- [x] Graceful shutdown validation
+
+</details>
 
 ---
 

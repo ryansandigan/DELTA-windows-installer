@@ -2,6 +2,23 @@
 
 All notable changes to the DELTA Windows Installer will be documented in this file.
 
+## [1.0.13]
+
+### Added
+
+- DELTA now runs as a Windows Service (`DeltaApp`) and starts automatically after a server reboot, without requiring an interactive user session.
+- Added automatic recovery for dependency installation failures caused by certificate trust issues. When detected, the installer can optionally retry with strict SSL verification temporarily disabled, with administrator confirmation.
+- Dependency installers can now be reused from neighbouring installer directories when available, reducing unnecessary downloads between installer releases.
+
+### Changed
+
+- DELTA Start, Stop, and Restart operations now use the Windows Service when available.
+
+### Fixed
+
+- Increased the Yarn dependency download timeout to improve installation reliability on slower or unstable networks and reduce `ESOCKETTIMEDOUT` failures.
+- Improved protection of DELTA environment configuration files containing application credentials.
+
 ## [1.0.12]
 
 ### Changed

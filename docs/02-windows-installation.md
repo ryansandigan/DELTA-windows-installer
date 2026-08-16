@@ -77,7 +77,7 @@ Steps 1–2 above are being replaced by a PowerShell installer (`setup.ps1`), bu
 | PostgreSQL server installation | `setup.ps1` — `Install-PostgreSql` (**Phase 2A**) | ✅ Implemented — detects an existing install, silently installs via the EDB installer's own unattended mode, validates the service and `psql`/`postgres` binaries. If a matching install is already running, offers to reuse it instead — see [§Reusing an existing PostgreSQL installation](#reusing-an-existing-postgresql-installation). |
 | PostGIS installation | Not yet automated (**Phase 2B**, planned) | ⬜ Still manual — install via Stack Builder as described in [Prerequisites](#prerequisites) above |
 | DELTA database initialization | Not yet automated (**Phase 2C**, planned) | ⬜ Still manual — continue using `init_db.bat` per [§Running the installer scripts](#running-the-installer-scripts) below |
-| Application dependency installation (Yarn, `node_modules`, `dotenv-cli`) | `setup.ps1` — `Install-DeltaDependencies` (**Phase 3**) | ✅ Implemented, idempotently — skips `init_website.bat` entirely if dependencies are already present. **Not yet a from-scratch fix**: it wraps the shipped `init_website.bat` as-is rather than correcting its known gaps at the source — see [08 §Phase 3](08-development-roadmap.md#phase-3--yarn--dependencies). Also applies a permanent, idempotent `dotenv-cli` PATH fix (`Add-YarnGlobalBinToPersistentPath`) — see [§Running the installer scripts](#running-the-installer-scripts) below. |
+| Application dependency installation (Yarn, `node_modules`, `dotenv-cli`) | `setup.ps1` — `Install-DeltaDependencies` (**Phase 3**) | ✅ Implemented, idempotently — skips `init_website.bat` entirely if dependencies are already present. **Not yet a from-scratch fix**: it wraps the shipped `init_website.bat` as-is rather than correcting its known gaps at the source — see [08 §Phase 3](08-development-roadmap.md#phase-3--yarn--dependencies). Also applies a permanent, idempotent `dotenv-cli` PATH fix (`Add-YarnGlobalBinToPersistentPath`) — see [§Running the installer scripts](#running-the-installer-scripts) below. If the dependency download fails specifically because the package registry certificate cannot be validated, setup offers one retry with strict SSL verification disabled, defaulting to No — see [06 — Package registry certificate validation](06-deployment-risks.md#package-registry-certificate-validation). |
 | Application startup | `setup.ps1` — `Resolve-DeltaApplicationPort` / `Update-DeltaApplicationPortEnvironment` / `Start-DeltaRuntimeForValidation` / `Confirm-DeltaRuntimeStarted` | ✅ Implemented, as an **interim installation-validation step** — not a substitute for Phase 5 (Windows Service). See [§Automatic startup](#automatic-startup) below. |
 
 Do not assume PostGIS or the DELTA database are handled by running `setup.ps1` today — only run it for Node.js and the bare PostgreSQL server, then continue the rest of this guide manually until Phases 2B and 2C land. This section will be updated as each phase completes; the authoritative status lives in [08](08-development-roadmap.md#progress-dashboard), not here.
@@ -129,6 +129,15 @@ When run via `setup.ps1`, `init_website.bat` and `init_db.bat` are invoked autom
 .\init_website.bat
 .\init_db.bat
 ```
+
+> **Execution policy.** If Windows PowerShell refuses to run any of this repository's `.ps1` scripts (`setup.ps1 cannot be loaded because running scripts is disabled on this system`), lift the restriction for the current session only, then run the script from that same session:
+>
+> ```powershell
+> Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+> .\setup.ps1
+> ```
+>
+> `-Scope Process` leaves the machine-wide and user-level policies unchanged, and closing the window restores the normal effective execution-policy behaviour. See [README — If PowerShell refuses to run the scripts](../README.md#if-powershell-refuses-to-run-the-scripts).
 
 `init_website.bat` installs Yarn globally and runs `yarn install --production`. **Known gaps in this script** — missing `--force` on the Yarn install, and PATH handling that targets npm's global folder rather than Yarn Classic's own global bin (where `dotenv-cli`, needed by `start.bat`, actually lands) — are documented in [06 — Installation tooling gaps](06-deployment-risks.md#installation-tooling-gaps) and not yet fixed at the source (see [08 §Phase 3](08-development-roadmap.md#phase-3--yarn--dependencies)). Verify manually after running it standalone that a **new** shell can resolve the `dotenv` command:
 
@@ -283,25 +292,88 @@ Declining a restart (either the first time, or the per-run question under `0`) l
 
 ## Windows Service installation
 
-Wrap the Node process directly — do not point the service at `start.bat` itself, since its trailing `pause` will hang the service indefinitely on every start. Substitute the actual application directory for `C:\DELTA` below if a different one was chosen at install time (see [§Deployment layout](#deployment-layout)) — future automation of this step (Phase 5) will use `$Script:DeltaRuntimeRoot` directly rather than a literal path. Once implemented, Phase 5 supersedes [§Automatic startup](#automatic-startup) above — `Start-DeltaRuntimeForValidation`'s unsupervised detached process is an interim stand-in for exactly this service, not something meant to run alongside it.
+**Automated.** `setup.ps1` installs and configures the DELTA Windows Service itself (`Install-DeltaWindowsService`, backed by `lib\DeltaInstaller.Service.ps1`) — there is no manual step, and no NSSM/WinSW command to run by hand. This supersedes [§Automatic startup](#automatic-startup) above: the unsupervised detached process described there is no longer used once the service is registered, and the two never run alongside each other.
 
-```powershell
-nssm install DeltaApp "C:\Program Files\nodejs\node.exe" "node_modules\@react-router\serve\dist\cli.js .\build\server\index.js"
-nssm set DeltaApp AppDirectory "C:\DELTA"
-nssm set DeltaApp AppEnvironmentExtra DATABASE_URL=... SESSION_SECRET=... NODE_ENV=production PUBLIC_URL=...
-nssm set DeltaApp AppExit Default Restart
-nssm set DeltaApp AppStdout "C:\DELTA\logs\service-out.log"
-nssm set DeltaApp AppStderr "C:\DELTA\logs\service-err.log"
-nssm start DeltaApp
+**After installation, DELTA starts automatically when Windows boots, with no interactive login.** Logging out or disconnecting RDP no longer stops it.
+
+| Property | Value |
+|---|---|
+| Service name | `DeltaApp` |
+| Display name | DELTA Application |
+| Startup type | Automatic |
+| Runs as | `NT SERVICE\DeltaApp` (per-service virtual account — no password to manage) |
+| Wrapper | WinSW, pinned and SHA-256 verified via `.env.installer` (`WINSW_*`) |
+| Wrapper location | `<AppRoot>\service\DeltaApp.exe` + `DeltaApp.xml` |
+| Depends on | The local PostgreSQL service, when `DATABASE_URL` points at this machine |
+
+**Startup type is plain Automatic, not Automatic (Delayed Start).** DELTA begins starting as soon as the SCM can start it — a production server should not spend a window after every boot installed, healthy, and not yet answering. Ordering is handled by the two mechanisms that actually address it: the `<depend>` element makes the SCM start PostgreSQL first, and the bounded recovery policy below covers the remainder, since a service dependency guarantees PostgreSQL is *Running* rather than already accepting connections. A DELTA that starts a moment too early is retried at 10s / 30s / 60s; deferring every boot to make the first attempt more likely was the more expensive way to buy the same outcome. Readiness is still decided independently — process, then port, then a real HTTP response.
+
+### What the service actually runs
+
+```text
+<node.exe> --env-file="<AppRoot>\.env" "<resolved serve CLI>" ./build/server/index.js
 ```
+
+with `<AppRoot>` as the working directory. Three things about this are deliberate:
+
+- **`node.exe` directly** — not `start.bat` (its trailing `pause` hangs a non-interactive caller forever), and not the `cmd.exe` → `dotenv` → `yarn` → `react-router-serve` chain. That chain is four processes with no parent/child lifetime coupling on Windows, and `dotenv`/`yarn` resolve only through the *User* PATH of whoever ran the installer — which a service identity does not share.
+- **The serve CLI path is resolved at install time from the installed package's own `package.json` `bin` field**, never hardcoded. An earlier revision of this document gave the path as `node_modules\@react-router\serve\dist\cli.js`; **that is wrong** for the version actually shipped (`@react-router/serve` 7.18.2 uses `bin.js`), and a hardcoded path produces a service that cannot start.
+- **`.env` stays the single source of configuration**, loaded by Node's own `--env-file`. No secret is ever copied into the service definition. The compiled bundle does not read `.env` itself — it only reads `process.env.*` — so something has to load it, and `--env-file` was verified to parse this project's real `.env` identically to `dotenv-cli`.
 
 | Setting | Value | Why |
 |---|---|---|
-| Working directory | Install root | Relative `uploads`/`logs` paths resolve from here — see [01 — Statelessness](01-runtime-architecture.md#statelessness). |
-| Environment | Service environment block or `.env` in the working directory | Either avoids needing `dotenv-cli` as a wrapper in production. |
-| Restart strategy | `AppExit Default Restart`, with `AppThrottle` to avoid crash-loop flapping | Standard NSSM crash recovery. |
-| Application-level logging | Handled by `winston-daily-rotate-file` into `LOG_DIR` regardless of service manager | Point NSSM's stdout/stderr redirection at a separate file for anything logged before Winston initializes. |
-| Shutdown behavior | **Not yet empirically verified** — see [06 #5](06-deployment-risks.md#windows-service-shutdown-behavior) | Confirm during [07 — Validation checklist](07-windows-poc.md#validation-checklist) before relying on graceful shutdown in production. |
+| Working directory | Application root | Relative `uploads`/`logs` paths resolve from here — see [01 — Statelessness](01-runtime-architecture.md#statelessness). |
+| Environment | `.env` in the working directory, via `--env-file` | Keeps one source of truth and keeps secrets out of the service configuration. |
+| Restart strategy | `<onfailure>` restart at 10s / 30s / 60s, then stop, with a 1-hour reset period | WinSW translates these into **native SCM recovery actions**, so there is exactly one restart mechanism, not two. Bounded by design — no crash-loop storms. |
+| Application-level logging | `winston-daily-rotate-file` into `LOG_DIR`, unchanged | The service additionally captures stdout/stderr to `<AppRoot>\logs\DeltaApp.out.log` / `.err.log` / `.wrapper.log`, rolled by size, for anything logged before Winston initializes. |
+| Shutdown behavior | **Verified.** Stopping the service delivers `SIGINT` to Node; the application's cleanup handler runs, Winston transports are closed, and the process exits with code 0 — see [06 #5](06-deployment-risks.md#windows-service-shutdown-behavior). |
+
+### Service repair and migration
+
+**A DELTA deployment without a healthy `DeltaApp` registration is a repair condition, not a runtime state.** The service is how DELTA is supported to run, so `setup.ps1` recognises a missing, damaged, misdirected, or disabled registration when it starts and repairs or migrates it, rather than presenting it as one more thing for an administrator to diagnose. Nobody needs to know what WinSW is, or pick "Update DELTA", merely to obtain the service.
+
+The governing rule: **a missing `DeltaApp` service is not a reason to update or reinstall DELTA.** A deployment that already has everything a registration needs — `.env` with `DATABASE_URL`, a valid `PORT`, `node.exe`, `node_modules`, a resolvable `@react-router/serve`, `build\server\index.js`, `logs\` and `uploads\` — is converted in place. No application files are redeployed, no dependencies reinstalled, no configuration rewritten, and the database is never touched.
+
+Detection is split in two so a healthy installation pays nothing: `Get-DeltaServiceRepairCondition` is pure and runs off state the management menu has already read, and the prerequisite survey (`Get-DeltaServicePrerequisiteReport`, which resolves `node.exe` and the serve CLI) runs only once a condition is actually found. Both feed `Get-DeltaServiceRepairPlan`, a single decision table; `setup.ps1` performs the resulting plan by composing the same installation phases a full run uses, never a second implementation of them.
+
+| Condition | Action | Behavior |
+|---|---|---|
+| No registration at all | Repair | The migration path for deployments predating the service. Announced, then performed. |
+| WinSW executable missing | Repair | Re-copied from the verified cache and re-registered. |
+| Definition file missing | Repair | Regenerated from the template and re-registered. |
+| Definition file present but not parseable | Repair | Same. A service that fails at every boot for a reason no restart fixes must be distinguishable from one that is merely stopped. |
+| Registered against a different application directory | Repair | Re-registered against this deployment. |
+| Wrong service identity | Repair | Re-registered under `NT SERVICE\DeltaApp`. |
+| Startup type drifted (Manual, or Automatic still carrying the delayed-start flag) | Configure | One `sc.exe` start-mode change plus clearing the delayed-start registry value. Nothing is re-registered, rewritten, or restarted — a serving DELTA keeps serving straight through it, with the same `node.exe` PID. |
+| **Disabled** | Enable | **Always confirmed, never automatic.** Disabled is the one state that can encode a deliberate "DELTA must not run here". |
+| A prerequisite is genuinely missing | Update | Hands off to the existing full installation flow, which already owns restoring it. |
+| An unrelated process holds the configured `PORT` | Blocked | Reported with the owning process named, and left running untouched. A service that could not bind would leave the installation worse than it was found. |
+| Nothing wrong | None | The ordinary management menu, unchanged. |
+
+A repair is only reported as successful once the service-managed runtime passes the existing readiness verification — process, then port, then a real HTTP round trip. Confirmation is requested wherever proceeding interrupts something visible: a running DELTA (any repair restarts it under the service), a deliberately disabled service, or a hand-off to the longer full-installation flow. Converting a stopped deployment is announced and then simply done.
+
+Repair is idempotent. Once the service is registered, enabled, intact, and correctly configured, a repeated run finds no condition and therefore re-registers nothing, rewrites nothing, and restarts nothing.
+
+#### Disabled after an uninstall
+
+`uninstall.ps1` stops and disables `DeltaApp` — rather than removing it — when the administrator keeps the DELTA application directory, because that uninstall removes Node.js unconditionally and an Automatic service pointed at a missing `node.exe` would fail at every boot forever. That disable is deliberate, and Windows records nothing about intent in the service registration itself, so the uninstall also writes a `ServiceDisabledByUninstall` marker under `HKLM:\SOFTWARE\PreventionWeb\DELTA`.
+
+Re-running `setup.ps1` against that retained deployment recognises it and offers to re-enable it, with the explanation matched to what actually happened: an uninstall-disabled service is described as such, while one disabled outside the installer is described as possibly deliberate. **Neither is re-enabled without confirmation** — no `sc.exe` cleanup by hand is required, and no deliberate decision is silently overturned. In practice the same uninstall also removed Node.js, so the prerequisite survey routes that deployment through a normal update, which reinstalls Node and re-enables the service on the way past. The marker is cleared the moment the service is genuinely back on automatic startup, so it can never outlive the state it describes.
+
+### Administrator operations
+
+The DELTA management menu (`setup.ps1`) reports service state alongside DELTA's own process/port evidence and offers Start / Stop / Restart. Standard Windows tooling works too:
+
+```powershell
+Get-Service DeltaApp
+Start-Service DeltaApp
+Stop-Service DeltaApp
+Restart-Service DeltaApp
+```
+
+**A running service is not the same thing as a ready application.** `Get-Service` reporting `Running` only means the wrapper is up; DELTA is ready when it is listening on its configured port and answering HTTP. The installer always verifies the second, and the management menu reports both.
+
+> **Note — the reverse proxy is separate.** IIS (`W3SVC`) is a Windows service and starts at boot on its own. NGINX, as installed by `setup-nginx.ps1`, is **not** currently registered as a service and therefore does not restart automatically after a reboot. That is independent of DELTA's own service and is tracked separately.
 
 ## Reverse proxy configuration
 
